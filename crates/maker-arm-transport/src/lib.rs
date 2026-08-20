@@ -4,8 +4,12 @@
 
 mod mock;
 pub mod replay;
+#[cfg(feature = "socketcan")]
+mod socketcan_backend;
 
 pub use mock::MockBackend;
+#[cfg(feature = "socketcan")]
+pub use socketcan_backend::SocketCanBackend;
 
 use std::time::Duration;
 
