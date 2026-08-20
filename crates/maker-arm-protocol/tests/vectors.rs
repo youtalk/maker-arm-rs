@@ -175,3 +175,30 @@ fn mit_interop_frames_golden() {
     // MIT command 5 (F_CMD=0, read fault, side-effect-free probe ping).
     assert_eq!(mit_fault_query_data().to_vec(), hex("FFFFFFFFFFFF00FB"));
 }
+
+#[test]
+fn parse_fault_frame() {
+    // Case 1: Normal DLC-8 fault frame.
+    // comm=21 (COMM_FAULT), motor=5, target=host (0xFD).
+    // Motor ID 5 is distinctive to detect bit-shift errors.
+    let id = (21u32 << 24) | (5 << 8) | 0xFD;
+    assert_eq!(id, 0x150005FD);
+    let data = hex("1122334455667788");
+    let Some(ParsedFrame::Fault(fault)) = parse_frame(id, &data, &RS00) else {
+        panic!("expected fault frame");
+    };
+    assert_eq!(fault.motor_id, 5);
+    assert_eq!(fault.raw, [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
+
+    // Case 2: Short-payload fault frame — pins current, plan-mandated behavior.
+    // Unlike COMM_FEEDBACK and COMM_READ_PARAM which reject data.len() < 8,
+    // the COMM_FAULT arm zero-pads shorter payloads. This asymmetry is
+    // unreachable in practice (all private-protocol frames are DLC 8), and
+    // whether to reconcile it is deferred to the next milestone.
+    let data_short = &[0xAA, 0xBB, 0xCC];
+    let Some(ParsedFrame::Fault(fault)) = parse_frame(id, data_short, &RS00) else {
+        panic!("expected fault frame with short payload");
+    };
+    assert_eq!(fault.motor_id, 5);
+    assert_eq!(fault.raw, [0xAA, 0xBB, 0xCC, 0x00, 0x00, 0x00, 0x00, 0x00]);
+}
