@@ -1,0 +1,15 @@
+[package]
+name = "maker-arm-transport"
+description = "CAN transports for the MakerMods Maker Arm: mock, candump replay, SocketCAN"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+socketcan = ["dep:socketcan"]
+
+[dependencies]
+socketcan = { version = "3", optional = true }
