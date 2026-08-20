@@ -29,3 +29,35 @@ jobs:
           sudo ip link add dev vcan0 type vcan
           sudo ip link set up vcan0
       - run: cargo test -p maker-arm-transport --features socketcan -- --ignored
+  wheels:
+    strategy:
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: bindings/maker-arm-py
+          command: build
+          args: --release
+      - name: locate the built wheel
+        # maturin-action's output path depends on cargo workspace layout: since
+        # bindings/maker-arm-py is a member of the root workspace, the shared
+        # target dir (and thus target/wheels/) resolves to the repo root, not
+        # bindings/maker-arm-py/target/wheels/. Search instead of hardcoding.
+        id: wheel
+        run: |
+          wheel="$(find . -name '*.whl' -print -quit)"
+          if [ -z "$wheel" ]; then
+            echo "no wheel found" >&2
+            find . -name '*.whl'
+            exit 1
+          fi
+          echo "path=$wheel" >> "$GITHUB_OUTPUT"
+      - name: test the built wheel
+        run: |
+          pip install "${{ steps.wheel.outputs.path }}" pytest
+          pytest bindings/maker-arm-py/tests/ -v

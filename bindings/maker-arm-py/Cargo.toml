@@ -1,0 +1,15 @@
+[package]
+name = "maker-arm-py"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "maker_arm_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+maker-arm-protocol = { path = "../../crates/maker-arm-protocol" }
+pyo3 = { version = "0.24", features = ["extension-module"] }
