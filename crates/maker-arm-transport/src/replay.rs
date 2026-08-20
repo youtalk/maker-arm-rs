@@ -29,7 +29,14 @@ pub fn parse_candump_line(line: &str) -> Option<RecordedFrame> {
     let frame = parts.next()?;
     let (id_hex, data_hex) = frame.split_once('#')?;
     let id = u32::from_str_radix(id_hex, 16).ok()?;
-    if data_hex.len() % 2 != 0 || data_hex.len() > 16 {
+    // Byte length alone doesn't guarantee char boundaries: a multi-byte UTF-8
+    // character can make `data_hex.len()` even and <= 16 while still landing
+    // mid-character at a fixed 2-byte slice offset below, which panics. Reject
+    // non-ASCII up front so every subsequent byte offset is a valid boundary.
+    // A payload with no hex digits at all isn't a frame record with data to
+    // parse, so it's rejected here too.
+    if data_hex.is_empty() || !data_hex.is_ascii() || data_hex.len() % 2 != 0 || data_hex.len() > 16
+    {
         return None;
     }
     let mut data = [0u8; 8];
@@ -102,6 +109,31 @@ mod tests {
         // garbage is None, not a panic
         assert!(parse_candump_line("not a frame").is_none());
         assert!(parse_candump_line("").is_none());
+    }
+
+    #[test]
+    fn malformed_lines_return_none_never_panic() {
+        // Multi-byte UTF-8 character as the whole payload: byte length is 4
+        // (even, <= 16) but no char boundary at offset 2 -- this panics
+        // without the is_ascii() guard.
+        assert!(parse_candump_line("(1.0) can0 0300FD01#\u{1f600}").is_none());
+        // Multi-byte character positioned so total byte length is still even
+        // and <= 16, but the fixed 2-byte slice offsets land mid-character.
+        assert!(parse_candump_line("(1.0) can0 0300FD01#aa\u{1f600}").is_none());
+        // Odd-length hex payload.
+        assert!(parse_candump_line("(1.0) can0 0300FD01#010").is_none());
+        // Hex payload longer than 16 characters (more than 8 bytes).
+        assert!(parse_candump_line("(1.0) can0 0300FD01#0011223344556677889900").is_none());
+        // Non-hex ASCII characters in the payload.
+        assert!(parse_candump_line("(1.0) can0 0300FD01#ZZ").is_none());
+        // Empty payload after '#'.
+        assert!(parse_candump_line("(1.0) can0 0300FD01#").is_none());
+        // No '#' separator at all.
+        assert!(parse_candump_line("(1.0) can0 0300FD01").is_none());
+        // Timestamp missing its parentheses.
+        assert!(parse_candump_line("1.0 can0 0300FD01#0102").is_none());
+        // Too few whitespace-separated fields.
+        assert!(parse_candump_line("(1.0) can0").is_none());
     }
 
     #[test]
