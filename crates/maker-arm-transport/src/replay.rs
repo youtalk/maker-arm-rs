@@ -33,10 +33,9 @@ pub fn parse_candump_line(line: &str) -> Option<RecordedFrame> {
     // character can make `data_hex.len()` even and <= 16 while still landing
     // mid-character at a fixed 2-byte slice offset below, which panics. Reject
     // non-ASCII up front so every subsequent byte offset is a valid boundary.
-    // A payload with no hex digits at all isn't a frame record with data to
-    // parse, so it's rejected here too.
-    if data_hex.is_empty() || !data_hex.is_ascii() || data_hex.len() % 2 != 0 || data_hex.len() > 16
-    {
+    // An empty payload is valid—candump -l prints "ID#" for a legitimate
+    // zero-length (DLC 0) CAN data frame; it parses to dlc: 0.
+    if !data_hex.is_ascii() || data_hex.len() % 2 != 0 || data_hex.len() > 16 {
         return None;
     }
     let mut data = [0u8; 8];
@@ -106,6 +105,11 @@ mod tests {
         assert_eq!(s.dlc, 1);
         assert_eq!(s.data[0], 0x01);
         assert_eq!(s.data[1], 0x00);
+        // empty payload is a legitimate zero-length CAN frame (DLC 0)
+        let z = parse_candump_line("(1.0) can0 0300FD01#").unwrap();
+        assert_eq!(z.dlc, 0);
+        assert_eq!(z.data, [0u8; 8]);
+        assert_eq!(z.id, 0x0300FD01);
         // garbage is None, not a panic
         assert!(parse_candump_line("not a frame").is_none());
         assert!(parse_candump_line("").is_none());
@@ -113,6 +117,7 @@ mod tests {
 
     #[test]
     fn malformed_lines_return_none_never_panic() {
+        // Payload guards: reject non-ASCII and non-even-length payloads.
         // Multi-byte UTF-8 character as the whole payload: byte length is 4
         // (even, <= 16) but no char boundary at offset 2 -- this panics
         // without the is_ascii() guard.
@@ -126,8 +131,8 @@ mod tests {
         assert!(parse_candump_line("(1.0) can0 0300FD01#0011223344556677889900").is_none());
         // Non-hex ASCII characters in the payload.
         assert!(parse_candump_line("(1.0) can0 0300FD01#ZZ").is_none());
-        // Empty payload after '#'.
-        assert!(parse_candump_line("(1.0) can0 0300FD01#").is_none());
+
+        // Earlier parsing guards: reject malformed timestamps, field structure.
         // No '#' separator at all.
         assert!(parse_candump_line("(1.0) can0 0300FD01").is_none());
         // Timestamp missing its parentheses.
