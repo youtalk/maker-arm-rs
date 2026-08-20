@@ -143,3 +143,143 @@ pub fn encode_mit(
         data,
     }
 }
+
+/// Well-known parameter indices (Type 17/18 frames).
+pub mod param_index {
+    pub const RUN_MODE: u16 = 0x7005; // u8: 0 = control mode (MIT)
+    pub const LIMIT_TORQUE: u16 = 0x700B; // f32
+    pub const LOC_REF: u16 = 0x7016; // f32
+    pub const LIMIT_SPD: u16 = 0x7017; // f32
+    pub const MECH_POS: u16 = 0x7019; // f32
+    pub const VBUS: u16 = 0x701C; // f32
+    pub const CAN_TIMEOUT: u16 = 0x7028; // u32, 50 µs/count (20000 = 1 s)
+}
+
+/// canTimeout unit is 50 µs/count (protocol: 20000 = 1 s) — verified on
+/// real hardware by the official SDK.
+pub const CAN_TIMEOUT_PER_MS: u32 = 20;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ParamValue {
+    F32(f32),
+    U8(u8),
+    U16(u16),
+    U32(u32),
+}
+
+pub fn encode_read_param(motor_id: u8, index: u16, host_id: u8) -> Frame {
+    let mut data = [0u8; 8];
+    data[0..2].copy_from_slice(&index.to_le_bytes());
+    Frame {
+        id: make_can_id(COMM_READ_PARAM, host_id as u16, motor_id),
+        data,
+    }
+}
+
+pub fn encode_write_param(motor_id: u8, index: u16, value: ParamValue, host_id: u8) -> Frame {
+    let mut data = [0u8; 8];
+    data[0..2].copy_from_slice(&index.to_le_bytes());
+    match value {
+        ParamValue::F32(v) => data[4..8].copy_from_slice(&v.to_le_bytes()),
+        ParamValue::U8(v) => data[4] = v,
+        ParamValue::U16(v) => data[4..6].copy_from_slice(&v.to_le_bytes()),
+        ParamValue::U32(v) => data[4..8].copy_from_slice(&v.to_le_bytes()),
+    }
+    Frame {
+        id: make_can_id(COMM_WRITE_PARAM, host_id as u16, motor_id),
+        data,
+    }
+}
+
+pub fn encode_save_params(motor_id: u8, host_id: u8) -> Frame {
+    Frame {
+        id: make_can_id(COMM_SAVE, host_id as u16, motor_id),
+        data: [0; 8],
+    }
+}
+
+/// Feedback in motor coordinates; direction/offset conversion is the arm
+/// layer's job (MA1).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MotorFeedback {
+    pub motor_id: u8,
+    pub position: f64,    // rad
+    pub velocity: f64,    // rad/s
+    pub torque: f64,      // Nm
+    pub temperature: f64, // °C
+    pub mode: u8,         // 0=Reset 1=Cali 2=Motor
+    pub fault_bits: u8,   // 6-bit fault code, nonzero = faulted
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParamReply {
+    pub motor_id: u8,
+    pub index: u16,
+    pub raw: [u8; 4],
+}
+
+impl ParamReply {
+    pub fn as_f32(&self) -> f32 {
+        f32::from_le_bytes(self.raw)
+    }
+    pub fn as_u8(&self) -> u8 {
+        self.raw[0]
+    }
+    pub fn as_u16(&self) -> u16 {
+        u16::from_le_bytes([self.raw[0], self.raw[1]])
+    }
+    pub fn as_u32(&self) -> u32 {
+        u32::from_le_bytes(self.raw)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FaultReport {
+    pub motor_id: u8,
+    pub raw: [u8; 8],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ParsedFrame {
+    Feedback(MotorFeedback),
+    ParamReply(ParamReply),
+    Fault(FaultReport),
+}
+
+pub fn parse_frame(id: u32, data: &[u8], params: &MotorParams) -> Option<ParsedFrame> {
+    let comm = ((id >> 24) & 0x1F) as u8;
+    if comm == COMM_FEEDBACK {
+        if data.len() < 8 {
+            return None;
+        }
+        let u = |i: usize| u16::from_be_bytes([data[i], data[i + 1]]);
+        return Some(ParsedFrame::Feedback(MotorFeedback {
+            motor_id: ((id >> 8) & 0xFF) as u8,
+            position: u16_to_float(u(0), params.p_min, params.p_max),
+            velocity: u16_to_float(u(2), params.v_min, params.v_max),
+            torque: u16_to_float(u(4), params.t_min, params.t_max),
+            temperature: u(6) as f64 / 10.0,
+            mode: ((id >> 22) & 0x03) as u8,
+            fault_bits: ((id >> 16) & 0x3F) as u8,
+        }));
+    }
+    if comm == COMM_READ_PARAM {
+        if data.len() < 8 {
+            return None;
+        }
+        return Some(ParsedFrame::ParamReply(ParamReply {
+            motor_id: ((id >> 8) & 0xFF) as u8,
+            index: u16::from_le_bytes([data[0], data[1]]),
+            raw: [data[4], data[5], data[6], data[7]],
+        }));
+    }
+    if comm == COMM_FAULT {
+        let mut raw = [0u8; 8];
+        raw[..data.len().min(8)].copy_from_slice(&data[..data.len().min(8)]);
+        return Some(ParsedFrame::Fault(FaultReport {
+            motor_id: ((id >> 8) & 0xFF) as u8,
+            raw,
+        }));
+    }
+    None
+}

@@ -71,3 +71,83 @@ fn encode_mit_golden() {
     assert_eq!(f.id, 0x01800001);
     assert_eq!(f.data, [0x80, 0x00, 0x80, 0x00, 0x05, 0x1F, 0x33, 0x33]);
 }
+
+fn hex(s: &str) -> Vec<u8> {
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+        .collect()
+}
+
+#[test]
+fn encode_params_little_endian() {
+    let f = encode_read_param(1, param_index::VBUS, HOST_CAN_ID);
+    assert_eq!(f.id, 0x1100FD01);
+    assert_eq!(f.data.to_vec(), hex("1C70000000000000")); // index little-endian
+    let f = encode_write_param(
+        1,
+        param_index::CAN_TIMEOUT,
+        ParamValue::U32(200),
+        HOST_CAN_ID,
+    );
+    assert_eq!(f.id, 0x1200FD01);
+    assert_eq!(f.data.to_vec(), hex("28700000C8000000")); // value little-endian u32
+    let f = encode_write_param(1, param_index::LIMIT_SPD, ParamValue::F32(2.0), HOST_CAN_ID);
+    assert_eq!(&f.data[0..2], &hex("1770")[..]);
+    assert_eq!(&f.data[4..8], &2.0f32.to_le_bytes());
+    let f = encode_save_params(1, HOST_CAN_ID);
+    assert_eq!(f.id, 0x1600FD01);
+}
+
+#[test]
+fn parse_feedback_golden() {
+    // comm=2, mode=2 (Motor), fault=0, motor=1, target=host
+    let id = (2u32 << 24) | (2 << 22) | (1 << 8) | 0xFD;
+    assert_eq!(id, 0x028001FD);
+    let data = hex("8000800080000159"); // pos/vel/tau ≈ 0, temp = 34.5 °C
+    let Some(ParsedFrame::Feedback(fb)) = parse_frame(id, &data, &RS00) else {
+        panic!("expected feedback");
+    };
+    assert_eq!(fb.motor_id, 1);
+    assert_eq!(fb.mode, 2);
+    assert_eq!(fb.fault_bits, 0);
+    approx(fb.position, 0.0, 1e-3);
+    approx(fb.velocity, 0.0, 1e-3);
+    approx(fb.torque, 0.0, 1e-3);
+    approx(fb.temperature, 34.5, 1e-9);
+}
+
+#[test]
+fn parse_feedback_fault_bits() {
+    let id = (2u32 << 24) | (2 << 22) | (0x21 << 16) | (3 << 8) | 0xFD;
+    let Some(ParsedFrame::Feedback(fb)) = parse_frame(id, &[0u8; 8], &RS00) else {
+        panic!("expected feedback");
+    };
+    assert_eq!(fb.motor_id, 3);
+    assert_eq!(fb.fault_bits, 0x21);
+}
+
+#[test]
+fn parse_param_reply() {
+    // motor 2 reads back VBUS = 24.5: comm=17, ID bits 15..8 = motor id
+    let id = (17u32 << 24) | (2 << 8) | 0xFD;
+    let mut data = vec![0x1C, 0x70, 0, 0];
+    data.extend_from_slice(&24.5f32.to_le_bytes());
+    let Some(ParsedFrame::ParamReply(r)) = parse_frame(id, &data, &RS00) else {
+        panic!("expected param reply");
+    };
+    assert_eq!(r.motor_id, 2);
+    assert_eq!(r.index, param_index::VBUS);
+    assert_eq!(r.as_f32(), 24.5);
+    let mut d2 = vec![0x28, 0x70, 0, 0];
+    d2.extend_from_slice(&200u32.to_le_bytes());
+    let Some(ParsedFrame::ParamReply(r2)) = parse_frame(id, &d2, &RS00) else {
+        panic!("expected param reply");
+    };
+    assert_eq!(r2.as_u32(), 200);
+}
+
+#[test]
+fn parse_unknown_returns_none() {
+    assert!(parse_frame((22u32 << 24) | 0xFD, &[0u8; 8], &RS00).is_none());
+}
