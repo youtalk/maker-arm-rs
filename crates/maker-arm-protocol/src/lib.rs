@@ -283,3 +283,26 @@ pub fn parse_frame(id: u32, data: &[u8], params: &MotorParams) -> Option<ParsedF
     }
     None
 }
+
+/// Private-protocol Type 25: switch the motor's communication protocol
+/// (0 = private, 1 = CANopen, 2 = MIT). Persistent and mutually exclusive;
+/// takes effect after a power cycle. Magic 01..06 at bytes 0..5, F_CMD at
+/// byte 6 (anchored by real-hardware testing in the official SDK).
+pub fn encode_set_protocol(motor_id: u8, f_cmd: u8, host_id: u8) -> Frame {
+    Frame {
+        id: make_can_id(COMM_SET_PROTOCOL, host_id as u16, motor_id),
+        data: [1, 2, 3, 4, 5, 6, f_cmd, 0],
+    }
+}
+
+/// MIT protocol command 8 (protocol switch) data field; the frame itself
+/// uses an 11-bit standard ID equal to the motor id.
+pub fn mit_switch_protocol_data(f_cmd: u8) -> [u8; 8] {
+    [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, f_cmd, 0xFD]
+}
+
+/// MIT protocol command 5 (F_CMD=0, read fault status, no side effects) —
+/// used as an MIT-mode probe ping.
+pub fn mit_fault_query_data() -> [u8; 8] {
+    [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0xFB]
+}

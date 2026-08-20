@@ -151,3 +151,27 @@ fn parse_param_reply() {
 fn parse_unknown_returns_none() {
     assert!(parse_frame((22u32 << 24) | 0xFD, &[0u8; 8], &RS00).is_none());
 }
+
+#[test]
+fn encode_set_protocol_golden() {
+    // Anchored by the official SDK's real-hardware test (motor 7,
+    // 2026-08-07): Type 25, magic 01..06 at bytes 0..5, F_CMD at byte 6.
+    let f = encode_set_protocol(7, 2, HOST_CAN_ID);
+    assert_eq!(f.id, 0x1900FD07);
+    assert_eq!(f.data.to_vec(), hex("0102030405060200"));
+}
+
+#[test]
+fn mit_interop_frames_golden() {
+    // MIT protocol command 8 (switch), 11-bit standard frame at motor id.
+    assert_eq!(
+        mit_switch_protocol_data(0).to_vec(),
+        hex("FFFFFFFFFFFF00FD")
+    );
+    assert_eq!(
+        mit_switch_protocol_data(2).to_vec(),
+        hex("FFFFFFFFFFFF02FD")
+    );
+    // MIT command 5 (F_CMD=0, read fault, side-effect-free probe ping).
+    assert_eq!(mit_fault_query_data().to_vec(), hex("FFFFFFFFFFFF00FB"));
+}
