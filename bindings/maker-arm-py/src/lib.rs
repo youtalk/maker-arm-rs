@@ -1,3 +1,12 @@
+// `pyo3`'s `extension-module` feature (see Cargo.toml) is enabled
+// unconditionally, which normally breaks `cargo test` at link time with
+// undefined `Py*` symbols. It doesn't break here only because this crate
+// has no `#[test]` items of its own: nothing in the test harness's
+// synthetic `main()` reaches the PyO3-touching code below, so the
+// linker's `--gc-sections` pass drops it before symbol resolution runs.
+// Adding a `#[test]` here that calls into these bindings would bring that
+// dead code back into the link and resurface the failure — put such tests
+// in the Python suite (`tests/test_bindings.py`) instead.
 use maker_arm_protocol as p;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
