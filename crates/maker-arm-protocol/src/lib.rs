@@ -21,6 +21,13 @@ pub const HOST_CAN_ID: u8 = 0xFD;
 /// Per-model u16 mapping ranges. The frame format is identical across
 /// models; only the ranges differ. Picking the wrong table shows up as
 /// torque/velocity scaled by the wrong factor.
+///
+/// **Invariant: every `*_min` must be strictly less than its `*_max`.**
+/// The fields are public so per-joint tables can be written as consts, and
+/// nothing enforces the invariant at construction: [`float_to_u16`] clamps
+/// with [`f64::clamp`], which **panics** on an inverted range (`lo > hi`),
+/// and an equal pair (`lo == hi`) divides by zero. Tables are expected to
+/// be compile-time constants that a test pins, not runtime input.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MotorParams {
     pub t_min: f64,
@@ -60,8 +67,30 @@ pub fn motor_params(model: &str) -> Option<&'static MotorParams> {
     }
 }
 
-/// Round-half-to-even matches Python's round(); MA1 golden-trace parity
-/// depends on byte-exact agreement with the official SDK.
+/// Maps `x` into the `lo..=hi` range as a u16, clamping out-of-range input.
+///
+/// Rounding is round-half-to-even, matching Python's `round()`: MA1
+/// golden-trace parity depends on byte-exact agreement with the official
+/// SDK, and the two modes disagree on exact ties (see the
+/// `round_half_to_even_is_load_bearing` vector).
+///
+/// # Non-finite input
+///
+/// This function never fails, so non-finite input is silently mapped to a
+/// range extreme, and the mapping is *not* obviously safe:
+///
+/// * `NaN` → `0`, i.e. the **minimum** of the range (`P_MIN` is
+///   −12.57 rad, `T_MIN` is −14 Nm) — `f64::clamp` propagates NaN and the
+///   `as u16` cast then saturates it to 0.
+/// * `+∞` → `65535` (range maximum), `-∞` → `0` (range minimum).
+///
+/// The Python oracle diverges here: `int(round(x))` raises `ValueError` on
+/// NaN and `OverflowError` on ±∞ rather than encoding anything. Until the
+/// session layer owns input validation, **callers must reject non-finite
+/// values before calling** — a NaN escaping IK or a PD term would otherwise
+/// be transmitted as a full-scale command, not as an error. Changing the
+/// signature to report this is deliberately deferred; the behavior above is
+/// pinned by tests so it cannot drift silently.
 pub fn float_to_u16(x: f64, lo: f64, hi: f64) -> u16 {
     let x = x.clamp(lo, hi);
     ((x - lo) * 65535.0 / (hi - lo)).round_ties_even() as u16
@@ -258,6 +287,12 @@ pub fn parse_frame(id: u32, data: &[u8], params: &MotorParams) -> Option<ParsedF
             position: u16_to_float(u(0), params.p_min, params.p_max),
             velocity: u16_to_float(u(2), params.v_min, params.v_max),
             torque: u16_to_float(u(4), params.t_min, params.t_max),
+            // Unsigned on purpose: this mirrors the official SDK byte for
+            // byte, which is the hard requirement. The cost is that a
+            // sub-zero reading wraps instead of going negative (raw 0xFFF6,
+            // two's-complement -1 °C, decodes as 6552.6 °C) — a nonsense
+            // value that fails safe rather than a plausible one. Confirm the
+            // sign convention against upstream during hardware bring-up.
             temperature: u(6) as f64 / 10.0,
             mode: ((id >> 22) & 0x03) as u8,
             fault_bits: ((id >> 16) & 0x3F) as u8,

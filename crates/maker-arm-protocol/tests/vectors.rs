@@ -11,9 +11,13 @@ fn constants() {
     assert_eq!(P_MAX, 12.57);
     assert_eq!(P_MIN, -12.57);
     assert_eq!(V_MAX, 33.0);
+    assert_eq!(V_MIN, -33.0);
     assert_eq!(T_MAX, 14.0);
+    assert_eq!(T_MIN, -14.0);
     assert_eq!(KP_MAX, 500.0);
+    assert_eq!(KP_MIN, 0.0);
     assert_eq!(KD_MAX, 5.0);
+    assert_eq!(KD_MIN, 0.0);
     assert_eq!(HOST_CAN_ID, 0xFD);
 }
 
@@ -28,6 +32,62 @@ fn u16_roundtrip_and_bounds() {
     let x = 1.234;
     let back = u16_to_float(float_to_u16(x, P_MIN, P_MAX), P_MIN, P_MAX);
     approx(back, x, 25.14 / 65535.0);
+}
+
+#[test]
+fn round_half_to_even_is_load_bearing() {
+    // The ONLY discriminating case in the Rust suite. Every other vector
+    // ties at 32767.5, where round-half-to-even and round-half-away-from-
+    // zero both give 32768, so they cannot tell the two modes apart.
+    //
+    // 14.0 Nm on RS02's torque range is an exact tie:
+    //   (14.0 - (-17.0)) * 65535 / 34 = 31 * 65535 / 34
+    //                                 = 2031585 / 34 = 59752.5
+    // exactly (every step is representable in f64, and 59752.5 * 34 is
+    // exactly 2031585). Halfway between 59752 (even) and 59753 (odd):
+    //   round_ties_even -> 59752   (matches Python's round(), our oracle)
+    //   round           -> 59753   (half away from zero, WRONG here)
+    //
+    // Byte-exact agreement with the official SDK is the project's #1
+    // requirement, so if this assertion fails the rounding mode has been
+    // changed — do not "fix" the expected value.
+    assert_eq!(float_to_u16(14.0, RS02.t_min, RS02.t_max), 59752);
+    // Same tie seen through the encoder: tau rides in id bits 23..8.
+    let f = encode_mit(1, 0.0, 0.0, 0.0, 0.0, 14.0, &RS02);
+    assert_eq!(f.id, 0x01E96801); // 0xE968 == 59752
+
+    // Ties that both modes agree on, kept as a contrast.
+    assert_eq!(float_to_u16(0.0, P_MIN, P_MAX), 32768); // 32767.5 -> 32768
+    assert_eq!(float_to_u16(2.5, KD_MIN, KD_MAX), 32768); // 32767.5 -> 32768
+}
+
+#[test]
+fn non_finite_input_is_pinned_not_rejected() {
+    // float_to_u16 cannot fail, so non-finite input silently lands on a
+    // range extreme. This DIVERGES from the Python oracle, whose
+    // int(round(x)) raises ValueError on NaN and OverflowError on +/-inf.
+    // Pinned here so the hazard is documented and observable rather than
+    // accidental; see the doc comment on float_to_u16. The fix (validating
+    // at the session layer, or a fallible signature) is MA1 work.
+
+    // NaN survives f64::clamp and the `as u16` cast saturates it to 0 --
+    // which is the range MINIMUM, i.e. -12.57 rad of commanded position.
+    assert_eq!(float_to_u16(f64::NAN, P_MIN, P_MAX), 0);
+    assert_eq!(float_to_u16(f64::NAN, T_MIN, T_MAX), 0); // -14 Nm
+    approx(
+        u16_to_float(float_to_u16(f64::NAN, P_MIN, P_MAX), P_MIN, P_MAX),
+        P_MIN,
+        1e-12,
+    );
+
+    // Infinities clamp to the range ends before rounding.
+    assert_eq!(float_to_u16(f64::INFINITY, P_MIN, P_MAX), 65535);
+    assert_eq!(float_to_u16(f64::NEG_INFINITY, P_MIN, P_MAX), 0);
+    assert_eq!(float_to_u16(f64::INFINITY, KP_MIN, KP_MAX), 65535);
+
+    // Through encode_mit: a NaN position is transmitted, not rejected.
+    let f = encode_mit(1, f64::NAN, 0.0, 0.0, 0.0, 0.0, &RS00);
+    assert_eq!(&f.data[0..2], &[0x00, 0x00]);
 }
 
 #[test]
@@ -94,9 +154,51 @@ fn encode_params_little_endian() {
     assert_eq!(f.data.to_vec(), hex("28700000C8000000")); // value little-endian u32
     let f = encode_write_param(1, param_index::LIMIT_SPD, ParamValue::F32(2.0), HOST_CAN_ID);
     assert_eq!(&f.data[0..2], &hex("1770")[..]);
-    assert_eq!(&f.data[4..8], &2.0f32.to_le_bytes());
+    // Independent literal, not 2.0f32.to_le_bytes(): IEEE-754 2.0f32 is
+    // 0x40000000, so little-endian on the wire is 00 00 00 40.
+    assert_eq!(&f.data[4..8], &hex("00000040")[..]);
     let f = encode_save_params(1, HOST_CAN_ID);
     assert_eq!(f.id, 0x1600FD01);
+}
+
+#[test]
+fn encode_write_param_value_widths() {
+    // The four ParamValue arms write to DIFFERENT byte ranges: U8 -> [4],
+    // U16 -> [4..6], U32/F32 -> [4..8]. A wrong offset in the U8 arm is a
+    // silent mode error on RUN_MODE, the first write MA1 makes to every
+    // motor, so pin the exact payload of each.
+
+    // U8: run_mode = 0 (MIT control mode). Index 0x7005 little-endian at
+    // [0..2], value at [4] only, everything else zero.
+    let f = encode_write_param(1, param_index::RUN_MODE, ParamValue::U8(0), HOST_CAN_ID);
+    assert_eq!(f.id, 0x1200FD01);
+    assert_eq!(f.data.to_vec(), hex("0570000000000000"));
+
+    // U8 with a nonzero value: only byte 4 moves (0xAA is asymmetric, so a
+    // byte swap or a wrong offset shows up immediately).
+    let f = encode_write_param(2, param_index::RUN_MODE, ParamValue::U8(0xAA), HOST_CAN_ID);
+    assert_eq!(f.id, 0x1200FD02);
+    assert_eq!(f.data.to_vec(), hex("05700000AA000000"));
+
+    // U16: two little-endian bytes at [4..6], bytes 6..8 untouched.
+    // 0xBEEF little-endian is EF BE.
+    let f = encode_write_param(
+        3,
+        param_index::RUN_MODE,
+        ParamValue::U16(0xBEEF),
+        HOST_CAN_ID,
+    );
+    assert_eq!(f.id, 0x1200FD03);
+    assert_eq!(f.data.to_vec(), hex("05700000EFBE0000"));
+
+    // U32 for contrast: four little-endian bytes fill [4..8].
+    let f = encode_write_param(
+        4,
+        param_index::CAN_TIMEOUT,
+        ParamValue::U32(0xDEADBEEF),
+        HOST_CAN_ID,
+    );
+    assert_eq!(f.data.to_vec(), hex("28700000EFBEADDE"));
 }
 
 #[test]
