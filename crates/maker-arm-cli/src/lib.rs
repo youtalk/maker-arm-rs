@@ -107,6 +107,9 @@ fn read_param(
     let deadline = Instant::now() + PROBE_TIMEOUT;
     while Instant::now() < deadline {
         if let Some((id, data)) = backend.recv(Duration::from_millis(2))? {
+            // `parse_frame`'s ParamReply branch ignores `params` entirely
+            // (only the Feedback branch is model-dependent), so `&p::RS00`
+            // here is a deliberate placeholder, not a model mismatch bug.
             if let Some(p::ParsedFrame::ParamReply(r)) = p::parse_frame(id, &data, &p::RS00) {
                 if r.motor_id == motor_id && r.index == index {
                     return Ok(Some(r.raw));

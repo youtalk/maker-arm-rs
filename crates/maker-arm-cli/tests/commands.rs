@@ -44,3 +44,46 @@ fn doctor_reads_params_and_checks_limits() {
         report.warnings
     );
 }
+
+#[test]
+fn doctor_reports_absent_motor_as_not_in_limits_with_no_params() {
+    let c = ArmConfig::maker_arm_v1();
+    let mut sim = SimArm::new(&c);
+    sim.set_muted(5, true);
+    let report = doctor(&mut sim, &c).expect("doctor");
+    let r = report
+        .rows
+        .iter()
+        .find(|r| r.motor_id == 5)
+        .expect("motor 5 row");
+    assert!(!r.present);
+    assert_eq!(r.run_mode, None);
+    assert_eq!(r.can_timeout, None);
+    assert_eq!(r.vbus, None);
+    // An absent motor has no position reading at all -- it must never be
+    // reported as confirmed in limits, since that would tell an operator
+    // it is safe to energize when nothing was actually checked.
+    assert!(!r.in_limits);
+}
+
+#[test]
+fn scan_and_doctor_report_fault_bits_and_temperature_on_the_right_rows() {
+    let c = ArmConfig::maker_arm_v1();
+    let mut sim = SimArm::new(&c);
+    sim.inject_fault(2, 0x21);
+    sim.set_temperature(5, 71.5);
+
+    let rows = scan(&mut sim, &c).expect("scan");
+    let faulted = rows.iter().find(|r| r.motor_id == 2).unwrap();
+    assert_eq!(faulted.fault_bits, 0x21);
+    assert!((faulted.temperature - 35.0).abs() < 1e-9); // unaffected motor stays at sim default
+    let hot = rows.iter().find(|r| r.motor_id == 5).unwrap();
+    assert!((hot.temperature - 71.5).abs() < 1e-9);
+    assert_eq!(hot.fault_bits, 0); // unaffected motor stays clean
+
+    let report = doctor(&mut sim, &c).expect("doctor");
+    let faulted = report.rows.iter().find(|r| r.motor_id == 2).unwrap();
+    assert_eq!(faulted.fault_bits, 0x21);
+    let hot = report.rows.iter().find(|r| r.motor_id == 5).unwrap();
+    assert!((hot.temperature - 71.5).abs() < 1e-9);
+}
