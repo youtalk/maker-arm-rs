@@ -21,10 +21,12 @@ See [NOTICE](NOTICE) for the attribution details.
 - `crates/maker-arm-cli` — `scan`, `doctor`, `zero`, and `hold` (typed-RELEASE
   safety gate), against `--can <iface>` or `--sim`.
 
-Status: MA1 prep (hardware-independent session layer) complete. Golden-trace
-capture, live parity, the RS02 firmware check, and everything else that needs
-the physical arm land in MA1 — see the design doc in the maker-arm-lab
-project.
+Status: MA1 prep (hardware-independent session layer) complete. **No physical
+arm has ever been driven by this code** — everything here is exercised against
+`SimArm`, a virtual CAN interface, and golden vectors copied from upstream.
+Golden-trace capture, live parity, the RS02 firmware check, and everything else
+that needs the physical arm land in MA1 — see the design doc in the
+maker-arm-lab project.
 
 ## Building
 
@@ -70,6 +72,12 @@ print(fb["kind"], fb["motor_id"], fb["temperature"])  # feedback 1 34.5
 The same functions in Rust are `maker_arm_protocol::{encode_mit, parse_frame}`;
 put the frames on a bus with `maker_arm_transport::SocketCanBackend::open("can0")`
 and its `CanBackend::{send, recv}`.
+
+That raw pairing is for frame-level work and tests only — it bypasses the
+single command clamp. The supported way to command a motor is through
+`maker-arm`'s session and control loop (the `Arm` class below, or
+`Session::start`), which passes every command through `clamp_command` before
+it reaches a motor.
 
 Orchestration mode: Python selects and steers controllers that run inside the
 Rust control loop; it never commands torque itself, so every command still
