@@ -60,4 +60,9 @@ pub trait CanBackend: Send {
     /// `SO_RCVTIMEO` reads an all-zero `timeval` as *no* timeout and would
     /// otherwise block forever.)
     fn recv(&mut self, timeout: Duration) -> Result<Option<(u32, [u8; 8])>, TransportError>;
+
+    /// Test support: downcast access to the concrete backend.
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        None
+    }
 }

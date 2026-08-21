@@ -7,11 +7,13 @@
 pub mod clamp;
 pub mod config;
 pub mod controller;
+pub mod session;
 pub mod sim;
 pub mod state;
 
 pub use clamp::{clamp_command, ClampError};
 pub use config::{ArmConfig, JointConfig, MotorModel};
 pub use controller::{Controller, HoldController};
+pub use session::{Session, SessionError, SessionState};
 pub use sim::SimArm;
 pub use state::{ArmCommand, ArmState, JointCommand, MotorState};
