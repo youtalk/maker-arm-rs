@@ -17,6 +17,11 @@ pub struct RecordedFrame {
 
 /// Parses one `candump -l` line: `(ts) iface ID#HEXDATA`. Returns None on
 /// anything that isn't a well-formed frame line.
+///
+/// Note the classic-CAN shape: a CAN FD capable adapter makes `candump -l`
+/// emit `ID##flags+data` (a doubled `#`), which this parser rejects. Use
+/// [`ReplayBackend::from_log_strict`] or [`ReplayBackend::skipped`] to find
+/// out when that has happened instead of silently replaying nothing.
 pub fn parse_candump_line(line: &str) -> Option<RecordedFrame> {
     let mut parts = line.split_whitespace();
     let ts = parts
@@ -52,18 +57,94 @@ pub fn parse_candump_line(line: &str) -> Option<RecordedFrame> {
     })
 }
 
+/// A log line [`ReplayBackend::from_log`] could not parse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedLine {
+    /// 1-based line number within the log text.
+    pub number: usize,
+    pub text: String,
+}
+
+/// Returned by [`ReplayBackend::from_log_strict`] when a log contains lines
+/// that are not well-formed `candump -l` frames.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayLogError {
+    /// Every line that was skipped, in order.
+    pub skipped: Vec<SkippedLine>,
+}
+
+impl std::fmt::Display for ReplayLogError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "candump log: {} unparseable line(s)", self.skipped.len())?;
+        if let Some(first) = self.skipped.first() {
+            write!(f, "; first at line {}: {:?}", first.number, first.text)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ReplayLogError {}
+
 /// Pops recorded frames in order; records everything sent.
+#[derive(Debug, Default)]
 pub struct ReplayBackend {
     frames: VecDeque<RecordedFrame>,
+    skipped: Vec<SkippedLine>,
     pub sent: Vec<(u32, [u8; 8])>,
 }
 
 impl ReplayBackend {
+    /// Forgiving constructor: unparseable lines are skipped, not rejected.
+    ///
+    /// Silence is the hazard here — a CAN FD capture (`ID##flags+data`)
+    /// loses *every* frame, and the resulting empty backend's `recv` returns
+    /// `Ok(None)` forever, which is indistinguishable from a trace that
+    /// finished normally. Check [`skipped`](Self::skipped) afterwards, or
+    /// use [`from_log_strict`](Self::from_log_strict), before trusting a
+    /// replay for golden-trace fidelity. Blank and whitespace-only lines are
+    /// not counted as skipped.
     pub fn from_log(text: &str) -> Self {
+        let mut frames = VecDeque::new();
+        let mut skipped = Vec::new();
+        for (i, line) in text.lines().enumerate() {
+            match parse_candump_line(line) {
+                Some(frame) => frames.push_back(frame),
+                None if line.trim().is_empty() => {}
+                None => skipped.push(SkippedLine {
+                    number: i + 1,
+                    text: line.to_string(),
+                }),
+            }
+        }
         Self {
-            frames: text.lines().filter_map(parse_candump_line).collect(),
+            frames,
+            skipped,
             sent: Vec::new(),
         }
+    }
+
+    /// Same as [`from_log`](Self::from_log), but a log with any unparseable
+    /// line is an error — the right default when a malformed line most
+    /// plausibly means a corrupt or wrong-format capture.
+    pub fn from_log_strict(text: &str) -> Result<Self, ReplayLogError> {
+        let backend = Self::from_log(text);
+        if backend.skipped.is_empty() {
+            Ok(backend)
+        } else {
+            Err(ReplayLogError {
+                skipped: backend.skipped,
+            })
+        }
+    }
+
+    /// Lines [`from_log`](Self::from_log) discarded, in log order.
+    pub fn skipped(&self) -> &[SkippedLine] {
+        &self.skipped
+    }
+
+    /// Frames still waiting to be handed out by `recv`.
+    pub fn remaining(&self) -> usize {
+        self.frames.len()
     }
 }
 
@@ -139,6 +220,73 @@ mod tests {
         assert!(parse_candump_line("1.0 can0 0300FD01#0102").is_none());
         // Too few whitespace-separated fields.
         assert!(parse_candump_line("(1.0) can0").is_none());
+    }
+
+    // What `candump -l` writes on a CAN FD capable adapter: `ID##flags+data`.
+    // The doubled '#' leaves the payload starting with '#', so every line
+    // fails to parse and the whole capture silently vanishes.
+    const CAN_FD_LOG: &str = "\
+(1755600000.000100) can0 0300FD01##10000000000000000
+(1755600000.000350) can0 028001FD##18000800080000159
+";
+
+    #[test]
+    fn from_log_reports_skipped_lines() {
+        let text = "\
+(1755600000.000100) can0 0300FD01#0000000000000000
+
+(1755600000.000350) can0 028001FD##18000800080000159
+this is not a frame line
+";
+        let r = ReplayBackend::from_log(text);
+        // The one good line still replays: from_log stays forgiving.
+        assert_eq!(r.remaining(), 1);
+        // Line 2 is blank and does not count; lines 3 and 4 do, with their
+        // 1-based numbers and original text.
+        assert_eq!(
+            r.skipped(),
+            &[
+                SkippedLine {
+                    number: 3,
+                    text: "(1755600000.000350) can0 028001FD##18000800080000159".to_string(),
+                },
+                SkippedLine {
+                    number: 4,
+                    text: "this is not a frame line".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn from_log_strict_rejects_a_can_fd_capture() {
+        // Without a signal this returns an empty backend whose recv yields
+        // Ok(None) forever -- indistinguishable from "trace finished".
+        let forgiving = ReplayBackend::from_log(CAN_FD_LOG);
+        assert_eq!(forgiving.remaining(), 0);
+        assert_eq!(forgiving.skipped().len(), 2);
+
+        let err = ReplayBackend::from_log_strict(CAN_FD_LOG).unwrap_err();
+        assert_eq!(err.skipped.len(), 2);
+        assert_eq!(err.skipped[0].number, 1);
+        let msg = err.to_string();
+        assert!(msg.contains("2 unparseable line(s)"), "{msg}");
+        assert!(msg.contains("first at line 1"), "{msg}");
+    }
+
+    #[test]
+    fn from_log_strict_accepts_a_clean_log() {
+        let mut r = ReplayBackend::from_log_strict(LOG).expect("clean log");
+        assert!(r.skipped().is_empty());
+        assert_eq!(r.remaining(), 3);
+        // Trailing and interior blank lines are not "dropped frames".
+        let padded = format!("\n{LOG}\n\n");
+        assert!(ReplayBackend::from_log_strict(&padded).is_ok());
+        assert_eq!(
+            r.recv(Duration::from_millis(1)).unwrap(),
+            Some((0x0300FD01, [0u8; 8]))
+        );
+        assert_eq!(r.remaining(), 2);
     }
 
     #[test]
