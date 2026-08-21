@@ -242,3 +242,68 @@ fn confirm_release_treats_read_errors_like_eof() {
         "expected one retry warning per read error, got: {text}"
     );
 }
+
+/// A mock `Write` whose `write`/`flush` fail on their very first call each,
+/// then succeed and capture output afterwards -- used only by the write-
+/// error regression test below.
+struct FlakyWrite {
+    write_calls: u32,
+    flush_calls: u32,
+    buf: Vec<u8>,
+}
+
+impl Write for FlakyWrite {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.write_calls += 1;
+        if self.write_calls == 1 {
+            return Err(std::io::Error::other("simulated broken stdout (write)"));
+        }
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.flush_calls += 1;
+        if self.flush_calls == 1 {
+            return Err(std::io::Error::other("simulated broken stdout (flush)"));
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn confirm_release_treats_write_errors_like_eof() {
+    // Regression test: `writeln!`/`flush` inside `confirm_release` used to
+    // propagate via a bare `?`. A broken stdout (or any other write
+    // failure) would then make `confirm_release` return `Err`, and the
+    // caller's `?` on that would drop the live `RunningArm` -- releasing
+    // torque with no typed RELEASE at all, the mirror image of the read-
+    // error bug fixed above, reached through the write side instead.
+    let mut out = FlakyWrite {
+        write_calls: 0,
+        flush_calls: 0,
+        buf: Vec::new(),
+    };
+    // "nope" forces one mismatch cycle before "RELEASE": the first
+    // prompt's write AND flush both fail (see FlakyWrite above), so this
+    // also exercises the write-failure pacing sleep before the second,
+    // successful, iteration.
+    let mut input = Cursor::new(b"nope\nRELEASE\n".to_vec());
+    confirm_release(&mut input, &mut out)
+        .expect("returns Ok after RELEASE despite the first write and flush failing");
+    assert!(
+        out.write_calls >= 2,
+        "expected at least one write to succeed after the first failure"
+    );
+    assert!(
+        out.flush_calls >= 2,
+        "expected at least one flush to succeed after the first failure"
+    );
+    let text = String::from_utf8(out.buf).unwrap();
+    // The first prompt's write failed and was never captured, but a later
+    // (successful) prompt attempt must still have gotten through.
+    assert!(
+        text.contains("Type RELEASE"),
+        "prompt never made it through: {text}"
+    );
+}

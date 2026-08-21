@@ -205,18 +205,34 @@ pub fn zero_motor(
 
 /// The typed-RELEASE gate, mirroring the official SDK's cli/safety.py:
 /// returns only once the operator typed RELEASE (case-insensitive,
-/// trimmed). Anything else — including EOF — keeps torque on and
-/// re-prompts. The caller disables the arm only after this returns.
+/// trimmed). Anything else — including EOF, other read errors, and
+/// prompt/warning write failures — keeps torque on and retries. The
+/// caller disables the arm only after this returns.
+///
+/// The `io::Result` return type is kept only for interface stability (the
+/// brief pins this signature); in practice this function now returns only
+/// on a typed RELEASE line and never propagates `Err`.
 pub fn confirm_release(
     input: &mut dyn std::io::BufRead,
     output: &mut dyn std::io::Write,
 ) -> std::io::Result<()> {
     loop {
-        writeln!(
+        // Prompting is best-effort: writing/flushing here must NEVER
+        // become a release path. If this function returned `Err` on a
+        // write failure (e.g. a broken stdout), the caller's `?` would
+        // drop the live `RunningArm`, and `RunningArm`'s `Drop` disables
+        // the motors -- releasing torque with no typed RELEASE at all.
+        // That is the exact same inversion closed for read errors below,
+        // just reached through the write side instead of the read side.
+        // The operator can't see a prompt that failed to print, but a
+        // HOLDING arm is still the correct failure direction.
+        let mut wrote_ok = writeln!(
             output,
             "arm is holding. Type RELEASE and press ENTER only when it is safe to release torque."
-        )?;
-        output.flush()?;
+        )
+        .is_ok();
+        wrote_ok &= output.flush().is_ok();
+
         let mut line = String::new();
         // EOF (`Ok(0)`) and any read `Err` are treated identically: keep
         // torque on, warn, sleep, and retry -- NEVER propagate. If this
@@ -235,19 +251,29 @@ pub fn confirm_release(
         // tests/commands.rs, which forces exactly that error kind).
         let is_data = matches!(input.read_line(&mut line), Ok(n) if n > 0);
         if !is_data {
-            writeln!(
+            let _ = writeln!(
                 output,
                 "input is unavailable; torque remains enabled while this process is alive"
-            )?;
+            );
             std::thread::sleep(std::time::Duration::from_secs(1));
             continue;
         }
         if line.trim().eq_ignore_ascii_case("release") {
             return Ok(());
         }
-        writeln!(
+        wrote_ok &= writeln!(
             output,
             "torque remains enabled; type RELEASE only when the arm is supported"
-        )?;
+        )
+        .is_ok();
+        // If every write this iteration failed, `read_line`'s normal
+        // blocking can no longer be trusted to pace the loop on its own
+        // (a pathological input could keep returning immediate mismatched
+        // lines while output stays fully broken); sleep the same 1s used
+        // for the dead-input case above so this can never spin at full
+        // CPU speed.
+        if !wrote_ok {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
     }
 }
