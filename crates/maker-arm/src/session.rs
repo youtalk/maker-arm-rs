@@ -342,6 +342,18 @@ impl Session {
     /// error encountered (send or drain) is remembered and returned after
     /// the sweep, so the caller learns the bus is unreliable while every
     /// reachable motor has still been commanded off.
+    ///
+    /// Also resets `fault`/`fault_hold`/`health`: torque is off and the
+    /// session is back at `Connected`, so whatever fault state got us here
+    /// is resolved and the health monitor must start clean on the next
+    /// `enable()` -- otherwise a single fault would permanently disable
+    /// health checking (`self.fault.is_some()` gates it in `tick()`) even
+    /// after a full `clear_faults()` + `enable()` cycle. The hold_on_fault
+    /// = false path in `enter_fault` calls `disable()` (hence this) and
+    /// then re-sets `self.fault` immediately afterward so the *caller* of
+    /// that specific tick still sees why the arm just went dark; an
+    /// externally-triggered `disable`/`estop`/`clear_faults` leaves it
+    /// cleared, as intended.
     fn disable_all(&mut self, clear_fault: bool) -> Result<(), SessionError> {
         let host = self.config.host_id;
         let motor_ids: Vec<u8> = self.config.joints.iter().map(|j| j.motor_id).collect();
@@ -360,6 +372,9 @@ impl Session {
             }
         }
         self.state = SessionState::Connected;
+        self.fault = None;
+        self.fault_hold = None;
+        self.health = HealthMonitor::new(&self.config);
         match first_err {
             Some(e) => Err(e),
             None => Ok(()),

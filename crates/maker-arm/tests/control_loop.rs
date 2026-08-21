@@ -154,36 +154,59 @@ fn nan_from_a_controller_becomes_a_holding_fault() {
 
 #[test]
 fn motor_fault_bits_trigger_hold_and_ignore_the_controller() {
+    // `Session` only learns about a motor's fault bits when a feedback
+    // frame carrying them is dispatched. `inject_fault` mutates the sim
+    // directly with no frame, so detection lands one tick after it (the
+    // reply to THIS tick's own MIT send, drained at the end of the tick,
+    // per Task 5's/Task 7's convention) -- the same one-control-period
+    // latency a real motor's feedback would have. That first tick DOES
+    // still apply the moving controller's output (nothing could have
+    // known better yet): on real hardware a motor ramps and moves only a
+    // fraction of a 0.2 rad step in 5 ms, but `SimArm` is an ideal servo
+    // that snaps instantly, so we only pin "never moved again" from the
+    // tick the fault is actually reported onward, not from `before`.
     let c = fast(ArmConfig::maker_arm_v1());
     let mut s = enabled_session(&c);
     let before = s.positions();
     s.backend_as_sim().unwrap().inject_fault(5, 0x21);
     let mut away = GoTo::new(&c, before.iter().map(|q| q + 0.2).collect());
-    let out = s.tick(&mut away).expect("tick");
+    let out1 = s.tick(&mut away).expect("tick 1: fault not visible yet");
+    assert!(out1.fault.is_none());
+    assert_eq!(s.state(), SessionState::Enabled);
+    let out2 = s.tick(&mut away).expect("tick 2: fault now visible");
     assert_eq!(
-        out.fault,
+        out2.fault,
         Some(FaultReason::MotorFault {
             motor_id: 5,
             bits: 0x21
         })
     );
     assert_eq!(s.state(), SessionState::Fault);
+    let held = s.positions();
     for _ in 0..5 {
         s.tick(&mut away).expect("hold");
     }
-    // the moving controller was never listened to after the fault
-    assert!((s.positions()[0] - before[0]).abs() < 1e-2);
+    // the moving controller was never listened to once the fault was
+    // actually detected and held
+    let after = s.positions();
+    for i in 0..7 {
+        assert!((after[i] - held[i]).abs() < 1e-3);
+    }
 }
 
 #[test]
 fn hold_on_fault_false_disables_outright() {
+    // Same one-tick detection latency as above; `HoldController` never
+    // moves the arm, so there is no ideal-servo jump to account for here.
     let mut c = fast(ArmConfig::maker_arm_v1());
     c.hold_on_fault = false;
     let mut s = enabled_session(&c);
     s.backend_as_sim().unwrap().inject_fault(2, 0x01);
     let mut hold = HoldController::from_config(&c);
-    let out = s.tick(&mut hold).expect("tick");
-    assert!(out.fault.is_some());
+    let out1 = s.tick(&mut hold).expect("tick 1: fault not visible yet");
+    assert!(out1.fault.is_none());
+    let out2 = s.tick(&mut hold).expect("tick 2: fault now visible");
+    assert!(out2.fault.is_some());
     assert_eq!(s.state(), SessionState::Connected);
     let sim = s.backend_as_sim().unwrap();
     for id in 1..=7u8 {
@@ -193,16 +216,28 @@ fn hold_on_fault_false_disables_outright() {
 
 #[test]
 fn stale_feedback_faults() {
+    // Every tick's own MIT reply refreshes ITS motor at the end of that
+    // same tick, so a motor kept in the loop stays "fresh" every control
+    // period; a muted motor's timestamp freezes at the moment it was
+    // muted and its age grows without bound. Drive real-time-paced ticks
+    // (via `run()`) long enough for a several-period gap to exceed a
+    // feedback_timeout comfortably larger than one nominal tick period,
+    // so ONLY the muted motor -- not all seven -- crosses it.
     let mut c = fast(ArmConfig::maker_arm_v1());
-    c.feedback_timeout = 0.005;
+    c.feedback_timeout = 0.02; // 4x the nominal 5 ms tick period
     let mut s = enabled_session(&c);
     let mut hold = HoldController::from_config(&c);
-    s.tick(&mut hold).expect("tick");
+    let stop = AtomicBool::new(false);
+    // Warm up: every motor's own feedback is fresh after a few real ticks.
+    s.run(&mut hold, &stop, Some(3)).expect("warm-up run");
+    assert!(s.fault().is_none());
     s.backend_as_sim().unwrap().set_muted(4, true);
-    std::thread::sleep(std::time::Duration::from_millis(15));
-    let out = s.tick(&mut hold).expect("tick");
+    // Drive enough further paced ticks for motor 4's un-refreshed age to
+    // cross feedback_timeout while the other six, refreshed every tick by
+    // their own MIT round trip, stay comfortably under it.
+    s.run(&mut hold, &stop, Some(15)).expect("run to fault");
     assert!(matches!(
-        out.fault,
+        s.fault(),
         Some(FaultReason::FeedbackTimeout { motor_id: 4, .. })
     ));
 }
@@ -234,4 +269,107 @@ fn run_paces_ticks_and_running_arm_lifecycle_works() {
     for id in 1..=7u8 {
         assert!(!sim.enabled(id));
     }
+}
+
+#[test]
+fn clearing_a_fault_resets_the_health_monitor_and_reenables_detection() {
+    // `Session::fault` is only ever set to `Some(..)`; unless something
+    // clears it, `tick()`'s `if self.fault.is_none()` gates stay closed
+    // forever, so the health monitor never runs again -- even across a
+    // clean clear_faults() + enable() cycle. Pin the intended recovery
+    // path: clear_faults() must reset `fault` (and the health monitor's
+    // internal counters) so a freshly re-enabled arm has live detection.
+    let c = fast(ArmConfig::maker_arm_v1());
+    let mut s = enabled_session(&c);
+    s.backend_as_sim().unwrap().inject_fault(3, 0x01);
+    let mut hold = HoldController::from_config(&c);
+    s.tick(&mut hold).expect("tick 1: fault not visible yet");
+    s.tick(&mut hold).expect("tick 2: fault now visible");
+    assert!(s.fault().is_some());
+    assert_eq!(s.state(), SessionState::Fault);
+
+    s.clear_faults().expect("clear_faults");
+    assert!(
+        s.fault().is_none(),
+        "clear_faults must reset the stale fault reason"
+    );
+    assert_eq!(s.state(), SessionState::Connected);
+    s.enable().expect("re-enable");
+
+    // Live again: a healthy tick after re-enable must not carry forward
+    // the old fault, and the health check must actually be running.
+    let mut hold2 = HoldController::from_config(&c);
+    let out = s.tick(&mut hold2).expect("tick after re-enable");
+    assert!(out.fault.is_none());
+    assert!(s.fault().is_none());
+    assert_eq!(s.state(), SessionState::Enabled);
+}
+
+#[test]
+fn run_keeps_holding_through_a_fault_until_max_ticks() {
+    // `run()`'s early-return condition (`state() == Connected`) is
+    // deliberately narrow: it must NOT also fire for `Fault`, or a
+    // hold-on-fault run would drop torque and let the arm fall instead of
+    // holding. Pin it by counting ticks actually executed (not just the
+    // final state, which would look the same either way): a `run()` that
+    // wrongly exits on `Fault` executes far fewer than `max_ticks`.
+    let c = fast(ArmConfig::maker_arm_v1());
+    let mut s = enabled_session(&c);
+    let before = s.positions();
+    let mut evil = GoesNan {
+        inner: GoTo::new(&c, before),
+        ticks: 0,
+    };
+    let stop = AtomicBool::new(false);
+    // Bounded: max_ticks caps the run even if something is badly wrong.
+    s.run(&mut evil, &stop, Some(50))
+        .expect("run through fault");
+    assert_eq!(s.state(), SessionState::Fault);
+    assert_eq!(
+        s.arm_state().tick,
+        50,
+        "run() must keep ticking (holding) through a fault, not exit early"
+    );
+    // torque never dropped -- still holding, not disabled
+    let sim = s.backend_as_sim().unwrap();
+    for id in 1..=7u8 {
+        assert!(sim.enabled(id));
+    }
+}
+
+#[test]
+fn command_side_respects_direction_and_offset() {
+    // Every `maker_arm_v1` joint has direction = 1.0, offset = 0.0, so a
+    // sign error in `j.direction * c.vel` / `j.direction * c.tau` inside
+    // `send_mit_all`, or a mis-ordered offset term feeding `to_motor`,
+    // would be invisible there -- the same class of latent, hardware-only
+    // bug the wrap-sign test above guards against. Exercise a SYNTHETIC
+    // joint with a nontrivial direction and offset instead of touching
+    // the pinned profile. (`SimArm` never stores or replies with the
+    // commanded velocity -- its MIT handler doesn't read it at all -- so
+    // this only covers position and torque.)
+    let mut c = fast(ArmConfig::maker_arm_v1());
+    c.joints[0].direction = -1.0;
+    c.joints[0].offset = 0.7;
+    let mut s = enabled_session(&c);
+    let target = mid(&c, 0);
+    let mut targets = s.positions();
+    targets[0] = target;
+    let mut go = GoTo::new(&c, targets);
+    go.tau = 1.0;
+    s.tick(&mut go).expect("tick");
+
+    // Position: read the RAW motor angle straight from the sim, bypassing
+    // decode entirely -- `to_motor` must actually have been applied, not
+    // skipped or applied with the operands swapped.
+    let raw_pos = s.backend_as_sim().unwrap().position(1); // motor_id 1 == joint index 0
+    let expected_raw_pos = c.joints[0].offset + c.joints[0].direction * target;
+    assert!((raw_pos - expected_raw_pos).abs() < 1e-2);
+
+    // Torque: decoded through Task 5's (unchanged) receive-side direction
+    // multiply, so a missing or wrong direction factor in `send_mit_all`
+    // flips its sign here (direction^2 == 1 only when BOTH sides apply
+    // it consistently).
+    let decoded_tau = s.arm_state().motors[0].torque;
+    assert!((decoded_tau - 1.0).abs() < 1e-2);
 }

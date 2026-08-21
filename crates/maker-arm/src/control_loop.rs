@@ -33,8 +33,15 @@ impl Session {
             self.set_state(SessionState::Fault);
             Ok(())
         } else {
+            // `disable()` (`disable_all`) resets `fault`/`fault_hold`/
+            // `health` as part of its general "back to a clean Connected
+            // state" contract -- re-set `fault` right after so THIS tick's
+            // caller still learns why the arm just went dark. An
+            // externally-triggered disable/estop/clear_faults leaves it
+            // cleared, as intended (see `disable_all`'s doc comment).
+            let result = self.disable();
             self.fault = Some(reason);
-            self.disable()
+            result
         }
     }
 
@@ -48,14 +55,12 @@ impl Session {
             });
         }
         self.drain()?;
-        // While not already faulted, solicit fresh feedback before deciding:
-        // a motor's cached state only updates when a feedback frame is
-        // dispatched, so without this a fault could go undetected for a
-        // full tick (and the moving controller could be sent once more
-        // before the loop ever notices).
-        if self.fault.is_none() {
-            self.refresh_feedback()?;
-        }
+        // Health checks below run on whatever's cached: a motor's state
+        // only updates when a feedback frame is dispatched, so a fault
+        // that appears between ticks is visible starting from the tick
+        // after its own MIT round trip lands (drained at the end of THIS
+        // tick, below) -- one tick (one control period) of detection
+        // latency, same as on real hardware.
         let snapshot = self.arm_state();
         // Owned copy: `self.health.check(&mut ...)` and `self.config()`
         // (&self method) cannot borrow `self` simultaneously.
@@ -120,21 +125,6 @@ impl Session {
             fault: self.fault.clone(),
             clamped,
         })
-    }
-
-    /// Actively solicits fresh feedback from every motor with a
-    /// non-disruptive ENABLE re-send (a no-op on an already-enabled
-    /// motor, mirroring how `probe()` uses DISABLE as a non-disruptive
-    /// read while torque-free) and drains the replies. Never touches
-    /// torque, position, or gains.
-    fn refresh_feedback(&mut self) -> Result<(), SessionError> {
-        let host = self.config().host_id;
-        let motor_ids: Vec<u8> = self.config().joints.iter().map(|j| j.motor_id).collect();
-        for m in motor_ids {
-            let f = maker_arm_protocol::encode_enable(m, host);
-            self.send_raw(f.id, &f.data)?;
-        }
-        self.drain()
     }
 
     fn send_mit_all(&mut self, cmd: &[crate::state::JointCommand]) -> Result<(), SessionError> {
@@ -238,7 +228,10 @@ impl Session {
             }
             (self, result)
         });
-        RunningArm { shared, handle }
+        RunningArm {
+            shared,
+            handle: Some(handle),
+        }
     }
 }
 
@@ -257,7 +250,9 @@ pub struct Snapshot {
 
 pub struct RunningArm {
     shared: Arc<LoopShared>,
-    handle: std::thread::JoinHandle<(Session, Result<(), SessionError>)>,
+    // `Option` so `stop_and_disable` (which consumes `self`) can `take()`
+    // the handle and join it without leaving `Drop` to double-join.
+    handle: Option<std::thread::JoinHandle<(Session, Result<(), SessionError>)>>,
 }
 
 impl RunningArm {
@@ -272,8 +267,30 @@ impl RunningArm {
     }
 
     /// Disable all motors and join the control thread.
-    pub fn stop_and_disable(self) -> (Session, Result<(), SessionError>) {
+    pub fn stop_and_disable(mut self) -> (Session, Result<(), SessionError>) {
         self.shared.stop.store(true, Ordering::Relaxed);
-        self.handle.join().expect("control thread panicked")
+        self.handle
+            .take()
+            .expect("handle only ever taken here or in Drop, and self is consumed after")
+            .join()
+            .expect("control thread panicked")
+    }
+}
+
+impl Drop for RunningArm {
+    /// Without this, dropping a `RunningArm` instead of calling
+    /// `stop_and_disable()` leaves the background thread's own
+    /// `Arc<LoopShared>` clone as the only thing keeping `stop` alive: it
+    /// never gets set, and the detached thread keeps MIT-streaming with
+    /// torque on forever (refreshing the motor-side CAN_TIMEOUT watchdog
+    /// along the way, so even that safety net never fires). Signal `stop`
+    /// and join so a dropped handle still leaves the arm disabled -- the
+    /// spawned thread already disables on any non-error exit from its
+    /// loop.
+    fn drop(&mut self) {
+        self.shared.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
     }
 }
