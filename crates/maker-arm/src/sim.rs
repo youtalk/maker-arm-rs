@@ -295,6 +295,28 @@ mod tests {
     }
 
     #[test]
+    fn seeded_param_defaults_are_pinned() {
+        // CAN_TIMEOUT and VBUS are seeded at construction (sim.rs); a wrong
+        // literal in either would pass silently today and only surface as a
+        // confusing failure downstream (Task 5's enable sequence writes and
+        // verifies CAN_TIMEOUT; Task 9's `doctor` command reads VBUS).
+        let c = ArmConfig::maker_arm_v1();
+        let mut sim = SimArm::new(&c);
+        // CAN_TIMEOUT defaults to 0 before any write.
+        assert_eq!(sim.param_u32(2, p::param_index::CAN_TIMEOUT), Some(0));
+        // VBUS defaults to 24.0, read back over the wire (no param_f32 hook
+        // exists, and the brief's hook list is fixed).
+        let f = p::encode_read_param(2, p::param_index::VBUS, c.host_id);
+        sim.send(f.id, &f.data).unwrap();
+        let p::ParsedFrame::ParamReply(r) = recv_parsed(&mut sim, &p::RS02) else {
+            panic!("expected param reply");
+        };
+        assert_eq!(r.motor_id, 2);
+        assert_eq!(r.index, p::param_index::VBUS);
+        assert_eq!(r.as_f32(), 24.0);
+    }
+
+    #[test]
     fn unknown_motor_and_muted_motor_do_not_reply() {
         let c = ArmConfig::maker_arm_v1();
         let mut sim = SimArm::new(&c);
@@ -305,6 +327,31 @@ mod tests {
         let f = p::encode_disable(4, false, c.host_id);
         sim.send(f.id, &f.data).unwrap();
         assert_eq!(sim.recv(Duration::ZERO).unwrap(), None);
+    }
+
+    #[test]
+    fn unknown_comm_type_to_a_valid_motor_is_ignored() {
+        // Distinct from unknown_motor_and_muted_motor_do_not_reply: the motor
+        // id here (2) IS one of the arm's seven motors. COMM_SAVE is a real
+        // RobStride comm type that SimArm does not implement, so it must
+        // fall into send()'s wildcard arm: no reply, and no state mutation.
+        let c = ArmConfig::maker_arm_v1();
+        let mut sim = SimArm::new(&c);
+        sim.inject_fault(2, 0x05);
+        let before_pos = sim.motors[&2].position;
+        let before_mode = sim.motors[&2].mode();
+        let before_fault = sim.motors[&2].fault_bits;
+        let before_can_timeout = sim.param_u32(2, p::param_index::CAN_TIMEOUT);
+        let f = p::encode_save_params(2, c.host_id);
+        sim.send(f.id, &f.data).unwrap();
+        assert_eq!(sim.recv(Duration::ZERO).unwrap(), None);
+        assert_eq!(sim.motors[&2].position, before_pos);
+        assert_eq!(sim.motors[&2].mode(), before_mode);
+        assert_eq!(sim.motors[&2].fault_bits, before_fault);
+        assert_eq!(
+            sim.param_u32(2, p::param_index::CAN_TIMEOUT),
+            before_can_timeout
+        );
     }
 
     #[test]
