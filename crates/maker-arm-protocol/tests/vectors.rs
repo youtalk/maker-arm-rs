@@ -305,3 +305,50 @@ fn parse_fault_frame() {
     assert_eq!(fault.motor_id, 5);
     assert_eq!(fault.raw, [0xAA, 0xBB, 0xCC, 0x00, 0x00, 0x00, 0x00, 0x00]);
 }
+
+#[test]
+fn encode_feedback_inverts_parse() {
+    let fb = MotorFeedback {
+        motor_id: 3,
+        position: 1.234,
+        velocity: -2.5,
+        torque: 0.75,
+        temperature: 34.5,
+        mode: 2,
+        fault_bits: 0,
+    };
+    let f = encode_feedback(&fb, &RS00, HOST_CAN_ID);
+    // 29-bit id: comm=2 | mode in bits 23..22 | fault in 21..16 | motor in 15..8 | host
+    assert_eq!(f.id, (2u32 << 24) | (2 << 22) | (3 << 8) | 0xFD);
+    let Some(ParsedFrame::Feedback(back)) = parse_frame(f.id, &f.data, &RS00) else {
+        panic!("expected feedback");
+    };
+    assert_eq!(back.motor_id, 3);
+    assert_eq!(back.mode, 2);
+    assert_eq!(back.fault_bits, 0);
+    approx(back.position, 1.234, 25.14 / 65535.0);
+    approx(back.velocity, -2.5, 66.0 / 65535.0);
+    approx(back.torque, 0.75, 28.0 / 65535.0);
+    approx(back.temperature, 34.5, 1e-9);
+
+    // fault bits and the golden zero-pose frame
+    let fb2 = MotorFeedback {
+        motor_id: 1,
+        fault_bits: 0x21,
+        ..fb
+    };
+    let f2 = encode_feedback(&fb2, &RS00, HOST_CAN_ID);
+    assert_eq!((f2.id >> 16) & 0x3F, 0x21);
+    let zero = MotorFeedback {
+        motor_id: 1,
+        position: 0.0,
+        velocity: 0.0,
+        torque: 0.0,
+        temperature: 34.5,
+        mode: 2,
+        fault_bits: 0,
+    };
+    let f3 = encode_feedback(&zero, &RS00, HOST_CAN_ID);
+    assert_eq!(f3.id, 0x028001FD);
+    assert_eq!(f3.data.to_vec(), hex("8000800080000159"));
+}
