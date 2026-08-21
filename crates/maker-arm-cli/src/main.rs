@@ -1,3 +1,5 @@
+use std::io::Write;
+
 use clap::{Parser, Subcommand};
 use maker_arm::{ArmConfig, HoldController, Session, SimArm};
 use maker_arm_transport::CanBackend;
@@ -147,23 +149,52 @@ fn main() -> Result<(), String> {
                 Session::connect(backend, config.clone()).map_err(|e| e.to_string())?;
             session.enable().map_err(|e| e.to_string())?;
             let running = session.start(Box::new(HoldController::from_config(&config)));
-            println!("enabled; holding at the current pose (200 Hz).");
+            // EVERYTHING from here to `confirm_release` runs with a live,
+            // torque-on `RunningArm` on the stack, and `RunningArm`'s
+            // `Drop` disables the motors. So any panic or `?` in this span
+            // releases the arm with no typed RELEASE at all -- the exact
+            // inversion two earlier fix rounds closed INSIDE
+            // `confirm_release`. Nothing here may unwind or return early:
+            // prints are best-effort (`println!` panics on a broken
+            // stdout, e.g. `... --sim hold | head`), and a handler that
+            // cannot be installed is a warning, not an exit.
+            let _ = writeln!(
+                std::io::stdout(),
+                "enabled; holding at the current pose (200 Hz)."
+            );
             // Ctrl-C must HOLD, never release (design §4 / upstream safety.py).
             {
                 let running_hold = running.shared_hold_handle();
-                ctrlc::set_handler(move || {
+                if let Err(e) = ctrlc::set_handler(move || {
                     running_hold.hold_now();
-                    eprintln!("\ntorque remains enabled; type RELEASE when safe");
-                })
-                .map_err(|e| e.to_string())?;
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "\ntorque remains enabled; type RELEASE when safe"
+                    );
+                }) {
+                    // Losing the Ctrl-C convenience is strictly better than
+                    // dropping a live arm because a handler could not be
+                    // installed. Without it, Ctrl-C terminates this process
+                    // outright and the motors' own CAN_TIMEOUT watchdog is
+                    // the only backstop -- so say so, and continue into the
+                    // gate, which is still the only way to release cleanly.
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "WARNING: could not install the Ctrl-C handler ({e}); Ctrl-C will \
+                         kill this process instead of holding, leaving the motors to their \
+                         own CAN_TIMEOUT watchdog. Type RELEASE to release cleanly."
+                    );
+                }
             }
             let stdin = std::io::stdin();
             let mut input = stdin.lock();
             let mut output = std::io::stdout();
-            maker_arm_cli::confirm_release(&mut input, &mut output).map_err(|e| e.to_string())?;
+            maker_arm_cli::confirm_release(&mut input, &mut output);
+            // Past the gate: torque is commanded off before anything below
+            // can fail, so `?` is safe again from here on.
             let (_session, res) = running.stop_and_disable();
             res.map_err(|e| e.to_string())?;
-            println!("torque released.");
+            let _ = writeln!(std::io::stdout(), "torque released.");
         }
     }
     Ok(())

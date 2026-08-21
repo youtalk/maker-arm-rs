@@ -120,7 +120,7 @@ fn confirm_release_accepts_only_release() {
     // wrong input, then case-insensitive + whitespace-tolerant match
     let mut input = Cursor::new(b"nope\n  release \n".to_vec());
     let mut out = Vec::new();
-    confirm_release(&mut input, &mut out).expect("returns after RELEASE");
+    confirm_release(&mut input, &mut out); // returns only on RELEASE
     let text = String::from_utf8(out).unwrap();
     // the prompt and the mismatch warning both appeared
     assert!(text.contains("Type RELEASE"));
@@ -162,7 +162,7 @@ fn confirm_release_never_returns_on_eof_and_keeps_retrying() {
     std::thread::spawn(move || {
         let mut input = Cursor::new(Vec::new()); // empty: read_line is EOF immediately
         let mut out = out_for_thread;
-        let _ = confirm_release(&mut input, &mut out); // never expected to return
+        confirm_release(&mut input, &mut out); // never expected to return
         let _ = tx.send(());
     });
     // Bounded wait: if this ever receives, confirm_release wrongly returned
@@ -232,8 +232,9 @@ fn confirm_release_treats_read_errors_like_eof() {
     // on, warn, sleep, and retry.
     let mut input = FlakyThenRelease { calls: 0 };
     let mut out = Vec::new();
-    confirm_release(&mut input, &mut out)
-        .expect("returns Ok after RELEASE despite two read errors first");
+    // Returns (no `Result` to check: every failure mode inside is
+    // warn-and-retry, so the signature has no `Err` variant at all).
+    confirm_release(&mut input, &mut out);
     assert_eq!(input.calls, 3);
     let text = String::from_utf8(out).unwrap();
     assert_eq!(
@@ -289,8 +290,8 @@ fn confirm_release_treats_write_errors_like_eof() {
     // also exercises the write-failure pacing sleep before the second,
     // successful, iteration.
     let mut input = Cursor::new(b"nope\nRELEASE\n".to_vec());
-    confirm_release(&mut input, &mut out)
-        .expect("returns Ok after RELEASE despite the first write and flush failing");
+    // Returns despite the first write AND flush failing.
+    confirm_release(&mut input, &mut out);
     assert!(
         out.write_calls >= 2,
         "expected at least one write to succeed after the first failure"

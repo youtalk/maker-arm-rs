@@ -209,13 +209,15 @@ pub fn zero_motor(
 /// prompt/warning write failures — keeps torque on and retries. The
 /// caller disables the arm only after this returns.
 ///
-/// The `io::Result` return type is kept only for interface stability (the
-/// brief pins this signature); in practice this function now returns only
-/// on a typed RELEASE line and never propagates `Err`.
-pub fn confirm_release(
-    input: &mut dyn std::io::BufRead,
-    output: &mut dyn std::io::Write,
-) -> std::io::Result<()> {
+/// Returns `()`, not `io::Result<()>`: every failure mode inside was made
+/// non-releasing (read errors and write errors alike are warn-and-retry),
+/// so there is no longer any `Err` to return. The plan pinned an
+/// `io::Result` signature, but a `Result` that can never be `Err` is dead
+/// failure surface on a safety gate — it invites a caller's `?`, and a
+/// `?` here drops the live `RunningArm`, whose `Drop` disables the
+/// motors: a release with no typed RELEASE at all. Deliberate,
+/// approved deviation from the plan.
+pub fn confirm_release(input: &mut dyn std::io::BufRead, output: &mut dyn std::io::Write) {
     loop {
         // Prompting is best-effort: writing/flushing here must NEVER
         // become a release path. If this function returned `Err` on a
@@ -259,7 +261,7 @@ pub fn confirm_release(
             continue;
         }
         if line.trim().eq_ignore_ascii_case("release") {
-            return Ok(());
+            return;
         }
         wrote_ok &= writeln!(
             output,
