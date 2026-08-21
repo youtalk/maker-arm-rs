@@ -3,7 +3,8 @@ use maker_arm::{
     Session, SessionState, SimArm,
 };
 use std::f64::consts::TAU;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 fn fast(mut c: ArmConfig) -> ArmConfig {
@@ -206,7 +207,13 @@ fn hold_on_fault_false_disables_outright() {
     let out1 = s.tick(&mut hold).expect("tick 1: fault not visible yet");
     assert!(out1.fault.is_none());
     let out2 = s.tick(&mut hold).expect("tick 2: fault now visible");
-    assert!(out2.fault.is_some());
+    assert_eq!(
+        out2.fault,
+        Some(FaultReason::MotorFault {
+            motor_id: 2,
+            bits: 0x01
+        })
+    );
     assert_eq!(s.state(), SessionState::Connected);
     let sim = s.backend_as_sim().unwrap();
     for id in 1..=7u8 {
@@ -372,4 +379,109 @@ fn command_side_respects_direction_and_offset() {
     // it consistently).
     let decoded_tau = s.arm_state().motors[0].torque;
     assert!((decoded_tau - 1.0).abs() < 1e-2);
+}
+
+#[test]
+fn reenabling_without_clear_faults_still_resets_the_stale_fault() {
+    // Critical 2's original fix lives in disable_all (reached by
+    // disable/estop/clear_faults). But the hold_on_fault=false path
+    // disables via enter_fault's own call to disable() -- so the same
+    // fault-never-clears latch can re-form on a caller who calls
+    // enable() again DIRECTLY, without an intervening clear_faults().
+    // enable() must also clear a stale fault on its own success path.
+    let mut c = fast(ArmConfig::maker_arm_v1());
+    c.hold_on_fault = false;
+    let mut s = enabled_session(&c);
+    s.backend_as_sim().unwrap().inject_fault(6, 0x02);
+    let mut hold = HoldController::from_config(&c);
+    s.tick(&mut hold).expect("tick 1: fault not visible yet");
+    s.tick(&mut hold).expect("tick 2: fault now visible");
+    assert_eq!(
+        s.fault().cloned(),
+        Some(FaultReason::MotorFault {
+            motor_id: 6,
+            bits: 0x02
+        })
+    );
+    assert_eq!(s.state(), SessionState::Connected);
+
+    // Clear the sim-side fault bits so what's under test here is
+    // enable()'s OWN reset, not a still-genuinely-faulted motor 6
+    // re-tripping the health check immediately after re-enable.
+    s.backend_as_sim().unwrap().inject_fault(6, 0x00);
+
+    // Re-enable DIRECTLY: no clear_faults() call in between.
+    s.enable().expect("re-enable without clear_faults");
+    assert!(
+        s.fault().is_none(),
+        "enable() must clear a stale fault on its success path"
+    );
+    assert_eq!(s.state(), SessionState::Enabled);
+
+    // Health check must be live again: inject a fresh fault on a
+    // different motor and confirm it's still detected, not silently
+    // swallowed by a permanently-closed `self.fault.is_none()` gate.
+    let mut hold2 = HoldController::from_config(&c);
+    s.backend_as_sim().unwrap().inject_fault(1, 0x04);
+    let out1 = s.tick(&mut hold2).expect("tick 1 after re-enable");
+    assert!(out1.fault.is_none());
+    let out2 = s.tick(&mut hold2).expect("tick 2 after re-enable");
+    assert_eq!(
+        out2.fault,
+        Some(FaultReason::MotorFault {
+            motor_id: 1,
+            bits: 0x04
+        })
+    );
+}
+
+#[test]
+fn dropping_a_running_arm_stops_the_background_thread() {
+    // Regression for RunningArm's Drop impl: dropping the handle instead
+    // of calling stop_and_disable() used to leave the background
+    // thread's OWN Arc<LoopShared> clone as the only thing keeping it
+    // alive -- `stop` never got set, and the detached thread kept
+    // ticking (and MIT-streaming with torque on) forever. Verify via a
+    // counter that lives entirely in the test's own Arc -- no access to
+    // the Session or backend is needed (and none is available: a bare
+    // `drop()` never hands the Session back, unlike `stop_and_disable`).
+    struct CountingController {
+        ticks: Arc<AtomicU64>,
+        inner: HoldController,
+    }
+    impl Controller for CountingController {
+        fn update(&mut self, state: &ArmState, dt: f64) -> ArmCommand {
+            self.ticks.fetch_add(1, Ordering::Relaxed);
+            self.inner.update(state, dt)
+        }
+    }
+
+    let c = fast(ArmConfig::maker_arm_v1());
+    let s = enabled_session(&c);
+    let ticks = Arc::new(AtomicU64::new(0));
+    let controller = CountingController {
+        ticks: ticks.clone(),
+        inner: HoldController::from_config(&c),
+    };
+    let running = s.start(Box::new(controller));
+
+    // Let it tick a handful of times before we drop instead of releasing
+    // properly.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    drop(running); // NOT stop_and_disable() -- this is the regression path.
+
+    // `Drop` joins the thread before returning, so by the time `drop()`
+    // above returns, a CORRECT implementation has already stopped it.
+    // Sample now, then again after a generous margin: a leaked thread
+    // keeps incrementing at ~200 Hz and the counts would differ; a
+    // stopped one leaves them equal. Generous sleep on purpose -- a
+    // slow-but-correct result must never read as a false failure in CI.
+    let after_drop = ticks.load(Ordering::Relaxed);
+    assert!(after_drop > 0, "controller should have ticked before drop");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let after_wait = ticks.load(Ordering::Relaxed);
+    assert_eq!(
+        after_drop, after_wait,
+        "dropping RunningArm must stop the background thread, not leak it"
+    );
 }

@@ -332,6 +332,18 @@ impl Session {
         // below fails -- state must never lag reality in the unsafe
         // direction (Connected while motors are actually enabled).
         self.state = SessionState::Enabled;
+        // A freshly (re-)enabled session starts clean: any fault info
+        // that got us here (e.g. a hold_on_fault=false disable-on-fault
+        // that the caller re-enabled directly, without an intervening
+        // clear_faults()) no longer applies now that torque is back on,
+        // and the health monitor must not carry forward stale per-motor
+        // counters. Cleared here on the SUCCESS path only -- clearing at
+        // function entry would throw away the fault reason if enable()
+        // then failed partway through verification, exactly when a
+        // caller most wants to read it.
+        self.fault = None;
+        self.fault_hold = None;
+        self.health = HealthMonitor::new(&self.config);
         self.drain()?;
         Ok(())
     }
