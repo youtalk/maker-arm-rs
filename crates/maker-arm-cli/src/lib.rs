@@ -182,3 +182,58 @@ pub fn doctor(
     ];
     Ok(DoctorReport { rows, warnings })
 }
+
+/// Zeroes one motor (torque-free operation) and re-probes to confirm.
+pub fn zero_motor(
+    backend: &mut dyn CanBackend,
+    config: &ArmConfig,
+    motor_id: u8,
+) -> Result<f64, String> {
+    let j = config
+        .joint_by_motor_id(motor_id)
+        .ok_or_else(|| format!("unknown motor id {motor_id}"))?
+        .clone();
+    let f = p::encode_set_zero(motor_id, config.host_id);
+    backend.send(f.id, &f.data).map_err(|e| e.to_string())?;
+    // consume the set-zero feedback, then probe for a fresh reading
+    let _ = probe_one(backend, &j, config.host_id).map_err(|e| e.to_string())?;
+    match probe_one(backend, &j, config.host_id).map_err(|e| e.to_string())? {
+        Some(fb) => Ok(j.to_joint(fb.position)),
+        None => Err(format!("motor {motor_id} did not answer after set-zero")),
+    }
+}
+
+/// The typed-RELEASE gate, mirroring the official SDK's cli/safety.py:
+/// returns only once the operator typed RELEASE (case-insensitive,
+/// trimmed). Anything else — including EOF — keeps torque on and
+/// re-prompts. The caller disables the arm only after this returns.
+pub fn confirm_release(
+    input: &mut dyn std::io::BufRead,
+    output: &mut dyn std::io::Write,
+) -> std::io::Result<()> {
+    loop {
+        writeln!(
+            output,
+            "arm is holding. Type RELEASE and press ENTER only when it is safe to release torque."
+        )?;
+        output.flush()?;
+        let mut line = String::new();
+        let n = input.read_line(&mut line)?;
+        if n == 0 {
+            // EOF: never release on a dead stdin (upstream sleeps and retries)
+            writeln!(
+                output,
+                "input is unavailable; torque remains enabled while this process is alive"
+            )?;
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            continue;
+        }
+        if line.trim().eq_ignore_ascii_case("release") {
+            return Ok(());
+        }
+        writeln!(
+            output,
+            "torque remains enabled; type RELEASE only when the arm is supported"
+        )?;
+    }
+}

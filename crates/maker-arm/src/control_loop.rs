@@ -277,6 +277,28 @@ impl RunningArm {
     }
 }
 
+/// Clonable handle that can request a hold from signal context (e.g. a
+/// Ctrl-C handler, which cannot borrow the `RunningArm` it interrupts).
+#[derive(Clone)]
+pub struct HoldHandle {
+    shared: Arc<LoopShared>,
+}
+
+impl HoldHandle {
+    /// Same effect as `RunningArm::hold_now`: torque stays ON.
+    pub fn hold_now(&self) {
+        self.shared.hold_now.store(true, Ordering::Relaxed);
+    }
+}
+
+impl RunningArm {
+    pub fn shared_hold_handle(&self) -> HoldHandle {
+        HoldHandle {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+}
+
 impl Drop for RunningArm {
     /// Without this, dropping a `RunningArm` instead of calling
     /// `stop_and_disable()` leaves the background thread's own

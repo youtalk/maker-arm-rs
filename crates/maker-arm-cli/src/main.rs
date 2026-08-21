@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use maker_arm::{ArmConfig, SimArm};
+use maker_arm::{ArmConfig, HoldController, Session, SimArm};
 use maker_arm_transport::CanBackend;
 
 #[derive(Parser)]
@@ -24,6 +24,16 @@ enum Command {
     Scan,
     /// Scan plus param reads, limit checks, and known-trap warnings
     Doctor,
+    /// Zero one motor's position register (torque-free; confirm required)
+    Zero {
+        #[arg(long)]
+        motor: u8,
+        /// Skip the interactive confirmation
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Connect, enable, and hold the current pose until a typed RELEASE
+    Hold,
 }
 
 fn open_backend(cli: &Cli, config: &ArmConfig) -> Result<Box<dyn CanBackend>, String> {
@@ -100,6 +110,45 @@ fn main() -> Result<(), String> {
             if report.rows.iter().any(|r| !r.present || !r.in_limits) {
                 return Err("doctor found problems (see rows above)".into());
             }
+        }
+        Command::Zero { motor, yes } => {
+            if !yes {
+                println!(
+                    "zeroing motor {motor} overwrites its zero position. Type YES to continue."
+                );
+                let mut line = String::new();
+                std::io::stdin()
+                    .read_line(&mut line)
+                    .map_err(|e| e.to_string())?;
+                if line.trim() != "YES" {
+                    return Err("aborted".into());
+                }
+            }
+            let pos = maker_arm_cli::zero_motor(backend.as_mut(), &config, motor)?;
+            println!("motor {motor} zeroed; joint position now {pos:.4} rad");
+        }
+        Command::Hold => {
+            let mut session =
+                Session::connect(backend, config.clone()).map_err(|e| e.to_string())?;
+            session.enable().map_err(|e| e.to_string())?;
+            let running = session.start(Box::new(HoldController::from_config(&config)));
+            println!("enabled; holding at the current pose (200 Hz).");
+            // Ctrl-C must HOLD, never release (design §4 / upstream safety.py).
+            {
+                let running_hold = running.shared_hold_handle();
+                ctrlc::set_handler(move || {
+                    running_hold.hold_now();
+                    eprintln!("\ntorque remains enabled; type RELEASE when safe");
+                })
+                .map_err(|e| e.to_string())?;
+            }
+            let stdin = std::io::stdin();
+            let mut input = stdin.lock();
+            let mut output = std::io::stdout();
+            maker_arm_cli::confirm_release(&mut input, &mut output).map_err(|e| e.to_string())?;
+            let (_session, res) = running.stop_and_disable();
+            res.map_err(|e| e.to_string())?;
+            println!("torque released.");
         }
     }
     Ok(())

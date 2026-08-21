@@ -15,7 +15,7 @@ pub mod state;
 
 pub use clamp::{clamp_command, ClampError};
 pub use config::{ArmConfig, JointConfig, MotorModel};
-pub use control_loop::{RunningArm, Snapshot, TickOutcome};
+pub use control_loop::{HoldHandle, RunningArm, Snapshot, TickOutcome};
 pub use controller::{Controller, HoldController};
 pub use health::{FaultReason, HealthMonitor};
 pub use session::{Session, SessionError, SessionState};
