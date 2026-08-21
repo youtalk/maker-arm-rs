@@ -222,26 +222,34 @@ mod tests {
     fn per_motor_mode_independence() {
         let c = ArmConfig::maker_arm_v1();
         let mut h = HealthMonitor::new(&c);
-        // Run 12 ticks (well past mode_fault_ticks=5) with alternating per-motor failures.
-        // Motor 1 (index 0) bad on odd ticks, motor 2 (index 1) bad on even ticks.
-        // If counters were shared or not per-motor, one would accumulate to the threshold.
-        for tick in 0..12 {
+        // Two motors bad simultaneously on every tick: motors 1 and 2 (indices 0 and 1)
+        // report mode != 2, while motors 3..7 (indices 2..6) are healthy.
+        // Per-motor Vec: each motor gets 1 tick per call, motor 1 reaches 5 on tick 5,
+        // faults with motor_id=1 and ticks=5 (it checks first).
+        // Shared counter: increments by 2 per tick (both motors bad), crosses 5 on tick 3,
+        // would fault early with wrong tick count.
+        for tick in 1..=5 {
             let mut s = healthy(&c);
-            // Motor 1 bad on odd ticks (1, 3, 5, 7, 9, 11)
-            if tick % 2 == 1 {
-                s.motors[0].mode = 0;
+            s.motors[0].mode = 0; // Motor 1 bad
+            s.motors[1].mode = 0; // Motor 2 bad
+            if tick < 5 {
+                assert_eq!(
+                    h.check(&s, &c),
+                    None,
+                    "tick {}: expected no fault, counters per-motor still accumulating",
+                    tick
+                );
+            } else {
+                // Tick 5: motor 1's counter reaches 5 and faults
+                assert_eq!(
+                    h.check(&s, &c),
+                    Some(FaultReason::ModeNotMotor {
+                        motor_id: 1,
+                        ticks: 5
+                    }),
+                    "tick 5: motor 1 should fault with exactly 5 ticks"
+                );
             }
-            // Motor 2 bad on even ticks (0, 2, 4, 6, 8, 10)
-            if tick % 2 == 0 {
-                s.motors[1].mode = 0;
-            }
-            // Neither accumulates because each resets when healthy on alternate ticks
-            assert_eq!(
-                h.check(&s, &c),
-                None,
-                "tick {}: expected no fault with per-motor independence",
-                tick
-            );
         }
     }
 }
