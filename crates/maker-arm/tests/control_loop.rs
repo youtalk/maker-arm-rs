@@ -485,3 +485,95 @@ fn dropping_a_running_arm_stops_the_background_thread() {
         "dropping RunningArm must stop the background thread, not leak it"
     );
 }
+
+#[test]
+fn commands_travel_through_a_negative_wrap_too() {
+    // Mirror of `commands_travel_through_wrap_and_conversion` for the
+    // OTHER sign: park motor 4 one turn HIGH so connect assigns
+    // wrap = -2π (the branch that used to have zero coverage, and the one
+    // that can push `to_motor(q) - wrap` past the encoder's +12.57).
+    // J4's whole range still maps here (see the session-level test), so
+    // commands must round-trip exactly as they do for +2π.
+    let c = fast(ArmConfig::maker_arm_v1());
+    let mut sim = SimArm::new(&c);
+    let true_j4 = mid(&c, 3);
+    sim.set_position(4, true_j4 + TAU);
+    let mut s = Session::connect(Box::new(sim), c.clone()).expect("connect");
+    s.enable().expect("enable");
+    let mut targets = s.positions();
+    targets[3] = true_j4 + 0.1;
+    let mut go = GoTo::new(&c, targets);
+    for _ in 0..3 {
+        s.tick(&mut go).expect("tick");
+    }
+    // decoded joint position round-trips
+    assert!((s.positions()[3] - (true_j4 + 0.1)).abs() < 1e-2);
+    // and the raw motor angle stayed on the wrapped (one-turn-high) branch
+    let raw = s.backend_as_sim().unwrap().position(4);
+    assert!(
+        (raw - (true_j4 + 0.1 + TAU)).abs() < 1e-2,
+        "raw motor angle {raw} left the -2π branch"
+    );
+}
+
+#[test]
+fn a_saturating_motor_position_faults_instead_of_being_truncated() {
+    // Backstop for the same critical finding: if a computed motor-frame
+    // position ever falls outside the encoder's ±12.57 window,
+    // `encode_mit`'s `float_to_u16` would clamp it to the rail and report
+    // nothing -- a silently truncated position command at full kp. The
+    // output stage must fault instead.
+    //
+    // The connect-time check makes this unreachable through the normal
+    // path (it verifies exactly the range the clamp permits), so the test
+    // has to widen the clamp AFTER that check: `limit_margin` is
+    // subtracted from q_hi and added to q_lo, so a NEGATIVE margin widens
+    // the permitted command range beyond the bounds connect verified --
+    // precisely the class of mistake this backstop exists to catch.
+    // J4 parked one turn high gives wrap = -2π, so a commanded 6.3 rad
+    // maps to 6.3 + 6.283 = 12.583 rad, just past +12.57.
+    let mut c = fast(ArmConfig::maker_arm_v1());
+    c.limit_margin = -4.2;
+    let mut sim = SimArm::new(&c);
+    let true_j4 = mid(&c, 3);
+    sim.set_position(4, true_j4 + TAU);
+    let mut s = Session::connect(Box::new(sim), c.clone()).expect("connect");
+    s.enable().expect("enable");
+    let raw_before = s.backend_as_sim().unwrap().position(4);
+
+    let mut targets = s.positions();
+    targets[3] = 6.3; // inside the (widened) clamp, outside the encoder
+    let mut go = GoTo::new(&c, targets);
+    let out = s.tick(&mut go).expect("tick");
+    match out.fault {
+        Some(FaultReason::BadCommand { ref detail }) => {
+            assert!(
+                detail.contains("motor 4"),
+                "detail names no motor: {detail}"
+            );
+            assert!(
+                detail.contains("12.57"),
+                "detail names no encoder range: {detail}"
+            );
+        }
+        other => panic!("expected BadCommand from the output stage, got {other:?}"),
+    }
+    assert_eq!(s.state(), SessionState::Fault);
+
+    // Nothing truncated ever went out: the motor is still where it was,
+    // not slammed to the +12.57 rail (which would read back as 6.287 rad
+    // in joint coordinates -- 1.7 rad away from the pose it was holding).
+    for _ in 0..5 {
+        s.tick(&mut go).expect("holding after the refusal");
+    }
+    let raw_after = s.backend_as_sim().unwrap().position(4);
+    assert!(
+        (raw_after - raw_before).abs() < 1e-2,
+        "raw motor angle moved from {raw_before} to {raw_after}"
+    );
+    assert!(
+        (s.positions()[3] - true_j4).abs() < 1e-2,
+        "J4 left its pose: {}",
+        s.positions()[3]
+    );
+}

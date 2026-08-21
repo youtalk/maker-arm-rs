@@ -115,7 +115,34 @@ impl Session {
             }
         };
 
-        self.send_mit_all(&cmd)?;
+        // Output-stage backstop (see `send_mit_all`): a command whose
+        // motor-frame position would saturate the encoder range is a
+        // fault, handled exactly like a clamp rejection -- hold the pose
+        // (or disable) and report, rather than transmitting a truncated
+        // position at full kp.
+        if let Some(detail) = self.send_mit_all(&cmd)? {
+            self.enter_fault(FaultReason::BadCommand { detail }, &snapshot)?;
+            if self.state() == SessionState::Connected {
+                return Ok(TickOutcome {
+                    fault: self.fault.clone(),
+                    clamped: false,
+                });
+            }
+            let hold_cmd = self
+                .fault_hold
+                .as_mut()
+                .expect("holding")
+                .update(&snapshot, dt);
+            let (hold_cmd, _) = clamp_command(&hold_cmd, &cfg)?;
+            // The hold target is the arm's own MEASURED pose, decoded
+            // from the motor frame and then clamped into limits that
+            // connect verified are mappable, so this second attempt
+            // cannot be refused again. If some future change makes it
+            // possible anyway, nothing goes out -- torque is held by the
+            // motors' last command until their CAN_TIMEOUT watchdog
+            // fires, which is the safe direction.
+            let _refused_again = self.send_mit_all(&hold_cmd)?;
+        }
         // Drain this tick's own MIT replies now: a caller reading
         // `arm_state()` right after `tick()` returns must see the ACTUAL
         // (clamped) values just sent, not a stale cache.
@@ -127,7 +154,36 @@ impl Session {
         })
     }
 
-    fn send_mit_all(&mut self, cmd: &[crate::state::JointCommand]) -> Result<(), SessionError> {
+    /// Encodes and sends one MIT frame per motor.
+    ///
+    /// Returns `Ok(Some(detail))` — with NOTHING sent — when a computed
+    /// motor-frame position falls outside that motor's encoder window
+    /// `[p_min, p_max]`. `encode_mit`'s `float_to_u16` would clamp such a
+    /// value to the rail and report nothing, so a truncated position at
+    /// full kp would go out as if it were the commanded pose. The
+    /// connect-time `RangeNotMappable` check should make this unreachable;
+    /// it is kept as a backstop because silently saturating a torque
+    /// command is exactly the failure being eliminated, and two
+    /// comparisons per joint are cheap insurance. The whole command is
+    /// validated BEFORE the first frame goes out, so a refusal never
+    /// leaves a partially-commanded arm.
+    fn send_mit_all(
+        &mut self,
+        cmd: &[crate::state::JointCommand],
+    ) -> Result<Option<String>, SessionError> {
+        for (i, c) in cmd.iter().enumerate() {
+            let j = &self.config().joints[i];
+            let params = j.model.params();
+            let motor_pos = j.to_motor(c.pos) - self.wrap_of(i);
+            if !(motor_pos >= params.p_min && motor_pos <= params.p_max) {
+                return Ok(Some(format!(
+                    "motor {} position {motor_pos:.4} rad is outside the encoder range \
+                     [{:.2}, {:.2}] (joint command {:.4} rad); refusing to send a command \
+                     that would saturate",
+                    j.motor_id, params.p_min, params.p_max, c.pos
+                )));
+            }
+        }
         let spacing = self.config().inter_frame_us;
         for (i, c) in cmd.iter().enumerate() {
             let j = self.config().joints[i].clone();
@@ -149,7 +205,7 @@ impl Session {
                 }
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Fixed-rate loop. Keeps running while `Fault`-holding; exits on
@@ -180,6 +236,13 @@ impl Session {
                 std::thread::sleep(next - now);
             }
             next += period;
+            // Catch-up clamp: after a scheduling hiccup (a long GC-like
+            // stall, a descheduled thread, a slow bus write) `next` can
+            // already be in the past. Advancing it blindly makes the loop
+            // sprint to "repay" the missed deadlines, bursting 7xN MIT
+            // frames onto a real bus back to back. Drop the missed ticks
+            // instead: a late control cycle is better than a flood.
+            next = next.max(Instant::now());
         }
         Ok(())
     }
@@ -209,7 +272,10 @@ impl Session {
                         break;
                     }
                 }
-                *sh.snapshot.lock().unwrap() = Some(Snapshot {
+                // Poison-tolerant like `RunningArm::snapshot`: a panicking
+                // reader must not turn every later publish into a second
+                // panic that kills the control thread outright.
+                *sh.snapshot.lock().unwrap_or_else(|e| e.into_inner()) = Some(Snapshot {
                     state: self.state(),
                     fault: self.fault.clone(),
                     arm: self.arm_state(),
@@ -222,6 +288,9 @@ impl Session {
                     std::thread::sleep(next - now);
                 }
                 next += period;
+                // Same catch-up clamp as `run()`: drop missed deadlines
+                // rather than repaying them as a burst of MIT frames.
+                next = next.max(Instant::now());
             }
             if result.is_ok() && self.state() != SessionState::Connected {
                 result = self.disable().and(result);
@@ -256,8 +325,33 @@ pub struct RunningArm {
 }
 
 impl RunningArm {
+    /// The last published tick snapshot, or `None` before the first tick
+    /// completes.
+    ///
+    /// Poison-tolerant on purpose: if the control thread panicked while
+    /// holding this mutex, `lock().unwrap()` would panic here too, turning
+    /// the operator's ONLY window into the arm's state into a second
+    /// panic. A stale-but-readable snapshot is strictly more useful than
+    /// that; pair it with [`RunningArm::loop_finished`] to tell a live
+    /// loop from a dead one.
     pub fn snapshot(&self) -> Option<Snapshot> {
-        self.shared.snapshot.lock().unwrap().clone()
+        self.shared
+            .snapshot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// True once the control thread has exited -- cleanly, by error, or by
+    /// panic -- without joining it (`stop_and_disable` still owns that).
+    ///
+    /// The last snapshot keeps saying whatever the loop last published, so
+    /// a caller that reports state must consult this too: a finished
+    /// thread is no longer commanding the motors, and if it exited on an
+    /// error it did NOT disable them (see `start`), so torque may still be
+    /// on with only the motor-side CAN_TIMEOUT watchdog behind it.
+    pub fn loop_finished(&self) -> bool {
+        self.handle.as_ref().is_none_or(|h| h.is_finished())
     }
 
     /// Swap the active controller for a hold at the current pose. Torque

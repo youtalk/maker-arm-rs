@@ -31,10 +31,34 @@ pub enum SessionState {
 pub enum SessionError {
     Transport(TransportError),
     Clamp(ClampError),
-    Probe { motor_id: u8 },
-    EnableVerify { motor_id: u8, index: u16 },
-    PositionOutOfRange { motor_id: u8, joint_pos: f64 },
-    WrongState { expected: &'static str },
+    Probe {
+        motor_id: u8,
+    },
+    EnableVerify {
+        motor_id: u8,
+        index: u16,
+    },
+    PositionOutOfRange {
+        motor_id: u8,
+        joint_pos: f64,
+    },
+    /// The 2π wrap chosen at connect maps part of the joint's CONFIGURED
+    /// range outside the encoder's `[p_min, p_max]` window. Distinct from
+    /// [`SessionError::PositionOutOfRange`] on purpose: the arm's current
+    /// pose is fine, but commands near this limit would silently saturate
+    /// in `float_to_u16`, so the operator's action is different (re-zero
+    /// the motor, or rotate it one full turn) rather than "move the joint
+    /// back into range".
+    RangeNotMappable {
+        motor_id: u8,
+        wrap: f64,
+        joint_bound: f64,
+        motor_pos: f64,
+        encoder_limit: f64,
+    },
+    WrongState {
+        expected: &'static str,
+    },
 }
 
 impl std::fmt::Display for SessionError {
@@ -61,6 +85,23 @@ impl std::fmt::Display for SessionError {
                 write!(
                     f,
                     "motor {motor_id} at {joint_pos:.3} rad is outside its limit window"
+                )
+            }
+            SessionError::RangeNotMappable {
+                motor_id,
+                wrap,
+                joint_bound,
+                motor_pos,
+                encoder_limit,
+            } => {
+                write!(
+                    f,
+                    "motor {motor_id}: with the {wrap:+.3} rad wrap chosen at connect, its \
+                     configured limit {joint_bound:.3} rad maps to {motor_pos:.3} rad in the \
+                     motor frame, past the encoder limit {encoder_limit:.3} rad -- commands \
+                     near that limit would saturate silently. Re-zero this motor, or rotate \
+                     it one full turn, so its whole configured range fits inside the encoder \
+                     range"
                 )
             }
             SessionError::WrongState { expected } => {
@@ -169,6 +210,35 @@ impl Session {
                     motor_id: j.motor_id,
                     joint_pos: j.to_joint(raw),
                 })?;
+            // The wrap is chosen from where the arm HAPPENS to be parked,
+            // but the control loop's output stage sends
+            // `to_motor(q) - wrap` for every commanded q in
+            // `q_lo..q_hi`. If either end of that configured range falls
+            // outside the encoder's `[p_min, p_max]` window,
+            // `float_to_u16` would clamp it to the rail with no error --
+            // a silently truncated position command at full kp (the
+            // reviewer measured 1.61 rad of truncation on J3 with
+            // `clamped: false` reported). Refuse to connect instead: the
+            // motor needs re-zeroing or a full turn before it can be
+            // driven safely. Checked against BOTH bounds, since a
+            // negative `direction` swaps which joint bound maps highest.
+            let params = j.model.params();
+            for joint_bound in [j.q_lo, j.q_hi] {
+                let motor_pos = j.to_motor(joint_bound) - wrap;
+                if !(motor_pos >= params.p_min && motor_pos <= params.p_max) {
+                    return Err(SessionError::RangeNotMappable {
+                        motor_id: j.motor_id,
+                        wrap,
+                        joint_bound,
+                        motor_pos,
+                        encoder_limit: if motor_pos > params.p_max {
+                            params.p_max
+                        } else {
+                            params.p_min
+                        },
+                    });
+                }
+            }
             s.slots[i].wrap = wrap;
             s.slots[i].state.position = j.to_joint(raw + wrap);
         }

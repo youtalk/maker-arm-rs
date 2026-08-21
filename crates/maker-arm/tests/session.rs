@@ -259,3 +259,77 @@ fn enable_reports_enabled_even_if_the_trailing_drain_fails() {
         assert!(sim.enabled(j.motor_id));
     }
 }
+
+#[test]
+fn connect_refuses_a_wrap_that_cannot_map_the_configured_range() {
+    // Critical: `connect` picks the 2π wrap from wherever the arm HAPPENS
+    // to be parked, but the control loop then sends `to_motor(q) - wrap`
+    // for every commanded q in `q_lo..q_hi`. J3's window is 3.882..7.955;
+    // park its raw angle at 11.0 rad -- physically reachable -- and the
+    // only wrap that lands the pose inside the grace window is -2π
+    // (11.0 - 6.283 = 4.717). But then q_hi maps to 7.955 + 6.283 =
+    // 14.238 rad, past the encoder's +12.57: `float_to_u16` would clamp
+    // that to the rail with no error, truncating a position command by
+    // 1.61 rad at kp 90 while reporting `clamped: false`. Refuse at
+    // connect instead, with an error that says what to DO about it.
+    let c = ArmConfig::maker_arm_v1();
+    let mut sim = SimArm::new(&c);
+    sim.set_position(3, 11.0);
+    match Session::connect(Box::new(sim), c) {
+        Err(SessionError::RangeNotMappable {
+            motor_id: 3,
+            wrap,
+            joint_bound,
+            motor_pos,
+            encoder_limit,
+        }) => {
+            assert!(
+                (wrap - -TAU).abs() < 1e-9,
+                "expected the -2π wrap, got {wrap}"
+            );
+            assert!(
+                (joint_bound - 7.955).abs() < 1e-9,
+                "expected J3's q_hi as the offending bound, got {joint_bound}"
+            );
+            assert!(
+                motor_pos > 14.0,
+                "expected the unmappable motor-frame position, got {motor_pos}"
+            );
+            assert!((encoder_limit - 12.57).abs() < 1e-9);
+            // The message must tell the operator what to do, not just
+            // that a number was out of range.
+            let text = SessionError::RangeNotMappable {
+                motor_id: 3,
+                wrap,
+                joint_bound,
+                motor_pos,
+                encoder_limit,
+            }
+            .to_string();
+            assert!(text.contains("Re-zero"), "not actionable: {text}");
+            assert!(text.contains("motor 3"), "no motor id: {text}");
+        }
+        other => panic!("expected RangeNotMappable(3), got {other:?}"),
+    }
+}
+
+#[test]
+fn connect_accepts_a_negative_wrap_whose_whole_range_still_maps() {
+    // Guard against the fix above being over-broad: a -2π wrap is fine as
+    // long as the joint's WHOLE configured range still fits in the
+    // encoder window. J4's window is -0.832..2.122, so parking its raw
+    // angle one full turn HIGH (mid + 2π = 6.928) forces wrap = -2π, and
+    // both bounds still map comfortably (-0.832 + 6.283 = 5.451 and
+    // 2.122 + 6.283 = 8.405, both inside ±12.57). Connect must succeed
+    // and report the corrected joint position.
+    let c = ArmConfig::maker_arm_v1();
+    let mut sim = SimArm::new(&c);
+    let true_j4 = mid(&c, 3);
+    sim.set_position(4, true_j4 + TAU);
+    let s = Session::connect(Box::new(sim), c).expect("connect with a mappable -2π wrap");
+    assert!(
+        (s.positions()[3] - true_j4).abs() < 1e-3,
+        "expected {true_j4}, got {}",
+        s.positions()[3]
+    );
+}
