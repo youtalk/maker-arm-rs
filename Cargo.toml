@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/maker-arm", "crates/maker-arm-protocol", "crates/maker-arm-transport", "bindings/maker-arm-py"]
+members = ["crates/maker-arm", "crates/maker-arm-protocol", "crates/maker-arm-transport", "crates/maker-arm-cli", "bindings/maker-arm-py"]
 
 [workspace.package]
 version = "0.1.0"
