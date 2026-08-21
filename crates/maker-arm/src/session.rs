@@ -318,21 +318,43 @@ impl Session {
             let f = p::encode_enable(m, host);
             self.backend.send(f.id, &f.data)?;
         }
-        self.drain()?;
+        // Every enable frame has now gone out: the motors are physically
+        // torque-on. Report that truthfully even if the trailing drain
+        // below fails -- state must never lag reality in the unsafe
+        // direction (Connected while motors are actually enabled).
         self.state = SessionState::Enabled;
+        self.drain()?;
         Ok(())
     }
 
+    /// Best-effort across every motor: an emergency stop must not give up
+    /// on motors 3..7 just because motor 2's frame failed to send. Every
+    /// motor gets an attempt regardless of earlier failures; the first
+    /// error encountered (send or drain) is remembered and returned after
+    /// the sweep, so the caller learns the bus is unreliable while every
+    /// reachable motor has still been commanded off.
     fn disable_all(&mut self, clear_fault: bool) -> Result<(), SessionError> {
         let host = self.config.host_id;
         let motor_ids: Vec<u8> = self.config.joints.iter().map(|j| j.motor_id).collect();
+        let mut first_err: Option<SessionError> = None;
         for &m in &motor_ids {
             let f = p::encode_disable(m, clear_fault, host);
-            self.backend.send(f.id, &f.data)?;
+            if let Err(e) = self.backend.send(f.id, &f.data) {
+                if first_err.is_none() {
+                    first_err = Some(e.into());
+                }
+            }
         }
-        self.drain()?;
+        if let Err(e) = self.drain() {
+            if first_err.is_none() {
+                first_err = Some(e);
+            }
+        }
         self.state = SessionState::Connected;
-        Ok(())
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     pub fn disable(&mut self) -> Result<(), SessionError> {

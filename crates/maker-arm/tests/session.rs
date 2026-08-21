@@ -1,6 +1,9 @@
 use maker_arm::{ArmConfig, Session, SessionError, SessionState, SimArm};
 use maker_arm_protocol::param_index;
+use maker_arm_transport::{CanBackend, TransportError};
 use std::f64::consts::TAU;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 fn mid(config: &ArmConfig, i: usize) -> f64 {
     (config.joints[i].q_lo + config.joints[i].q_hi) / 2.0
@@ -128,5 +131,131 @@ fn enable_requires_connected_state() {
     match s.enable() {
         Err(SessionError::WrongState { .. }) => {}
         other => panic!("expected WrongState, got {other:?}"),
+    }
+}
+
+/// Test-only backend that wraps a `SimArm` and can be told to fail `send`
+/// or `recv` on demand -- something `SimArm` alone can never do, since it
+/// always succeeds. Configuration is shared via `Arc<Mutex<_>>` so a test
+/// can arm a failure *after* the backend is already boxed inside a
+/// `Session`. Exists purely to exercise `Session`'s error-handling paths
+/// (best-effort estop, enable-vs-drain-failure state ordering); not a
+/// production type and not a new hook on `SimArm` itself.
+#[derive(Default)]
+struct FlakyConfig {
+    /// Every `send` addressed to this motor id fails.
+    fail_send_for: Option<u8>,
+    /// Once true, every subsequent `recv` fails.
+    fail_recv: bool,
+    /// When set, `fail_recv` flips to true once this many `COMM_ENABLE`
+    /// frames have gone out -- lets a test fail the *trailing drain* of
+    /// `enable()` without touching the enable frames themselves.
+    fail_recv_after_n_enables: Option<u8>,
+    enables_seen: u8,
+}
+
+struct FlakyBackend {
+    inner: SimArm,
+    cfg: Arc<Mutex<FlakyConfig>>,
+}
+
+impl FlakyBackend {
+    fn new(inner: SimArm) -> (Self, Arc<Mutex<FlakyConfig>>) {
+        let cfg = Arc::new(Mutex::new(FlakyConfig::default()));
+        (
+            FlakyBackend {
+                inner,
+                cfg: cfg.clone(),
+            },
+            cfg,
+        )
+    }
+}
+
+impl CanBackend for FlakyBackend {
+    fn send(&mut self, id: u32, data: &[u8; 8]) -> Result<(), TransportError> {
+        let comm = ((id >> 24) & 0x1F) as u8;
+        let target = (id & 0xFF) as u8;
+        {
+            let mut cfg = self.cfg.lock().unwrap();
+            if cfg.fail_send_for == Some(target) {
+                return Err(TransportError::Io(format!(
+                    "injected send failure for motor {target}"
+                )));
+            }
+            if let Some(n) = cfg.fail_recv_after_n_enables {
+                if comm == maker_arm_protocol::COMM_ENABLE {
+                    cfg.enables_seen += 1;
+                    if cfg.enables_seen >= n {
+                        cfg.fail_recv = true;
+                    }
+                }
+            }
+        }
+        self.inner.send(id, data)
+    }
+
+    fn recv(&mut self, timeout: Duration) -> Result<Option<(u32, [u8; 8])>, TransportError> {
+        if self.cfg.lock().unwrap().fail_recv {
+            return Err(TransportError::Io("injected recv failure".to_string()));
+        }
+        self.inner.recv(timeout)
+    }
+
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(&mut self.inner)
+    }
+}
+
+#[test]
+fn estop_send_failure_still_disables_every_reachable_motor() {
+    // Critical fix 1: disable_all must be best-effort across every motor.
+    // A bus hiccup on motor 2 must not stop estop from reaching 1 and 3..7.
+    let c = ArmConfig::maker_arm_v1();
+    let (backend, cfg) = FlakyBackend::new(SimArm::new(&c));
+    let mut s = Session::connect(Box::new(backend), c.clone()).expect("connect");
+    s.enable().expect("enable");
+    cfg.lock().unwrap().fail_send_for = Some(2);
+    match s.estop() {
+        Err(_) => {}
+        Ok(()) => panic!("expected estop to report the motor-2 send failure"),
+    }
+    // State still reflects "torque commanded off", since every reachable
+    // motor was attempted -- the Err is what tells the caller the bus is
+    // unreliable, not a state stuck at Enabled.
+    assert_eq!(s.state(), SessionState::Connected);
+    let sim = s.backend_as_sim().unwrap();
+    for j in &c.joints {
+        if j.motor_id != 2 {
+            assert!(
+                !sim.enabled(j.motor_id),
+                "motor {} should have received its disable frame",
+                j.motor_id
+            );
+        }
+    }
+    assert!(
+        sim.enabled(2),
+        "motor 2 never got a disable frame -- expected, it was blocked"
+    );
+}
+
+#[test]
+fn enable_reports_enabled_even_if_the_trailing_drain_fails() {
+    // Critical fix 2: state must reflect physical reality. All seven enable
+    // frames go out successfully (motors are physically torque-on) and only
+    // the trailing drain() fails -- state must be Enabled, not Connected.
+    let c = ArmConfig::maker_arm_v1();
+    let (backend, cfg) = FlakyBackend::new(SimArm::new(&c));
+    let mut s = Session::connect(Box::new(backend), c.clone()).expect("connect");
+    cfg.lock().unwrap().fail_recv_after_n_enables = Some(c.joints.len() as u8);
+    match s.enable() {
+        Err(SessionError::Transport(_)) => {}
+        other => panic!("expected a transport error from the trailing drain, got {other:?}"),
+    }
+    assert_eq!(s.state(), SessionState::Enabled);
+    let sim = s.backend_as_sim().unwrap();
+    for j in &c.joints {
+        assert!(sim.enabled(j.motor_id));
     }
 }
