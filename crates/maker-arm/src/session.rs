@@ -11,6 +11,8 @@
 
 use crate::clamp::ClampError;
 use crate::config::ArmConfig;
+use crate::controller::HoldController;
+use crate::health::{FaultReason, HealthMonitor};
 use crate::sim::SimArm;
 use crate::state::{ArmState, MotorState};
 use maker_arm_protocol as p;
@@ -99,6 +101,9 @@ pub struct Session {
     slots: Vec<MotorSlot>,
     started: Instant,
     pub(crate) tick: u64,
+    pub(crate) health: HealthMonitor,
+    pub(crate) fault: Option<FaultReason>,
+    pub(crate) fault_hold: Option<HoldController>,
 }
 
 impl std::fmt::Debug for Session {
@@ -130,6 +135,7 @@ impl Session {
                 last_feedback: None,
             })
             .collect();
+        let health = HealthMonitor::new(&config);
         let mut s = Session {
             backend,
             config,
@@ -137,6 +143,9 @@ impl Session {
             slots,
             started: Instant::now(),
             tick: 0,
+            health,
+            fault: None,
+            fault_hold: None,
         };
         let motor_ids: Vec<u8> = s.config.joints.iter().map(|j| j.motor_id).collect();
         for m in &motor_ids {
@@ -405,5 +414,24 @@ impl Session {
         self.backend
             .as_any_mut()
             .and_then(|a| a.downcast_mut::<SimArm>())
+    }
+
+    /// Supports the control loop's fault-entry transitions.
+    pub(crate) fn set_state(&mut self, s: SessionState) {
+        self.state = s;
+    }
+
+    /// The 2π wrap correction recorded for motor slot `idx` at connect —
+    /// the control loop's output stage subtracts it back out when
+    /// converting a commanded joint position to the raw motor frame.
+    pub(crate) fn wrap_of(&self, idx: usize) -> f64 {
+        self.slots[idx].wrap
+    }
+
+    /// Forwards one raw frame to the backend; the control loop's only way
+    /// to put a MIT frame on the wire.
+    pub(crate) fn send_raw(&mut self, id: u32, data: &[u8; 8]) -> Result<(), SessionError> {
+        self.backend.send(id, data)?;
+        Ok(())
     }
 }
