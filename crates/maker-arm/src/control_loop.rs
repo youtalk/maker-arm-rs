@@ -27,6 +27,16 @@ impl Session {
     fn enter_fault(&mut self, reason: FaultReason, at: &ArmState) -> Result<(), SessionError> {
         if self.config().hold_on_fault {
             let mut hold = HoldController::from_config(self.config());
+            // The hold target is the pose the arm was measured at, but it
+            // still goes through `clamp_command` like any other command,
+            // and the clamp pulls it back inside `q_lo..q_hi`. A pose that
+            // was legally outside the soft limits at fault time (enable
+            // accepts up to `enable_limit_grace` = 0.35 rad beyond them)
+            // therefore MOVES up to that much when the hold engages:
+            // "hold" means "hold the nearest in-limit pose", not "freeze
+            // exactly here". Deliberate -- the clamp is the single
+            // enforcement point and must not be bypassed on the fault
+            // path -- but it is operator-visible motion during a fault.
             hold.retarget_to_state(at);
             self.fault_hold = Some(hold);
             self.fault = Some(reason);
@@ -48,6 +58,26 @@ impl Session {
     /// One control cycle. Runs in `Enabled` (controller drives) and in
     /// `Fault` when holding (internal hold drives; the controller is not
     /// consulted).
+    ///
+    /// # Health checks stop once a fault latches
+    ///
+    /// The health check below is gated on `self.fault.is_none()`, and
+    /// `fault` stays `Some` for the whole of `Fault`. So during an
+    /// indefinite hold-on-fault -- exactly the situation where a loaded
+    /// arm heats up -- NO further health check runs: `temp_hold_c` (our
+    /// own addition, not an upstream behavior) does not re-trip, and
+    /// neither do the fault-bit, mode, or feedback-age checks. Only an
+    /// explicit `clear_faults()`/`disable()`/`estop()` or a fresh
+    /// `enable()` re-arms them.
+    ///
+    /// This is deliberate, not an oversight: re-entering `enter_fault`
+    /// every tick would re-`retarget_to_state` the hold to wherever the
+    /// arm has since sagged, walking it downhill. The motors' own firmware
+    /// protection remains the backstop for a genuine over-temperature, so
+    /// what is lost is OUR earlier trip point and the visibility that goes
+    /// with it, not protection outright. Changing it (e.g. a
+    /// latch-once-and-escalate path that disables instead of retargeting)
+    /// needs hardware to validate and is out of scope until then.
     pub fn tick(&mut self, controller: &mut dyn Controller) -> Result<TickOutcome, SessionError> {
         if self.state() != SessionState::Enabled && self.state() != SessionState::Fault {
             return Err(SessionError::WrongState {
@@ -67,6 +97,11 @@ impl Session {
         let cfg = self.config().clone();
         let dt = 1.0 / cfg.control_rate_hz;
 
+        // `fault` stays `Some` for the whole of `Fault`, so this gate is
+        // closed for the entire duration of a hold-on-fault: health
+        // checking (including our `temp_hold_c` trip) does NOT run again
+        // until an explicit release re-arms it. See this function's doc
+        // comment for why re-checking every tick would be worse.
         if self.fault.is_none() {
             if let Some(reason) = self.health.check(&snapshot, &cfg) {
                 self.enter_fault(reason, &snapshot)?;
