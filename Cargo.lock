@@ -250,7 +250,9 @@ version = "0.1.0"
 name = "maker-arm-py"
 version = "0.1.0"
 dependencies = [
+ "maker-arm",
  "maker-arm-protocol",
+ "maker-arm-transport",
  "pyo3",
 ]
 

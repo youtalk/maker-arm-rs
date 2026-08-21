@@ -11,3 +11,4 @@ license = "Apache-2.0"
 
 [tool.maturin]
 module-name = "maker_arm_rs"
+features = ["extension-module"]

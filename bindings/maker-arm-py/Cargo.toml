@@ -10,6 +10,12 @@ repository.workspace = true
 name = "maker_arm_rs"
 crate-type = ["cdylib"]
 
+[features]
+default = []
+extension-module = ["pyo3/extension-module"]
+
 [dependencies]
+maker-arm = { path = "../../crates/maker-arm", features = ["socketcan"] }
 maker-arm-protocol = { path = "../../crates/maker-arm-protocol" }
-pyo3 = { version = "0.24", features = ["extension-module"] }
+maker-arm-transport = { path = "../../crates/maker-arm-transport", features = ["socketcan"] }
+pyo3 = { version = "0.24" }

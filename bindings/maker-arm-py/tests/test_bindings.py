@@ -81,3 +81,30 @@ def test_parse_frame_unknown_model_raises():
 
     with pytest.raises(ValueError):
         m.parse_frame(0x028001FD, bytes.fromhex("8000800080000159"), "RS99")
+
+
+def test_arm_sim_orchestration_lifecycle():
+    import time
+
+    arm = m.Arm.sim()
+    assert arm.state() == "connected"
+    arm.enable()
+    assert arm.state() == "enabled"
+    arm.start_hold()
+    time.sleep(0.1)
+    snap = arm.snapshot()
+    assert snap is not None
+    assert snap["state"] == "enabled"
+    assert snap["fault"] is None
+    assert len(snap["positions"]) == 7
+    assert snap["tick"] > 0
+    arm.hold_now()
+    time.sleep(0.05)
+    arm.stop()
+    assert arm.state() == "connected"
+
+
+def test_arm_stop_before_start_is_safe():
+    arm = m.Arm.sim()
+    arm.stop()  # no loop running: must not raise
+    assert arm.state() == "connected"
