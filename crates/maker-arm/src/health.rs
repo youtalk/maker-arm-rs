@@ -198,4 +198,50 @@ mod tests {
             })
         );
     }
+
+    #[test]
+    fn never_heard_from_motor_faults() {
+        let c = ArmConfig::maker_arm_v1();
+        let mut h = HealthMonitor::new(&c);
+        // ArmState with all motors at stale() — never received any feedback
+        let s = ArmState {
+            motors: vec![MotorState::stale(); c.joints.len()],
+            tick: 0,
+            t: 0.0,
+        };
+        // First check should find the stale feedback (age = INFINITY > timeout)
+        match h.check(&s, &c) {
+            Some(FaultReason::FeedbackTimeout { motor_id: 1, age }) => {
+                assert!(age.is_infinite(), "expected infinite age, got {age}");
+            }
+            other => panic!("expected FeedbackTimeout(1) with infinite age, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn per_motor_mode_independence() {
+        let c = ArmConfig::maker_arm_v1();
+        let mut h = HealthMonitor::new(&c);
+        // Run 12 ticks (well past mode_fault_ticks=5) with alternating per-motor failures.
+        // Motor 1 (index 0) bad on odd ticks, motor 2 (index 1) bad on even ticks.
+        // If counters were shared or not per-motor, one would accumulate to the threshold.
+        for tick in 0..12 {
+            let mut s = healthy(&c);
+            // Motor 1 bad on odd ticks (1, 3, 5, 7, 9, 11)
+            if tick % 2 == 1 {
+                s.motors[0].mode = 0;
+            }
+            // Motor 2 bad on even ticks (0, 2, 4, 6, 8, 10)
+            if tick % 2 == 0 {
+                s.motors[1].mode = 0;
+            }
+            // Neither accumulates because each resets when healthy on alternate ticks
+            assert_eq!(
+                h.check(&s, &c),
+                None,
+                "tick {}: expected no fault with per-motor independence",
+                tick
+            );
+        }
+    }
 }
