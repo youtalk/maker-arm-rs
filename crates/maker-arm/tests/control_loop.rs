@@ -577,3 +577,40 @@ fn a_saturating_motor_position_faults_instead_of_being_truncated() {
         s.positions()[3]
     );
 }
+
+#[test]
+fn loop_finished_reports_a_dead_control_thread_honestly() {
+    // `snapshot()` keeps returning whatever the loop last published, so a
+    // caller that reports arm state from it alone (the Python surface
+    // does) would keep claiming the loop is live long after the thread
+    // exited. `loop_finished()` is that missing liveness signal, and it
+    // must not consume the handle the way `stop_and_disable` does.
+    //
+    // With hold_on_fault = false a detected fault disables the arm and the
+    // thread returns on its own while the `RunningArm` stays in the
+    // caller's hands -- exactly the situation where an optimistic default
+    // lies about a dead loop.
+    let mut c = fast(ArmConfig::maker_arm_v1());
+    c.hold_on_fault = false;
+    let mut s = enabled_session(&c);
+    s.backend_as_sim().unwrap().inject_fault(2, 0x01);
+    let running = s.start(Box::new(HoldController::from_config(&c)));
+    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+    while !running.loop_finished() && Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        running.loop_finished(),
+        "the control thread should have exited once the fault disabled the arm"
+    );
+    // The last snapshot is still readable -- that is the point: liveness
+    // is reported separately instead of being guessed from the snapshot.
+    let snap = running
+        .snapshot()
+        .expect("the exited loop still published its final snapshot");
+    assert_eq!(snap.state, SessionState::Connected);
+    assert!(
+        snap.fault.is_some(),
+        "the final snapshot must carry the fault"
+    );
+}

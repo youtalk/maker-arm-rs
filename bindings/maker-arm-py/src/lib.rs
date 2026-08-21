@@ -117,6 +117,18 @@ fn state_str(s: SessionState) -> &'static str {
     }
 }
 
+/// Reported while the control thread is alive but has not published its
+/// first tick snapshot yet. Distinct from `"enabled"`: torque is on, but
+/// nothing has been observed coming back from the loop.
+const STARTING: &str = "starting";
+
+/// Reported once the control thread has exited without being joined. The
+/// loop is NOT commanding the motors any more; if it exited on an error it
+/// did not disable them either, so torque may still be on with only the
+/// motor-side CAN_TIMEOUT watchdog behind it. `stop()` joins the thread
+/// and surfaces the error.
+const LOOP_STOPPED: &str = "loop_stopped";
+
 #[pymethods]
 impl Arm {
     /// Connect to the built-in 7-motor simulator.
@@ -151,7 +163,22 @@ impl Arm {
     }
 
     /// Spawn the 200 Hz control loop holding the current pose.
+    ///
+    /// Requires an enabled session: raises RuntimeError otherwise. Without
+    /// this gate the loop thread died on its first tick with a wrong-state
+    /// error, `snapshot()` returned None forever, and `state()` reported
+    /// "enabled" for an arm with no torque at all -- an operator told the
+    /// arm is holding might stop supporting it.
     fn start_hold(&mut self) -> PyResult<()> {
+        if let ArmHandle::Idle(s) = &self.handle {
+            if s.state() != SessionState::Enabled {
+                return Err(PyRuntimeError::new_err(format!(
+                    "start_hold requires an enabled session, but this one is {}; \
+                     call enable() first",
+                    state_str(s.state())
+                )));
+            }
+        }
         match std::mem::replace(&mut self.handle, ArmHandle::Empty) {
             ArmHandle::Idle(s) => {
                 let hold = HoldController::from_config(&self.config);
@@ -176,14 +203,30 @@ impl Arm {
         }
     }
 
+    /// The last published tick snapshot, or None if no loop is running (or
+    /// none has ticked yet).
+    ///
+    /// `loop_alive` reports whether the control thread is still running.
+    /// When it is False the snapshot is the LAST one the dead loop
+    /// published, and `state` reads "loop_stopped" rather than repeating
+    /// that stale session state as if it were current -- call stop() to
+    /// join the thread and surface whatever error ended it.
     fn snapshot(&self, py: Python<'_>) -> PyResult<Option<Py<PyDict>>> {
-        let snap = match &self.handle {
-            ArmHandle::Running(r) => r.snapshot(),
-            _ => None,
+        let (snap, alive) = match &self.handle {
+            ArmHandle::Running(r) => (r.snapshot(), !r.loop_finished()),
+            _ => (None, false),
         };
         let Some(snap) = snap else { return Ok(None) };
         let d = PyDict::new(py);
-        d.set_item("state", state_str(snap.state))?;
+        d.set_item(
+            "state",
+            if alive {
+                state_str(snap.state)
+            } else {
+                LOOP_STOPPED
+            },
+        )?;
+        d.set_item("loop_alive", alive)?;
         d.set_item("fault", snap.fault.as_ref().map(|f| f.to_string()))?;
         d.set_item("tick", snap.arm.tick)?;
         d.set_item("t", snap.arm.t)?;
@@ -249,13 +292,33 @@ impl Arm {
         self.stop()
     }
 
+    /// One of "connected", "enabled", "fault", "starting", or
+    /// "loop_stopped".
+    ///
+    /// With no loop running this is the session's own state. With a loop
+    /// running it is the state the loop last published -- except that loop
+    /// LIVENESS wins over a stale snapshot:
+    ///
+    /// * "starting" -- the thread is alive but has not completed its first
+    ///   tick yet, so nothing has come back from it.
+    /// * "loop_stopped" -- the thread has exited and has not been joined.
+    ///   It is no longer commanding the motors, and if it exited on an
+    ///   error it did not disable them either, so torque may still be on
+    ///   with only the motor-side CAN_TIMEOUT watchdog behind it. Call
+    ///   stop() to join it and surface the error.
+    ///
+    /// This used to default to "enabled" whenever no snapshot was
+    /// available, which reported a dead loop -- or an un-energized arm --
+    /// as if it were holding.
     fn state(&self) -> PyResult<&'static str> {
         match &self.handle {
             ArmHandle::Idle(s) => Ok(state_str(s.state())),
-            ArmHandle::Running(r) => Ok(r
-                .snapshot()
-                .map(|s| state_str(s.state))
-                .unwrap_or("enabled")),
+            ArmHandle::Running(r) => {
+                if r.loop_finished() {
+                    return Ok(LOOP_STOPPED);
+                }
+                Ok(r.snapshot().map_or(STARTING, |s| state_str(s.state)))
+            }
             ArmHandle::Empty => Err(PyRuntimeError::new_err("arm handle poisoned")),
         }
     }
