@@ -1,5 +1,6 @@
-//! Golden vectors ported from maker-arm-sdk tests/unit/test_protocol.py
-//! (main @ 2026-08-20). Do not edit values without re-checking upstream.
+//! Golden vectors taken from maker-arm-sdk tests/unit/test_protocol.py
+//! (main @ 2026-08-20), Apache-2.0 — see the NOTICE file at the repository
+//! root. Do not edit values without re-checking upstream.
 use maker_arm_protocol::*;
 
 fn approx(a: f64, b: f64, tol: f64) {

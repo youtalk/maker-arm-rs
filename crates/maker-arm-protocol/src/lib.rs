@@ -4,7 +4,9 @@
 //! frames (Type 17/18) are little-endian. τ_ff travels in bits 23..8 of the
 //! 29-bit CAN ID, not in the 8-byte data field.
 //!
-//! Ported from maker-arm-sdk maker_arm/protocol.py (Apache-2.0).
+//! Ported (with modifications) from maker-arm-sdk
+//! maker_arm/protocol.py, Apache-2.0 — see the NOTICE file at the
+//! repository root.
 
 pub const P_MIN: f64 = -12.57; // rad (encoding range, not joint limits)
 pub const P_MAX: f64 = 12.57;

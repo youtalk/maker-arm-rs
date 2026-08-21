@@ -1,0 +1,27 @@
+maker-arm-rs
+
+This product contains software derived from the Maker Arm SDK
+("maker-arm-sdk"), Copyright MakerMods Robotics, licensed under the
+Apache License, Version 2.0.
+
+  Upstream project: https://github.com/makermods-robotics/maker-arm-sdk
+  Upstream license: Apache License, Version 2.0
+                    http://www.apache.org/licenses/LICENSE-2.0
+
+The following files are derived from that project and have been modified:
+
+  crates/maker-arm-protocol/src/lib.rs
+      Ported from maker_arm/protocol.py. Mirrors upstream's frame layout,
+      CAN id construction, per-model u16 mapping ranges and rounding
+      behavior; rewritten in Rust with different types and APIs. The wire
+      bytes are intended to be identical to upstream's.
+
+  crates/maker-arm-protocol/tests/vectors.rs
+      Golden values taken from tests/unit/test_protocol.py
+      (branch main, 2026-08-20). Reorganized into Rust tests and extended
+      with cases that are not present upstream.
+
+  bindings/maker-arm-py/tests/test_bindings.py
+      Asserts the same golden values through the Python bindings.
+
+All other files are original to this project.
