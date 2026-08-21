@@ -79,8 +79,11 @@ pub struct ArmConfig {
     /// Our addition: any motor at or above this temperature (°C) trips an
     /// automatic hold (design §4 item 3). Not an upstream behavior.
     pub temp_hold_c: f64,
-    /// Clamp ceilings; at or below the protocol's KP_MAX/KD_MAX.
+    /// Our addition: experiment gain ceiling for kp (design §2) — well below
+    /// the protocol's KP_MAX = 500.0, tuned by hardware sessions under
+    /// pre-registered promotion criteria.
     pub kp_max: f64,
+    /// Clamp ceiling for kd: tracks the protocol's KD_MAX constant.
     pub kd_max: f64,
     /// Wire spacing between per-motor MIT frames within one tick (µs).
     pub inter_frame_us: u64,
