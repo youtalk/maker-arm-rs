@@ -162,28 +162,39 @@ mod tests {
     fn v1_profile_matches_upstream_yaml() {
         // Pinned from maker-arm-sdk maker_arm/profiles/maker_arm_v1.yaml
         // (main @ 2026-08-20). Do not edit without re-checking upstream.
+        //
+        // This test is the ONLY thing standing between the pinned upstream
+        // data and a silent local edit, so it asserts EVERY joint --
+        // limits, gains, direction, and offset -- not a sample of three.
+        // (An earlier version covered J1, J2, and the gripper only, which
+        // left a change to J3's q_hi passing CI unnoticed.)
         let c = ArmConfig::maker_arm_v1();
-        assert_eq!(c.joints.len(), 7);
-        let ids: Vec<u8> = c.joints.iter().map(|j| j.motor_id).collect();
-        assert_eq!(ids, vec![1, 2, 3, 4, 5, 6, 7]);
-        assert_eq!(c.joints[1].model, MotorModel::Rs02); // J2
-        assert_eq!(c.joints[2].model, MotorModel::Rs02); // J3
-        for i in [0usize, 3, 4, 5, 6] {
-            assert_eq!(c.joints[i].model, MotorModel::Rs00);
+        #[rustfmt::skip]
+        let upstream: [(u8, &str, MotorModel, f64, f64, f64, f64); 7] = [
+            // motor_id, name, model,           q_lo,   q_hi,    kp,    kd
+            (1, "j1",      MotorModel::Rs00, -0.668,  4.818,  60.0, 4.0),
+            (2, "j2",      MotorModel::Rs02, -2.024,  0.979, 150.0, 4.5),
+            (3, "j3",      MotorModel::Rs02,  3.882,  7.955,  90.0, 3.0),
+            (4, "j4",      MotorModel::Rs00, -0.832,  2.122,  30.0, 2.0),
+            (5, "j5",      MotorModel::Rs00,  0.577,  3.641,  30.0, 2.0),
+            (6, "j6",      MotorModel::Rs00,  0.966,  6.292,  30.0, 2.0),
+            (7, "gripper", MotorModel::Rs00, -2.092, -0.039,  20.0, 0.5),
+        ];
+        assert_eq!(c.joints.len(), upstream.len());
+        for (i, &(motor_id, name, model, q_lo, q_hi, kp, kd)) in upstream.iter().enumerate() {
+            let j = &c.joints[i];
+            assert_eq!(j.motor_id, motor_id, "joint index {i}: motor_id");
+            assert_eq!(j.name, name, "joint index {i}: name");
+            assert_eq!(j.model, model, "joint index {i}: model");
+            assert_eq!(j.q_lo, q_lo, "joint index {i}: q_lo");
+            assert_eq!(j.q_hi, q_hi, "joint index {i}: q_hi");
+            assert_eq!(j.kp, kp, "joint index {i}: kp");
+            assert_eq!(j.kd, kd, "joint index {i}: kd");
+            // Upstream ships no flipped axes and no offsets: only the
+            // motor's own zero position is user-calibrated, on the motor.
+            assert_eq!(j.direction, 1.0, "joint index {i}: direction");
+            assert_eq!(j.offset, 0.0, "joint index {i}: offset");
         }
-        assert_eq!(c.joints[0].q_lo, -0.668);
-        assert_eq!(c.joints[0].q_hi, 4.818);
-        assert_eq!(c.joints[0].kp, 60.0);
-        assert_eq!(c.joints[0].kd, 4.0);
-        assert_eq!(c.joints[1].q_lo, -2.024);
-        assert_eq!(c.joints[1].q_hi, 0.979);
-        assert_eq!(c.joints[1].kp, 150.0);
-        assert_eq!(c.joints[1].kd, 4.5);
-        assert_eq!(c.joints[6].name, "gripper");
-        assert_eq!(c.joints[6].q_lo, -2.092);
-        assert_eq!(c.joints[6].q_hi, -0.039);
-        assert_eq!(c.joints[6].kp, 20.0);
-        assert_eq!(c.joints[6].kd, 0.5);
         assert_eq!(c.control_rate_hz, 200.0);
         assert_eq!(c.max_velocity, 5.0);
         assert_eq!(c.feedback_timeout, 0.2);
