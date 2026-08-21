@@ -1,0 +1,16 @@
+[package]
+name = "maker-arm"
+description = "Arm session layer for the MakerMods Maker Arm: connect/enable/estop, health monitoring, watchdogs, fixed-rate control loop, and the single command-clamp enforcement point"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+socketcan = ["maker-arm-transport/socketcan"]
+
+[dependencies]
+maker-arm-protocol = { path = "../maker-arm-protocol" }
+maker-arm-transport = { path = "../maker-arm-transport" }
