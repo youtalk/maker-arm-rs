@@ -218,9 +218,23 @@ pub fn confirm_release(
         )?;
         output.flush()?;
         let mut line = String::new();
-        let n = input.read_line(&mut line)?;
-        if n == 0 {
-            // EOF: never release on a dead stdin (upstream sleeps and retries)
+        // EOF (`Ok(0)`) and any read `Err` are treated identically: keep
+        // torque on, warn, sleep, and retry -- NEVER propagate. If this
+        // function returned `Err`, the caller's `?` would drop the
+        // `RunningArm`, and `RunningArm`'s `Drop` disables the motors --
+        // cutting torque with no typed RELEASE at all. Releasing torque
+        // must be reachable only through that typed line.
+        //
+        // A literal Ctrl-C (SIGINT) cannot surface here as
+        // `ErrorKind::Interrupted`: Rust's std retries EINTR at the raw
+        // `read(2)` layer, below `BufRead`, so `read_line` blocks straight
+        // through a signal and returns real data once it arrives. Do not
+        // read that as license to drop this branch -- it still guards
+        // every OTHER I/O error a real stdin can produce (and is exercised
+        // directly by `confirm_release_treats_read_errors_like_eof` in
+        // tests/commands.rs, which forces exactly that error kind).
+        let is_data = matches!(input.read_line(&mut line), Ok(n) if n > 0);
+        if !is_data {
             writeln!(
                 output,
                 "input is unavailable; torque remains enabled while this process is alive"

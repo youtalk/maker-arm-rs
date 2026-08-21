@@ -126,6 +126,21 @@ fn main() -> Result<(), String> {
             }
             let pos = maker_arm_cli::zero_motor(backend.as_mut(), &config, motor)?;
             println!("motor {motor} zeroed; joint position now {pos:.4} rad");
+            // Presentation only: `zero_motor` reports a true register
+            // value, not a claim that it is a safe pose. Some joints'
+            // configured ranges do not include zero (e.g. J5, J6), so
+            // warn here -- `Session::enable()` remains the real gate and
+            // will refuse to energize a joint left outside its range.
+            if let Some(j) = config.joint_by_motor_id(motor) {
+                if pos < j.q_lo || pos > j.q_hi {
+                    println!(
+                        "WARNING: {pos:.4} rad is outside motor {motor}'s configured range \
+                         [{:.3}, {:.3}]; enable will refuse this pose until it is moved back \
+                         inside range",
+                        j.q_lo, j.q_hi
+                    );
+                }
+            }
         }
         Command::Hold => {
             let mut session =

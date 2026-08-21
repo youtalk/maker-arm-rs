@@ -151,9 +151,11 @@ fn confirm_release_never_returns_on_eof_and_keeps_retrying() {
     // forever. Instead it drives the call on a background thread and
     // bounds the wait with `recv_timeout`: a channel send only happens if
     // the function returns, so a timeout on the channel IS the assertion
-    // that it did not return. The timeout (2.5s) is sized to comfortably
-    // observe two 1s retry cycles without being so tight that a loaded CI
-    // box flakes.
+    // that it did not return. The timeout (3.8s) comfortably observes
+    // three 1s retry cycles with real margin left over -- a tighter bound
+    // (this used to be 2.5s) leaves too little slack before the next
+    // retry boundary on a loaded CI runner, which would turn a passing
+    // test into a flaky failure rather than a real signal.
     let out = SharedBuf::default();
     let out_for_thread = out.clone();
     let (tx, rx) = std::sync::mpsc::channel::<()>();
@@ -166,15 +168,77 @@ fn confirm_release_never_returns_on_eof_and_keeps_retrying() {
     // Bounded wait: if this ever receives, confirm_release wrongly returned
     // on EOF -- fail loudly instead of hanging.
     assert!(
-        rx.recv_timeout(Duration::from_millis(2500)).is_err(),
+        rx.recv_timeout(Duration::from_millis(3800)).is_err(),
         "confirm_release returned on EOF -- it must never release torque on a dead stdin"
     );
     let text = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
     assert!(text.contains("Type RELEASE"));
     assert!(
         text.matches("input is unavailable").count() >= 2,
-        "expected at least two EOF retries in 2.5s, got: {text}"
+        "expected at least two EOF retries in 3.8s, got: {text}"
     );
     // The spawned thread loops forever (by design); it is intentionally
     // left detached and dies with the test process.
+}
+
+/// A mock `BufRead` whose `read_line` is overridden (a provided trait
+/// method may always be overridden by a concrete impl) to hand back
+/// specific `Err`s before eventually producing real data -- something a
+/// `Cursor` cannot do, since it never fails.
+struct FlakyThenRelease {
+    calls: u32,
+}
+
+impl std::io::Read for FlakyThenRelease {
+    fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+        unreachable!("confirm_release only calls read_line, which is overridden below")
+    }
+}
+
+impl std::io::BufRead for FlakyThenRelease {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        unreachable!("confirm_release only calls read_line, which is overridden below")
+    }
+
+    fn consume(&mut self, _amt: usize) {}
+
+    fn read_line(&mut self, buf: &mut String) -> std::io::Result<usize> {
+        self.calls += 1;
+        match self.calls {
+            // First call: the exact error kind a retried-but-still-failing
+            // EINTR would produce, if it ever reached this layer.
+            1 => Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
+            // Second call: a different error kind, to confirm the handling
+            // is "any Err", not special-cased to Interrupted alone.
+            2 => Err(std::io::Error::other("simulated stdin failure")),
+            _ => {
+                buf.push_str(
+                    "RELEASE
+",
+                );
+                Ok(buf.len())
+            }
+        }
+    }
+}
+
+#[test]
+fn confirm_release_treats_read_errors_like_eof() {
+    // Regression test: a bare `?` on `read_line`'s result used to let any
+    // non-EOF I/O error propagate out of `confirm_release`, and the
+    // caller's `?` on THAT would drop the `RunningArm`, whose `Drop`
+    // disables the motors -- releasing torque with no typed RELEASE at
+    // all. Every read error must be treated exactly like EOF: keep torque
+    // on, warn, sleep, and retry.
+    let mut input = FlakyThenRelease { calls: 0 };
+    let mut out = Vec::new();
+    confirm_release(&mut input, &mut out)
+        .expect("returns Ok after RELEASE despite two read errors first");
+    assert_eq!(input.calls, 3);
+    let text = String::from_utf8(out).unwrap();
+    assert_eq!(
+        text.matches("input is unavailable").count(),
+        2,
+        "expected one retry warning per read error, got: {text}"
+    );
 }
