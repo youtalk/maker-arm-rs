@@ -75,6 +75,19 @@ mod tests {
     }
 
     #[test]
+    fn zero_timeout_recv_polls_without_waiting() {
+        // Same contract as SocketCanBackend::recv: Duration::ZERO is a poll,
+        // so a queued frame still comes out and an empty queue yields None.
+        let mut m = MockBackend::new();
+        m.push_incoming(0x028001FD, [7u8; 8]);
+        assert_eq!(
+            m.recv(Duration::ZERO).unwrap(),
+            Some((0x028001FD, [7u8; 8]))
+        );
+        assert_eq!(m.recv(Duration::ZERO).unwrap(), None);
+    }
+
+    #[test]
     fn mock_copies_send_data_payload_faithfully() {
         let mut m = MockBackend::new();
 

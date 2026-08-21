@@ -142,6 +142,18 @@ mod tests {
     }
 
     #[test]
+    fn zero_timeout_recv_polls_without_waiting() {
+        // Same contract as SocketCanBackend::recv: Duration::ZERO is a poll.
+        let mut r = ReplayBackend::from_log(LOG);
+        assert_eq!(
+            r.recv(Duration::ZERO).unwrap(),
+            Some((0x0300FD01, [0u8; 8]))
+        );
+        let mut empty = ReplayBackend::from_log("");
+        assert_eq!(empty.recv(Duration::ZERO).unwrap(), None);
+    }
+
+    #[test]
     fn replay_backend_pops_frames_in_order() {
         let mut r = ReplayBackend::from_log(LOG);
         assert_eq!(
