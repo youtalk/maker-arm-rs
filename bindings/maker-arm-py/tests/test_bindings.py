@@ -192,3 +192,60 @@ def test_profile_returns_a_fresh_dict_each_call():
     a = m.profile()
     a["joints"][0]["q_lo"] = -99.0
     assert m.profile()["joints"][0]["q_lo"] == -0.668
+
+
+import pytest
+
+
+def _hold_cmds(p, pos=None):
+    pos = pos if pos is not None else [0.0] * 7
+    return [(pos[i], 0.0, j["kp"], j["kd"], 0.0) for i, j in enumerate(p["joints"])]
+
+
+def test_clamp_command_passes_in_range_commands_unchanged():
+    p = m.profile()
+    mid = [(j["q_lo"] + j["q_hi"]) / 2.0 for j in p["joints"]]
+    out, clamped = m.clamp_command(_hold_cmds(p, mid), p)
+    assert clamped is False
+    assert out == _hold_cmds(p, mid)
+
+
+def test_clamp_command_clamps_position_to_profile_limits():
+    p = m.profile()
+    cmds = _hold_cmds(p)
+    cmds[0] = (100.0, 0.0, cmds[0][2], cmds[0][3], 0.0)
+    out, clamped = m.clamp_command(cmds, p)
+    assert clamped is True
+    assert out[0][0] == p["joints"][0]["q_hi"]
+
+
+def test_clamp_command_honours_numeric_overrides():
+    p = m.profile()
+    p["joints"][2]["q_lo"], p["joints"][2]["q_hi"] = 0.0, 3.14  # URDF limits for j3
+    p["limit_margin"] = 0.1
+    cmds = _hold_cmds(p, [0.0, 0.0, 5.0, 0.0, 0.0, 0.0, 0.0])
+    out, clamped = m.clamp_command(cmds, p)
+    assert clamped is True
+    assert out[2][0] == pytest.approx(3.04)
+
+
+def test_clamp_command_caps_gains_velocity_and_torque():
+    p = m.profile()
+    cmds = _hold_cmds(p)
+    cmds[1] = (0.0, 50.0, 1e6, 1e6, 1e6)
+    out, clamped = m.clamp_command(cmds, p)
+    assert clamped is True
+    assert out[1][1] == p["max_velocity"]
+    assert out[1][2] == p["kp_max"]
+    assert out[1][3] == p["kd_max"]
+    assert out[1][4] == p["joints"][1]["tau_max"]
+
+
+def test_clamp_command_rejects_non_finite_and_wrong_length():
+    p = m.profile()
+    with pytest.raises(ValueError):
+        m.clamp_command(_hold_cmds(p)[:6], p)
+    bad = _hold_cmds(p)
+    bad[3] = (float("nan"), 0.0, 1.0, 1.0, 0.0)
+    with pytest.raises(ValueError):
+        m.clamp_command(bad, p)

@@ -6,6 +6,7 @@
 // crate entirely (`--exclude maker-arm-py`) so `--all-features` can never
 // reach it. Bindings tests live in the Python suite
 // (`tests/test_bindings.py`), run against a `maturin develop` build.
+use maker_arm::state::JointCommand;
 use maker_arm::{ArmConfig, HoldController, RunningArm, Session, SessionState, SimArm};
 use maker_arm_protocol as p;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -111,11 +112,85 @@ fn config_to_dict(py: Python<'_>, c: &ArmConfig) -> PyResult<Py<PyDict>> {
     Ok(d.into())
 }
 
+fn override_f64(d: &Bound<'_, PyDict>, key: &str, slot: &mut f64) -> PyResult<()> {
+    if let Some(v) = d.get_item(key)? {
+        let x: f64 = v
+            .extract()
+            .map_err(|_| PyValueError::new_err(format!("profile field {key} must be a number")))?;
+        *slot = x;
+    }
+    Ok(())
+}
+
+/// Build an ArmConfig from the v1 profile plus the numeric overrides in `profile`.
+/// Names, models, and motor ids are never taken from Python.
+fn config_from_dict(profile: &Bound<'_, PyDict>) -> PyResult<ArmConfig> {
+    let mut c = ArmConfig::maker_arm_v1();
+    if let Some(joints) = profile.get_item("joints")? {
+        let joints = joints.downcast::<pyo3::types::PyList>()?;
+        if joints.len() != c.joints.len() {
+            return Err(PyValueError::new_err(format!(
+                "profile has {} joints, arm has {}",
+                joints.len(),
+                c.joints.len()
+            )));
+        }
+        for (j, item) in c.joints.iter_mut().zip(joints.iter()) {
+            let d = item.downcast::<PyDict>()?;
+            override_f64(d, "q_lo", &mut j.q_lo)?;
+            override_f64(d, "q_hi", &mut j.q_hi)?;
+            override_f64(d, "kp", &mut j.kp)?;
+            override_f64(d, "kd", &mut j.kd)?;
+            override_f64(d, "tau_max", &mut j.tau_max)?;
+        }
+    }
+    override_f64(profile, "max_velocity", &mut c.max_velocity)?;
+    override_f64(profile, "kp_max", &mut c.kp_max)?;
+    override_f64(profile, "kd_max", &mut c.kd_max)?;
+    override_f64(profile, "limit_margin", &mut c.limit_margin)?;
+    Ok(c)
+}
+
+/// The single-point command clamp, as a pure function. `cmds` is a list of
+/// 7 `(pos, vel, kp, kd, tau)` tuples in joint order; returns the clamped
+/// list and whether anything changed. Python still cannot reach
+/// `encode_mit`: a clamped result is data, not a frame.
+// The 5-tuple mirrors JointCommand's fields one for one, and PyO3 maps it
+// straight to/from a Python tuple; a named wrapper type would just move
+// the same fields behind an extra layer with no gain in clarity.
+#[allow(clippy::type_complexity)]
+#[pyfunction]
+fn clamp_command(
+    cmds: Vec<(f64, f64, f64, f64, f64)>,
+    profile: &Bound<'_, PyDict>,
+) -> PyResult<(Vec<(f64, f64, f64, f64, f64)>, bool)> {
+    let config = config_from_dict(profile)?;
+    let input: Vec<JointCommand> = cmds
+        .iter()
+        .map(|&(pos, vel, kp, kd, tau)| JointCommand {
+            pos,
+            vel,
+            kp,
+            kd,
+            tau,
+        })
+        .collect();
+    let (out, clamped) = maker_arm::clamp_command(&input, &config)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok((
+        out.iter()
+            .map(|c| (c.pos, c.vel, c.kp, c.kd, c.tau))
+            .collect(),
+        clamped,
+    ))
+}
+
 #[pymodule]
 fn maker_arm_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(encode_mit, m)?)?;
     m.add_function(wrap_pyfunction!(parse_frame, m)?)?;
     m.add_function(wrap_pyfunction!(profile, m)?)?;
+    m.add_function(wrap_pyfunction!(clamp_command, m)?)?;
     m.add_class::<Arm>()?;
     Ok(())
 }
