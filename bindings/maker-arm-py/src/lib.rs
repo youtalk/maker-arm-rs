@@ -75,10 +75,47 @@ fn parse_frame(
     Ok(Some(d.into()))
 }
 
+/// The pinned `maker_arm_v1` profile as plain Python data. A fresh dict on
+/// every call: callers may edit numeric fields and hand the result to
+/// `clamp_command` (see that function for which fields it reads).
+#[pyfunction]
+fn profile(py: Python<'_>) -> PyResult<Py<PyDict>> {
+    config_to_dict(py, &ArmConfig::maker_arm_v1())
+}
+
+fn config_to_dict(py: Python<'_>, c: &ArmConfig) -> PyResult<Py<PyDict>> {
+    let d = PyDict::new(py);
+    let joints = pyo3::types::PyList::empty(py);
+    for j in &c.joints {
+        let jd = PyDict::new(py);
+        jd.set_item("motor_id", j.motor_id)?;
+        jd.set_item("name", j.name)?;
+        jd.set_item("model", j.model.name())?;
+        jd.set_item("kp", j.kp)?;
+        jd.set_item("kd", j.kd)?;
+        jd.set_item("tau_max", j.tau_max)?;
+        jd.set_item("q_lo", j.q_lo)?;
+        jd.set_item("q_hi", j.q_hi)?;
+        jd.set_item("direction", j.direction)?;
+        jd.set_item("offset", j.offset)?;
+        joints.append(jd)?;
+    }
+    d.set_item("joints", joints)?;
+    d.set_item("control_rate_hz", c.control_rate_hz)?;
+    d.set_item("max_velocity", c.max_velocity)?;
+    d.set_item("feedback_timeout", c.feedback_timeout)?;
+    d.set_item("limit_margin", c.limit_margin)?;
+    d.set_item("kp_max", c.kp_max)?;
+    d.set_item("kd_max", c.kd_max)?;
+    d.set_item("temp_hold_c", c.temp_hold_c)?;
+    Ok(d.into())
+}
+
 #[pymodule]
 fn maker_arm_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(encode_mit, m)?)?;
     m.add_function(wrap_pyfunction!(parse_frame, m)?)?;
+    m.add_function(wrap_pyfunction!(profile, m)?)?;
     m.add_class::<Arm>()?;
     Ok(())
 }

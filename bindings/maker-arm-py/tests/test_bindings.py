@@ -153,3 +153,42 @@ def test_state_and_snapshot_report_loop_liveness():
     # joined and back to an idle session: its own state, and no snapshot
     assert arm.state() == "connected"
     assert arm.snapshot() is None
+
+
+import math
+
+
+def test_profile_pins_every_upstream_joint():
+    # Same table as crates/maker-arm/src/config.rs::v1_profile_matches_upstream_yaml,
+    # asserted through the Python surface so the binding cannot drift from the crate.
+    p = m.profile()
+    expected = [
+        (1, "j1", "RS00", -0.668, 4.818, 60.0, 4.0, 4.0),
+        (2, "j2", "RS02", -2.024, 0.979, 150.0, 4.5, 6.0),
+        (3, "j3", "RS02", 3.882, 7.955, 90.0, 3.0, 6.0),
+        (4, "j4", "RS00", -0.832, 2.122, 30.0, 2.0, 4.0),
+        (5, "j5", "RS00", 0.577, 3.641, 30.0, 2.0, 4.0),
+        (6, "j6", "RS00", 0.966, 6.292, 30.0, 2.0, 4.0),
+        (7, "gripper", "RS00", -2.092, -0.039, 20.0, 0.5, 2.0),
+    ]
+    assert len(p["joints"]) == 7
+    for j, (mid, name, model, q_lo, q_hi, kp, kd, tau_max) in zip(p["joints"], expected):
+        assert j["motor_id"] == mid
+        assert j["name"] == name
+        assert j["model"] == model
+        assert j["q_lo"] == q_lo and j["q_hi"] == q_hi
+        assert j["kp"] == kp and j["kd"] == kd and j["tau_max"] == tau_max
+        assert j["direction"] == 1.0 and j["offset"] == 0.0
+    assert p["control_rate_hz"] == 200.0
+    assert p["max_velocity"] == 5.0
+    assert p["feedback_timeout"] == 0.2
+    assert p["limit_margin"] == 0.0
+    assert p["kp_max"] == 200.0
+    assert p["temp_hold_c"] == 70.0
+    assert math.isfinite(p["kd_max"]) and p["kd_max"] > 0.0
+
+
+def test_profile_returns_a_fresh_dict_each_call():
+    a = m.profile()
+    a["joints"][0]["q_lo"] = -99.0
+    assert m.profile()["joints"][0]["q_lo"] == -0.668
