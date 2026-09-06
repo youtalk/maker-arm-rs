@@ -5,6 +5,17 @@
 //! over-temperature hold threshold are OUR additions (design §2/§4) — the
 //! official profile has no torque caps because its loop only ever sends
 //! tau_ff = 0.
+//!
+//! Joint-coordinate contract (maker-arm-lab MS1, 2026-09-05): joint
+//! coordinates are the vendor URDF's joint coordinates
+//! (makermods-robotics/maker-arm-sdk `urdf/maker_arm/robot.urdf` @ b30d05a),
+//! ordered `link_002_joint`..`link_007_joint` = motor ids 1..6.
+//! `JointConfig::direction` / `offset` are the motor -> URDF map and are
+//! filled by MA1 calibration; until then they are identity, and the
+//! `q_lo`/`q_hi` values below are the upstream YAML's MOTOR-frame values,
+//! to be re-expressed in URDF coordinates after calibration. Known
+//! discrepancy to check on the arm: j3's range width is 4.07 rad here vs
+//! 3.14 rad in the URDF.
 
 use maker_arm_protocol::{MotorParams, RS00, RS02};
 
@@ -39,7 +50,9 @@ pub struct JointConfig {
     pub direction: f64,
     /// Motor-frame position of joint zero, radians.
     pub offset: f64,
-    /// Soft limits in joint coordinates, radians.
+    /// Soft limits, radians. Motor-frame until MA1 calibration
+    /// re-expresses them in URDF joint coordinates (see the module
+    /// docstring's joint-coordinate contract).
     pub q_lo: f64,
     pub q_hi: f64,
     /// Default hold/impedance gains from the v1 profile.
