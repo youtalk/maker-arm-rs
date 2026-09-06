@@ -153,8 +153,10 @@ fn config_from_dict(profile: &Bound<'_, PyDict>) -> PyResult<ArmConfig> {
 
 /// The single-point command clamp, as a pure function. `cmds` is a list of
 /// 7 `(pos, vel, kp, kd, tau)` tuples in joint order; returns the clamped
-/// list and whether anything changed. Python still cannot reach
-/// `encode_mit`: a clamped result is data, not a frame.
+/// list and whether anything changed. The control loop's own command path
+/// always runs commands through this clamp before they reach a motor;
+/// `encode_mit` is a separate low-level protocol encoder exposed for tests
+/// and tooling and is not itself clamped.
 // The 5-tuple mirrors JointCommand's fields one for one, and PyO3 maps it
 // straight to/from a Python tuple; a named wrapper type would just move
 // the same fields behind an extra layer with no gain in clarity.

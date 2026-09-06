@@ -98,13 +98,7 @@ arm.stop()  # disable and join; also aliased as arm.estop()
 
 ## Profile and clamp from Python
 
-`maker_arm_rs.profile()` returns the pinned `maker_arm_v1` profile as a dict
-(7 joints: limits, gains, torque caps, direction/offset). `maker_arm_rs.clamp_command(cmds, profile)`
-applies the crate's single-point clamp to a list of 7 `(pos, vel, kp, kd, tau)` tuples and
-returns `(clamped_cmds, changed)`. The dict's numeric fields may be edited before the call
-(a simulator passes URDF joint limits this way); names, models, and motor ids are never
-read from Python, and `encode_mit` stays unreachable, so no Python value becomes a CAN
-frame without passing the Rust clamp inside the control loop.
+`maker_arm_rs.profile()` returns the pinned `maker_arm_v1` profile as a dict (7 joints: limits, gains, torque caps, direction/offset). `maker_arm_rs.clamp_command(cmds, profile)` applies the crate's single-point clamp to a list of 7 `(pos, vel, kp, kd, tau)` tuples and returns `(clamped_cmds, changed)`. The dict's numeric fields may be edited before the call (a simulator passes URDF joint limits this way); names, models, and motor ids are never read from Python. The control loop's own command path always runs commands through this clamp before they reach a motor; `encode_mit` is a separate low-level protocol encoder exposed for tests and tooling and is not itself clamped.
 
 Joint-coordinate contract: joint coordinates are the vendor URDF's
 (`maker-arm-sdk/urdf/maker_arm/robot.urdf` @ b30d05a), `link_002_joint`..`link_007_joint`

@@ -50,7 +50,9 @@ pub struct JointConfig {
     pub direction: f64,
     /// Motor-frame position of joint zero, radians.
     pub offset: f64,
-    /// Soft limits in joint coordinates, radians.
+    /// Soft limits, radians. Motor-frame until MA1 calibration
+    /// re-expresses them in URDF joint coordinates (see the module
+    /// docstring's joint-coordinate contract).
     pub q_lo: f64,
     pub q_hi: f64,
     /// Default hold/impedance gains from the v1 profile.
