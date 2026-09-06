@@ -125,7 +125,7 @@ fn clamp_guards_the_output_stage() {
     // the sim read back the CLAMPED torque, not 99
     let st = s.arm_state();
     assert!((st.motors[0].torque - 4.0).abs() < 1e-2); // J1 tau_max = 4.0
-    assert!((st.motors[1].torque - 6.0).abs() < 1e-2); // J2 (RS02) tau_max = 6.0
+    assert!((st.motors[1].torque - 12.0).abs() < 1e-2); // J2 (RS02) tau_max = 12.0
 }
 
 #[test]

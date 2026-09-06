@@ -130,8 +130,8 @@ impl ArmConfig {
         ArmConfig {
             joints: vec![
                 j(1, "j1", MotorModel::Rs00, -0.668, 4.818, 60.0, 4.0, 4.0),
-                j(2, "j2", MotorModel::Rs02, -2.024, 0.979, 150.0, 4.5, 6.0),
-                j(3, "j3", MotorModel::Rs02, 3.882, 7.955, 90.0, 3.0, 6.0),
+                j(2, "j2", MotorModel::Rs02, -2.024, 0.979, 150.0, 4.5, 12.0),
+                j(3, "j3", MotorModel::Rs02, 3.882, 7.955, 90.0, 3.0, 10.0),
                 j(4, "j4", MotorModel::Rs00, -0.832, 2.122, 30.0, 2.0, 4.0),
                 j(5, "j5", MotorModel::Rs00, 0.577, 3.641, 30.0, 2.0, 4.0),
                 j(6, "j6", MotorModel::Rs00, 0.966, 6.292, 30.0, 2.0, 4.0),
@@ -225,12 +225,22 @@ mod tests {
         // Design §2: experiment caps sit below the RS00 (±14) / RS02 (±17)
         // ratings. The clamp enforces these; MA1/MA2 sessions may tune them
         // per pre-registered promotion criteria, never silently.
+        //
+        // j2/j3 were tuned up from 6.0 (MS1 Maker Arm sim, 2026-09-05): the
+        // arm's own gravity torque, measured over the poses the
+        // pick-and-place oracle actually visits, peaks at 9.48 Nm at j2 and
+        // 8.198 Nm at j3, both above the old 6.0 cap -- the arm was sagging
+        // at rest and raising kp/kd could not recover it because the joints
+        // were already clipping at their protocol effort_limit. 12.0 / 10.0
+        // keep headroom over those measured peaks while staying under the
+        // RS02's 17 Nm rating.
         let c = ArmConfig::maker_arm_v1();
         for j in &c.joints {
             assert!(j.tau_max > 0.0);
             assert!(j.tau_max < j.model.params().t_max);
         }
-        assert_eq!(c.joints[1].tau_max, 6.0); // RS02
+        assert_eq!(c.joints[1].tau_max, 12.0); // j2, RS02
+        assert_eq!(c.joints[2].tau_max, 10.0); // j3, RS02
         assert_eq!(c.joints[0].tau_max, 4.0); // RS00
         assert_eq!(c.joints[6].tau_max, 2.0); // gripper
         assert!(c.kp_max <= maker_arm_protocol::KP_MAX);
