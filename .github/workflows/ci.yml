@@ -14,7 +14,7 @@ jobs:
         with: {components: "rustfmt, clippy"}
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo test --all-features
+      - run: cargo test --workspace --exclude maker-arm-py --all-features
   vcan:
     runs-on: ubuntu-latest
     steps:
@@ -29,6 +29,7 @@ jobs:
           sudo ip link add dev vcan0 type vcan
           sudo ip link set up vcan0
       - run: cargo test -p maker-arm-transport --features socketcan -- --ignored
+      - run: cargo test -p maker-arm --features socketcan -- --ignored
   wheels:
     strategy:
       matrix:

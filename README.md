@@ -11,17 +11,34 @@ See [NOTICE](NOTICE) for the attribution details.
   CAN protocol; ported from `maker_arm/protocol.py`.
 - `crates/maker-arm-transport` — `CanBackend` trait: mock, candump-log replay,
   and SocketCAN (feature `socketcan`).
-- `bindings/maker-arm-py` — PyO3 bindings, Python module `maker_arm_rs`.
+- `bindings/maker-arm-py` — PyO3 bindings, Python module `maker_arm_rs`:
+  protocol-level `encode_mit`/`parse_frame`, plus the orchestration-mode
+  `Arm` class (connect, enable, hold, snapshot, stop) described below.
+- `crates/maker-arm` — arm session layer: the pinned `maker_arm_v1` profile,
+  single-point command clamp, `Controller` trait, health monitoring with
+  hold-on-fault, 200 Hz control loop, and `SimArm`, an in-memory 7-motor
+  simulator for hardware-free development.
+- `crates/maker-arm-cli` — `scan`, `doctor`, `zero`, and `hold` (typed-RELEASE
+  safety gate), against `--can <iface>` or `--sim`.
 
-Status: MA0 (bench prep). The arm session layer, safety machinery, and CLI
-land in MA1 — see the design doc in the maker-arm-lab project.
+Status: MA1 prep (hardware-independent session layer) complete. **No physical
+arm has ever been driven by this code** — everything here is exercised against
+`SimArm`, a virtual CAN interface, and golden vectors copied from upstream.
+Golden-trace capture, live parity, the RS02 firmware check, and everything else
+that needs the physical arm land in MA1 — see the design doc in the
+maker-arm-lab project.
 
 ## Building
 
 ```sh
 cargo build
-cargo test --all-features
+cargo test --workspace --exclude maker-arm-py --all-features
 ```
+
+The bindings crate (`maker-arm-py`) is excluded from that command because its
+`extension-module` feature links against no Python interpreter, which breaks
+`cargo test` at link time; it is built and tested separately, via `maturin`
+(see below).
 
 The SocketCAN tests are `#[ignore]`d because they need a virtual CAN
 interface; bring one up first, then run them explicitly:
@@ -55,3 +72,26 @@ print(fb["kind"], fb["motor_id"], fb["temperature"])  # feedback 1 34.5
 The same functions in Rust are `maker_arm_protocol::{encode_mit, parse_frame}`;
 put the frames on a bus with `maker_arm_transport::SocketCanBackend::open("can0")`
 and its `CanBackend::{send, recv}`.
+
+That raw pairing is for frame-level work and tests only — it bypasses the
+single command clamp. The supported way to command a motor is through
+`maker-arm`'s session and control loop (the `Arm` class below, or
+`Session::start`), which passes every command through `clamp_command` before
+it reaches a motor.
+
+Orchestration mode: Python selects and steers controllers that run inside the
+Rust control loop; it never commands torque itself, so every command still
+passes through the Rust clamp.
+
+```python
+import time
+import maker_arm_rs as m
+
+arm = m.Arm.sim()  # or m.Arm.socketcan("can0") for a real bus
+arm.enable()
+arm.start_hold()  # spawns the 200 Hz loop, holding the current pose
+time.sleep(0.1)
+snap = arm.snapshot()
+print(snap["state"], snap["positions"])
+arm.stop()  # disable and join; also aliased as arm.estop()
+```

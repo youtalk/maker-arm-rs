@@ -1,0 +1,19 @@
+[package]
+name = "maker-arm-cli"
+description = "CLI for the MakerMods Maker Arm: scan, doctor, zero, hold"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["socketcan"]
+socketcan = ["maker-arm/socketcan"]
+
+[dependencies]
+maker-arm = { path = "../maker-arm" }
+maker-arm-protocol = { path = "../maker-arm-protocol" }
+maker-arm-transport = { path = "../maker-arm-transport" }
+clap = { version = "4", features = ["derive"] }
+ctrlc = "3"

@@ -343,3 +343,24 @@ pub fn mit_switch_protocol_data(f_cmd: u8) -> [u8; 8] {
 pub fn mit_fault_query_data() -> [u8; 8] {
     [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0xFB]
 }
+
+/// Motor-side feedback encoder — the inverse of the `COMM_FEEDBACK` arm of
+/// [`parse_frame`] up to u16 quantization. The real motors produce these
+/// frames; this encoder exists for the simulator and for round-trip tests.
+/// Temperature is encoded as an unsigned `round(°C * 10)`, mirroring the
+/// unsigned decode (see `MotorFeedback::temperature`).
+pub fn encode_feedback(fb: &MotorFeedback, params: &MotorParams, host_id: u8) -> Frame {
+    let mut data = [0u8; 8];
+    data[0..2]
+        .copy_from_slice(&float_to_u16(fb.position, params.p_min, params.p_max).to_be_bytes());
+    data[2..4]
+        .copy_from_slice(&float_to_u16(fb.velocity, params.v_min, params.v_max).to_be_bytes());
+    data[4..6].copy_from_slice(&float_to_u16(fb.torque, params.t_min, params.t_max).to_be_bytes());
+    data[6..8].copy_from_slice(&(((fb.temperature * 10.0).round()) as u16).to_be_bytes());
+    let id = ((COMM_FEEDBACK as u32) << 24)
+        | (((fb.mode & 0x03) as u32) << 22)
+        | (((fb.fault_bits & 0x3F) as u32) << 16)
+        | ((fb.motor_id as u32) << 8)
+        | host_id as u32;
+    Frame { id, data }
+}

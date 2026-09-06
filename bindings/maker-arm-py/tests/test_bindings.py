@@ -81,3 +81,75 @@ def test_parse_frame_unknown_model_raises():
 
     with pytest.raises(ValueError):
         m.parse_frame(0x028001FD, bytes.fromhex("8000800080000159"), "RS99")
+
+
+def test_arm_sim_orchestration_lifecycle():
+    import time
+
+    arm = m.Arm.sim()
+    assert arm.state() == "connected"
+    arm.enable()
+    assert arm.state() == "enabled"
+    arm.start_hold()
+    time.sleep(0.1)
+    snap = arm.snapshot()
+    assert snap is not None
+    assert snap["state"] == "enabled"
+    assert snap["fault"] is None
+    assert len(snap["positions"]) == 7
+    assert snap["tick"] > 0
+    arm.hold_now()
+    time.sleep(0.05)
+    arm.stop()
+    assert arm.state() == "connected"
+
+
+def test_arm_stop_before_start_is_safe():
+    arm = m.Arm.sim()
+    arm.stop()  # no loop running: must not raise
+    assert arm.state() == "connected"
+
+
+def test_start_hold_requires_an_enabled_session():
+    # A merely-connected session has no torque. start_hold() used to spawn
+    # a loop anyway; it died on its first tick with a wrong-state error,
+    # snapshot() then returned None forever, and state() reported
+    # "enabled" for an un-energized arm -- an operator told the arm is
+    # holding might stop supporting it.
+    import pytest
+
+    arm = m.Arm.sim()
+    assert arm.state() == "connected"
+    with pytest.raises(RuntimeError):
+        arm.start_hold()
+    # The refusal must not consume the handle: enable() then start_hold()
+    # still works on the same object.
+    assert arm.state() == "connected"
+    arm.enable()
+    arm.start_hold()
+    arm.stop()
+    assert arm.state() == "connected"
+
+
+def test_state_and_snapshot_report_loop_liveness():
+    # state() must never default to "enabled". While the loop is alive it
+    # reports what the loop published; the dead-loop reading
+    # ("loop_stopped", driven by JoinHandle::is_finished) is pinned in the
+    # Rust suite instead -- no Python-reachable path kills a SimArm loop
+    # now that start_hold() is gated, and adding a fault-injection hook to
+    # the binding just to reach it would be new public API for a test.
+    import time
+
+    arm = m.Arm.sim()
+    arm.enable()
+    arm.start_hold()
+    time.sleep(0.1)
+    snap = arm.snapshot()
+    assert snap is not None
+    assert snap["loop_alive"] is True
+    assert snap["state"] == "enabled"
+    assert arm.state() == "enabled"
+    arm.stop()
+    # joined and back to an idle session: its own state, and no snapshot
+    assert arm.state() == "connected"
+    assert arm.snapshot() is None
