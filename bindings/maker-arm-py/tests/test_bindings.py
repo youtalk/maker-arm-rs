@@ -249,3 +249,99 @@ def test_clamp_command_rejects_non_finite_and_wrong_length():
     bad[3] = (float("nan"), 0.0, 1.0, 1.0, 0.0)
     with pytest.raises(ValueError):
         m.clamp_command(bad, p)
+
+
+# --- Kinematics: the lab's global IK behind a thin surface --------------------------
+
+import math
+
+import pytest
+
+
+def _planar_chain():
+    """Two moving links (z then y), four inert joints at the same point, a fixed tool link."""
+    inert = [((0.0, 0.0, 0.0), (0.0, 0.0, 0.0), axis) for axis in ((1, 0, 0), (0, 1, 0), (0, 0, 1), (1, 0, 0))]
+    return m.Kinematics(
+        mount_rpy=(0.0, 0.0, 0.0),
+        links=[((0.0, 0.0, 0.1), (0.0, 0.0, 0.0), (0.0, 0.0, 1.0)), ((0.5, 0.0, 0.0), (0.0, 0.0, 0.0), (0.0, 1.0, 0.0))]
+        + inert
+        + [((0.3, 0.0, 0.0), (0.0, 0.0, 0.0), None)],
+        lower=[-3.0] * 6,
+        upper=[3.0] * 6,
+        tool_axis=(1.0, 0.0, 0.0),
+        jaw_axis=(0.0, 1.0, 0.0),
+    )
+
+
+def test_kinematics_fk_walks_the_chain():
+    pos, rot = _planar_chain().fk([math.pi / 2, 0.0, 0.0, 0.0, 0.0, 0.0])
+    assert pos == pytest.approx([0.0, 0.8, 0.1], abs=1e-15)
+    assert rot[1][0] == pytest.approx(1.0) and rot[0][0] == pytest.approx(0.0, abs=1e-15)
+    batch_pos, batch_rot = _planar_chain().fk_batch([[0.0] * 6, [math.pi / 2, 0.0, 0.0, 0.0, 0.0, 0.0]])
+    assert batch_pos[1] == pytest.approx(pos) and batch_rot[1] == rot and len(batch_pos) == 2
+
+
+def test_kinematics_pose_is_a_target_and_its_residual_vanishes():
+    k = _planar_chain()
+    q = [0.3, 0.6, 0.1, 0.2, 0.3, 0.4]
+    pose = k.pose_of(q)
+    position, tilt, jaw_heading, lean_azimuth = pose
+    assert len(position) == 3 and 0.0 < tilt < math.pi
+    assert max(abs(v) for v in k.residual(q, pose)) < 1e-12
+    assert k.margins(q) == pytest.approx([2.7, 2.4, 2.9, 2.8, 2.7, 2.6])
+
+
+def test_kinematics_jacobian_matches_a_coarser_central_difference():
+    k = _planar_chain()
+    q = [0.3, 0.6, 0.1, 0.2, 0.3, 0.4]
+    target = k.pose_of(q)
+    jac = k.residual_jacobian(q, target)
+    assert len(jac) == 6 and all(len(row) == 6 for row in jac)
+    eps = 1e-5
+    for j in range(6):
+        plus, minus = list(q), list(q)
+        plus[j] += eps
+        minus[j] -= eps
+        rp, rm = k.residual(plus, target), k.residual(minus, target)
+        for i in range(6):
+            assert jac[i][j] == pytest.approx((rp[i] - rm[i]) / (2 * eps), abs=1e-6)
+
+
+def _generic_chain():
+    """Base yaw, three pitch joints, wrist yaw, wrist roll, tool: six constraints on six
+    joints, so a pose pins its joint vector (the planar chain's wrist is redundant)."""
+    links = [
+        ((0.0, 0.0, 0.1), (0.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+        ((0.0, 0.0, 0.05), (0.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+        ((0.3, 0.0, 0.0), (0.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+        ((0.25, 0.0, 0.0), (0.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+        ((0.05, 0.0, 0.0), (0.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+        ((0.05, 0.0, 0.0), (0.0, 0.0, 0.0), (1.0, 0.0, 0.0)),
+        ((0.05, 0.0, 0.0), (0.0, 0.0, 0.0), None),
+    ]
+    return m.Kinematics(
+        mount_rpy=(0.0, 0.0, 0.0), links=links, lower=[-3.0] * 6, upper=[3.0] * 6,
+        tool_axis=(1.0, 0.0, 0.0), jaw_axis=(0.0, 1.0, 0.0),
+    )
+
+
+def test_kinematics_solve_recovers_a_pose_and_solve_path_walks():
+    k = _generic_chain()
+    q_true = [0.3, 0.3, 0.4, 0.3, 0.2, 0.1]
+    target = k.pose_of(q_true)
+    seed = [v + 0.1 for v in q_true]
+    solution = k.solve(target, [seed])
+    assert solution["position_error"] < 1e-5 and solution["q"] == pytest.approx(q_true, abs=1e-6)
+    assert solution["margin"] == pytest.approx(2.6) and solution["step"] == 0.0
+    assert k.solve(target, [seed], q_prev=seed, max_step=0.01) is None
+    assert k.refine(seed, target) == pytest.approx(solution["q"])
+    targets = [k.pose_of([a + t * (b - a) for a, b in zip(q_true, seed)]) for t in (0.5, 1.0)]
+    path = k.solve_path(targets, q_true, [], 0.2)
+    assert len(path) == 2 and path[-1]["q"] == pytest.approx(seed, abs=1e-6)
+    far = ((10.0, 10.0, 10.0), 0.5, 0.0, 0.0)
+    assert k.solve_path([targets[0], far], q_true, [], 0.2) is None
+
+
+def test_kinematics_rejects_a_chain_without_six_revolute_joints():
+    with pytest.raises(ValueError, match="revolute"):
+        m.Kinematics(mount_rpy=(0, 0, 0), links=[], lower=[0.0] * 6, upper=[1.0] * 6, tool_axis=(1, 0, 0), jaw_axis=(0, 1, 0))

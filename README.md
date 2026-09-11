@@ -18,6 +18,10 @@ See [NOTICE](NOTICE) for the attribution details.
   single-point command clamp, `Controller` trait, health monitoring with
   hold-on-fault, 200 Hz control loop, and `SimArm`, an in-memory 7-motor
   simulator for hardware-free development.
+  Its `kinematics` module is the six-joint grasp-pose solver the lab's planner
+  uses (forward kinematics over a caller-supplied URDF chain, central-difference
+  Jacobian, Levenberg-Marquardt refine, multi-seed branch selection, and
+  continuity-constrained paths), exposed to Python as `maker_arm_rs.Kinematics`.
 - `crates/maker-arm-cli` — `scan`, `doctor`, `zero`, and `hold` (typed-RELEASE
   safety gate), against `--can <iface>` or `--sim`.
 

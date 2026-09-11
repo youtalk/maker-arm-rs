@@ -9,6 +9,7 @@ pub mod config;
 pub mod control_loop;
 pub mod controller;
 pub mod health;
+pub mod kinematics;
 pub mod session;
 pub mod sim;
 pub mod state;
