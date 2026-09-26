@@ -250,8 +250,8 @@ impl TrackingShared {
         *self.telemetry.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The loop clock now: the last tick's `ArmState::t` (seconds since connect) plus the
-    /// wall time since that tick. None before the first tick.
+    /// The loop clock now: the tick clock (the latest good `ArmState::t`, seconds since
+    /// connect) plus the wall time since that tick. None before the first tick.
     pub fn now(&self) -> Option<f64> {
         self.clock
             .lock()
@@ -422,7 +422,9 @@ impl TrackingController {
     }
 
     /// Deadband admittance `D_a d(offset)/dt + K_a offset = dz(r)` by backward Euler (stable
-    /// for any step), and the contact gate.
+    /// for any step), and the contact gate. On a gap tick the observer has just restarted and
+    /// cannot see a push yet, so the admittance, the gate and its quiet timer keep their state
+    /// for that tick (design section 10).
     fn yield_and_gate(&mut self, h: f64, gap: bool) {
         let mut over = false;
         for j in 0..ARM_DOF {
@@ -444,7 +446,7 @@ impl TrackingController {
                 self.offset_rate[j] = 0.0;
             }
         }
-        if h > 0.0 {
+        if h > 0.0 && !gap {
             if over {
                 self.quiet = 0.0;
                 self.gate = (self.gate - h / self.params.gate_fall).max(0.0);
@@ -482,9 +484,6 @@ impl Controller for TrackingController {
             dq[j] = m.velocity;
             tau_m[j] = m.torque;
         }
-        if let Ok(mut clock) = self.shared.clock.try_lock() {
-            *clock = Some((t, Instant::now()));
-        }
         if let Ok(mut pending) = self.shared.pending.try_lock() {
             for p in pending.drain(..) {
                 self.plan.push(p);
@@ -494,13 +493,21 @@ impl Controller for TrackingController {
             self.begin(t, &q, &dq, state.motors[ARM_DOF].position);
         }
         let raw = t - self.t_prev;
-        // A repeated or backward stamp integrates nothing.
+        // A repeated, backward or NaN stamp integrates nothing and leaves the tick clock at
+        // the latest good stamp, so the clock never runs backward. A clock that is not finite
+        // (a NaN first stamp) takes the next stamp as it is.
         let h = if raw.is_finite() && raw > 0.0 {
             raw
         } else {
             0.0
         };
-        self.t_prev = t;
+        if h > 0.0 || !self.t_prev.is_finite() {
+            self.t_prev = t;
+        }
+        let t = self.t_prev;
+        if let Ok(mut clock) = self.shared.clock.try_lock() {
+            *clock = Some((t, Instant::now()));
+        }
         let gap = h > GAP_S;
         if h > LATE_S {
             self.telemetry.late_ticks += 1;
@@ -946,6 +953,65 @@ mod tests {
         let out = c.update(&st(19.0 * H, [0.0; 6], [0.0; 6], tau), H); // backward
         assert_eq!(c.q_d, q_d);
         assert!(out.iter().all(|j| j.tau.is_finite()));
+    }
+
+    #[test]
+    fn a_backward_or_nan_stamp_keeps_the_tick_clock_at_the_later_time() {
+        let rows = ramp(0.5, 0.0, 0.01, 300);
+        let mut tau = [0.0; 6];
+        tau[0] = -1.5;
+        let tick = |c: &mut TrackingController, t: f64| {
+            c.update(&st(t, [0.0; 6], [0.0; 6], tau), H);
+        };
+        let (mut a, mut b, mut n) = (
+            ctrl(contact(f64::INFINITY)),
+            ctrl(contact(f64::INFINITY)),
+            ctrl(contact(f64::INFINITY)),
+        );
+        for c in [&mut a, &mut b, &mut n] {
+            c.shared().push(Push::new(0.0, 0.01, rows.clone()).unwrap());
+        }
+        tick(&mut n, f64::NAN); // a NaN first stamp must not poison the clock
+        for k in 0..=20 {
+            for c in [&mut a, &mut b, &mut n] {
+                tick(c, k as f64 * H);
+            }
+        }
+        tick(&mut a, 19.0 * H); // backward
+        tick(&mut a, f64::NAN);
+        for k in 21..=22 {
+            for c in [&mut a, &mut b, &mut n] {
+                tick(c, k as f64 * H);
+            }
+            // a and n integrate exactly H, like b, which saw no bad stamp
+            for c in [&a, &n] {
+                assert_eq!(c.q_d, b.q_d, "q_d at tick {k}");
+                assert_eq!(c.dq_d, b.dq_d, "dq_d at tick {k}");
+                assert_eq!(c.r, b.r, "r at tick {k}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_gap_holds_the_gate_while_the_arm_is_blocked() {
+        let mut c = ctrl(contact(1.0));
+        let mut tau = [0.0; 6];
+        tau[1] = -3.0;
+        let mut t = 0.0;
+        for _ in 0..=40 {
+            c.update(&st(t, [0.0; 6], [0.0; 6], tau), H);
+            t += H;
+        }
+        assert_eq!(c.gate, 0.0);
+        t += 0.055; // this tick lands 60 ms after the last
+        c.update(&st(t, [0.0; 6], [0.0; 6], tau), H);
+        assert_eq!(c.r[1], 0.0); // the observer restarted
+        assert_eq!(c.gate, 0.0, "gate on the gap tick");
+        for _ in 0..40 {
+            t += H;
+            c.update(&st(t, [0.0; 6], [0.0; 6], tau), H);
+            assert_eq!(c.gate, 0.0, "gate at {t}");
+        }
     }
 
     #[test]
