@@ -14,6 +14,7 @@ pub mod kinematics;
 pub mod session;
 pub mod sim;
 pub mod state;
+pub mod tracking;
 
 pub use clamp::{clamp_command, ClampError};
 pub use config::{ArmConfig, JointConfig, MotorModel};
