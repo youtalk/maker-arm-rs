@@ -33,7 +33,7 @@ pub struct ArmState {
     /// Same order as `ArmConfig::joints`.
     pub motors: Vec<MotorState>,
     pub tick: u64,
-    /// Seconds since the loop started.
+    /// Seconds since `Session::connect`.
     pub t: f64,
 }
 
