@@ -8,6 +8,7 @@
 // (`tests/test_bindings.py`), run against a `maturin develop` build.
 mod dynamics;
 mod kinematics;
+mod tracking;
 
 use maker_arm::state::JointCommand;
 use maker_arm::{ArmConfig, HoldController, RunningArm, Session, SessionState, SimArm};
@@ -128,7 +129,7 @@ fn override_f64(d: &Bound<'_, PyDict>, key: &str, slot: &mut f64) -> PyResult<()
 
 /// Build an ArmConfig from the v1 profile plus the numeric overrides in `profile`.
 /// Names, models, and motor ids are never taken from Python.
-fn config_from_dict(profile: &Bound<'_, PyDict>) -> PyResult<ArmConfig> {
+pub(crate) fn config_from_dict(profile: &Bound<'_, PyDict>) -> PyResult<ArmConfig> {
     let mut c = ArmConfig::maker_arm_v1();
     if let Some(joints) = profile.get_item("joints")? {
         let joints = joints.downcast::<pyo3::types::PyList>()?;
@@ -200,6 +201,7 @@ fn maker_arm_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Arm>()?;
     m.add_class::<kinematics::Kinematics>()?;
     m.add_class::<dynamics::Dynamics>()?;
+    m.add_class::<tracking::Tracking>()?;
     Ok(())
 }
 
@@ -337,6 +339,25 @@ impl Arm {
         self.require_enabled("start_hold")?;
         let hold = HoldController::from_config(&self.config);
         self.start_loop(Box::new(hold), rt)
+    }
+
+    /// Move `tracking`'s controller into the 200 Hz loop. Requires an enabled session, as
+    /// `start_hold` does. After this, `tracking.update` raises; `push`, `now` and
+    /// `telemetry` keep working from any thread. `rt` as for `start_hold`. If the start
+    /// fails, the session stays idle and `tracking` stays usable.
+    #[pyo3(signature = (tracking, rt = None))]
+    fn start_tracking(
+        &mut self,
+        tracking: &tracking::Tracking,
+        rt: Option<(i32, usize)>,
+    ) -> PyResult<()> {
+        self.require_enabled("start_tracking")?;
+        let ctrl = tracking.enter_loop()?;
+        let result = self.start_loop(Box::new(ctrl), rt);
+        if result.is_err() {
+            tracking.leave_loop();
+        }
+        result
     }
 
     /// Retarget the running loop to hold the pose it is at right now.

@@ -1,6 +1,9 @@
 """Golden parity with the protocol vectors — the same numbers as the Rust
 tests and the official SDK, asserted through the Python surface."""
 
+import threading
+import time
+
 import maker_arm_rs as m
 
 
@@ -400,3 +403,93 @@ def test_dynamics_refuses_bad_models():
         m.Dynamics((0.0, 0.0, 0.0), CHAIN, [BODY] * 5)
     with pytest.raises(ValueError, match="friction"):
         m.Dynamics((0.0, 0.0, 0.0), CHAIN, [BODY] * 6, friction=[(0.1, 0.0, 0.0)] * 6)
+
+
+# --- Tracking: the compliant tracking controller behind a thread-safe handle --------
+
+def test_tracking_holds_the_start_pose_with_gravity_feed_forward():
+    d = _planar_dynamics()
+    tr = m.Tracking(d, params={"contact": False})
+    q = [0.1, -0.2, 0.3, 0.0, 0.2, -0.1, -1.0]
+    out = tr.update(0.0, q, [0.0] * 7, [0.0] * 7)
+    assert len(out) == 7
+    g = d.gravity(q[:6])
+    for j in range(6):
+        pos, vel, kp, kd, tau = out[j]
+        assert pos == q[j] and vel == 0.0 and abs(tau - g[j]) < 1e-12
+    assert out[6][0] == -1.0 and out[6][4] == 0.0
+    tel = tr.telemetry()
+    assert set(tel) == {"r", "gate", "offset", "q_r", "tau_ff", "late_ticks", "gaps", "max_interval"}
+
+
+def test_tracking_rejects_bad_input():
+    d = _planar_dynamics()
+    with pytest.raises(ValueError, match="unknown tracking parameter"):
+        m.Tracking(d, params={"f_R": 10.0})
+    with pytest.raises(ValueError, match="f_r"):
+        m.Tracking(d, params={"f_r": -1.0})
+    tr = m.Tracking(d)
+    with pytest.raises((ValueError, TypeError)):
+        tr.update(0.0, [0.0] * 6, [0.0] * 7, [0.0] * 7)
+    with pytest.raises(ValueError, match="push"):
+        tr.push(0.0, 0.0, [[0.0] * 7])
+    with pytest.raises(ValueError, match="push"):
+        tr.push(0.0, 0.01, [])
+
+
+def test_tracking_runs_in_the_loop_and_other_threads_can_reach_it():
+    a = m.Arm.sim()
+    a.enable()
+    tr = m.Tracking(_planar_dynamics())
+    a.start_tracking(tr)
+    errors, clocks = [], []
+
+    def worker():
+        try:
+            for _ in range(40):
+                snap = a_positions[0]
+                now = tr.now()
+                if now is not None:
+                    clocks.append(now)
+                    tr.push(now + 0.02, 0.05, [snap, snap])
+                tr.telemetry()
+                time.sleep(0.005)
+        except Exception as exc:  # noqa: BLE001 -- the assertion below reports it
+            errors.append(exc)
+
+    deadline = time.time() + 2.0
+    while a.snapshot() is None and time.time() < deadline:
+        time.sleep(0.01)
+    a_positions = [list(a.snapshot()["positions"])]
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join()
+    assert errors == []
+    assert clocks and clocks == sorted(clocks)
+    assert tr.telemetry() is not None
+    assert a.state() == "enabled"
+    with pytest.raises(RuntimeError, match="loop"):
+        tr.update(0.0, [0.0] * 7, [0.0] * 7, [0.0] * 7)
+    b = m.Arm.sim()
+    b.enable()
+    with pytest.raises(RuntimeError, match="already runs"):
+        b.start_tracking(tr)
+    a.stop()
+    b.stop()
+
+
+def test_start_tracking_with_an_impossible_rt_keeps_the_tracking_usable():
+    a = m.Arm.sim()
+    a.enable()
+    tr = m.Tracking(_planar_dynamics())
+    with pytest.raises(RuntimeError, match="CPU 1000"):
+        a.start_tracking(tr, rt=(80, 1000))
+    assert a.state() == "enabled"
+    a.start_tracking(tr)
+    a.stop()
+
+
+def test_start_tracking_requires_an_enabled_session():
+    a = m.Arm.sim()
+    with pytest.raises(RuntimeError, match="start_tracking requires an enabled session"):
+        a.start_tracking(m.Tracking(_planar_dynamics()))
