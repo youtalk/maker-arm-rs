@@ -205,6 +205,17 @@ impl Plan {
         Some(out)
     }
 
+    /// Adds `p` at `now`. A push due later than `now` onto a plan with no sample at or after
+    /// `now` (empty or run out) first gets the sample `(now, current target)`, so the
+    /// reference moves from where it is at `now` and reaches row 0 at `t0`, not at once.
+    pub fn push_at(&mut self, p: Push, now: f64, hold: Row) {
+        if p.t0 > now && self.samples.last().is_none_or(|s| s.0 < now) {
+            let current = self.sample(now).unwrap_or(hold);
+            self.samples.push((now, current));
+        }
+        self.push(p);
+    }
+
     /// Drops the samples no interpolation at or after `t` can need.
     pub fn forget_before(&mut self, t: f64) {
         let k = self.samples.partition_point(|x| x.0 <= t);
@@ -484,11 +495,6 @@ impl Controller for TrackingController {
             dq[j] = m.velocity;
             tau_m[j] = m.torque;
         }
-        if let Ok(mut pending) = self.shared.pending.try_lock() {
-            for p in pending.drain(..) {
-                self.plan.push(p);
-            }
-        }
         if !self.started {
             self.begin(t, &q, &dq, state.motors[ARM_DOF].position);
         }
@@ -517,6 +523,13 @@ impl Controller for TrackingController {
         }
         self.telemetry.max_interval = self.telemetry.max_interval.max(h);
 
+        // After `begin` and the clock update: a future push anchors at this tick's time and
+        // the hold pose (design section 6: row k is due at t0 + k dt).
+        if let Ok(mut pending) = self.shared.pending.try_lock() {
+            for p in pending.drain(..) {
+                self.plan.push_at(p, t, self.hold);
+            }
+        }
         let target = self.plan.sample(t).unwrap_or(self.hold);
         self.plan.forget_before(t);
         let mut u = [0.0; ARM_DOF];
@@ -755,6 +768,35 @@ mod tests {
             q_prev = c.q_d[0];
         }
         assert!((c.q_d[0] - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_future_push_starts_from_the_current_target_now() {
+        // First on the empty plan at start, then on a plan that has run out: a row due 1 s
+        // ahead must not move the input or q_d on the next tick, and the input is halfway at
+        // t0 - 0.5 s (design section 6: row k is due at t0 + k dt).
+        let mut c = ctrl(free());
+        c.update(&at_rest(0.0), H);
+        let mut k = 0;
+        for (from, to) in [(0.0, 0.1), (0.1, 0.2)] {
+            let t0 = (k + 1) as f64 * H + 1.0;
+            c.shared().push(Push::new(t0, 0.01, vec![row(to)]).unwrap());
+            let q_d = c.q_d[0];
+            for i in 1..=500 {
+                k += 1;
+                c.update(&at_rest(k as f64 * H), H);
+                if i == 1 {
+                    assert_eq!(c.u_prev[0], from, "the input moved on the push tick");
+                    assert!((c.q_d[0] - q_d).abs() < 1e-12, "q_d moved on the push tick");
+                }
+                if i == 101 {
+                    let half = (from + to) / 2.0;
+                    assert!((c.u_prev[0] - half).abs() < 1e-12, "{}", c.u_prev[0]);
+                }
+            }
+            // About 1.5 s past t0: the plan has run out and q_d has settled on `to`.
+            assert!((c.q_d[0] - to).abs() < 1e-9, "{}", c.q_d[0]);
+        }
     }
 
     #[test]
