@@ -884,6 +884,104 @@ mod tests {
         }
     }
 
+    /// `x` with `m x = b`, for a symmetric positive definite `m`.
+    // Rows r and i of `m` in one statement: an iterator would need a split borrow.
+    #[allow(clippy::needless_range_loop)]
+    fn solve(mut m: JointMatrix, mut b: Joints) -> Joints {
+        for i in 0..ARM_DOF {
+            for r in i + 1..ARM_DOF {
+                let f = m[r][i] / m[i][i];
+                for c in i..ARM_DOF {
+                    m[r][c] -= f * m[i][c];
+                }
+                b[r] -= f * b[i];
+            }
+        }
+        let mut x = [0.0; ARM_DOF];
+        for i in (0..ARM_DOF).rev() {
+            let s: f64 = (i + 1..ARM_DOF).map(|c| m[i][c] * x[c]).sum();
+            x[i] = (b[i] - s) / m[i][i];
+        }
+        x
+    }
+
+    #[test]
+    fn observer_recovers_a_constant_push_on_a_moving_arm() {
+        // A six-link planar arm under gravity swings every joint 0.5 rad at 0.5 Hz (up to
+        // 1.57 rad/s) under computed torque, while a constant external torque acts on it. RK4
+        // at 1 ms integrates the true dynamics, with the motor torque held over each 5 ms
+        // tick as the MIT loop holds its command, and the observer sees the true q, dq and
+        // that torque.
+        let d = vertical([0.0, -9.81, 0.0]);
+        let mut c = TrackingController::new(
+            d.clone(),
+            contact(f64::INFINITY),
+            &ArmConfig::maker_arm_v1(),
+        )
+        .unwrap();
+        let ext = [0.3, -0.2, 0.15, -0.1, 0.05, 0.08];
+        let (amp, w_ref) = (0.5, PI);
+        let reference = |t: f64| -> (Joints, Joints, Joints) {
+            let phase = |j: usize| w_ref * t + j as f64;
+            (
+                std::array::from_fn(|j| amp * phase(j).sin()),
+                std::array::from_fn(|j| amp * w_ref * phase(j).cos()),
+                std::array::from_fn(|j| -amp * w_ref * w_ref * phase(j).sin()),
+            )
+        };
+        let accel = |q: &Joints, dq: &Joints, tau: &Joints| -> Joints {
+            let bias = d.inverse(q, dq, &[0.0; ARM_DOF]);
+            solve(
+                d.mass_matrix(q),
+                std::array::from_fn(|j| tau[j] + ext[j] - bias[j]),
+            )
+        };
+        let axpy =
+            |a: &Joints, s: f64, b: &Joints| -> Joints { std::array::from_fn(|j| a[j] + s * b[j]) };
+        let step = 0.001;
+        let (mut q, mut dq, _) = reference(0.0);
+        let (mut tau, mut worst, mut fastest) = ([0.0; ARM_DOF], 0.0_f64, 0.0_f64);
+        for k in 0..=800 {
+            let t = k as f64 * H;
+            c.update(&st(t, q, dq, tau), H);
+            if t >= 0.5 {
+                for j in 0..ARM_DOF {
+                    worst = worst.max((c.r[j] - ext[j]).abs());
+                    fastest = fastest.max(dq[j].abs());
+                }
+            }
+            // Computed torque on the reference, blind to the push, held over the next tick.
+            let (q_ref, dq_ref, ddq_ref) = reference(t);
+            let ddq: Joints = std::array::from_fn(|j| {
+                ddq_ref[j] + 100.0 * (q_ref[j] - q[j]) + 20.0 * (dq_ref[j] - dq[j])
+            });
+            tau = d.inverse(&q, &dq, &ddq);
+            for _ in 0..5 {
+                let a1 = accel(&q, &dq, &tau);
+                let (q2, v2) = (axpy(&q, step / 2.0, &dq), axpy(&dq, step / 2.0, &a1));
+                let a2 = accel(&q2, &v2, &tau);
+                let (q3, v3) = (axpy(&q, step / 2.0, &v2), axpy(&dq, step / 2.0, &a2));
+                let a3 = accel(&q3, &v3, &tau);
+                let (q4, v4) = (axpy(&q, step, &v3), axpy(&dq, step, &a3));
+                let a4 = accel(&q4, &v4, &tau);
+                q = std::array::from_fn(|j| {
+                    q[j] + step / 6.0 * (dq[j] + 2.0 * v2[j] + 2.0 * v3[j] + v4[j])
+                });
+                dq = std::array::from_fn(|j| {
+                    dq[j] + step / 6.0 * (a1[j] + 2.0 * a2[j] + 2.0 * a3[j] + a4[j])
+                });
+            }
+        }
+        assert!(fastest > 1.4, "the arm must move: {fastest} rad/s");
+        // RK4 is converged here (half the step moves `worst` by 1e-11 N m). What is left is
+        // the observer's own discretization: it takes C^T dq - G at the tick's end for the
+        // whole 5 ms tick, an error that grows with dq^2. It is 13 mN m at up to 2.0 rad/s
+        // (the review's probe: 7 mN m at 1.4 rad/s on the URDF model). The bound doubles
+        // it. Dropping either term of `Mdot dq - C dq`, or flipping a sign, gives 0.13 to
+        // 0.42 N m.
+        assert!(worst < 0.03, "r misses the push by {worst} N m");
+    }
+
     #[test]
     fn admittance_settles_at_the_design_force_against_a_wall() {
         // Joint 0 (kp 60) is stuck at q = 0; the plan goes delta = 0.02 past it.
