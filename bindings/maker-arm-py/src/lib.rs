@@ -6,10 +6,13 @@
 // crate entirely (`--exclude maker-arm-py`) so `--all-features` can never
 // reach it. Bindings tests live in the Python suite
 // (`tests/test_bindings.py`), run against a `maturin develop` build.
+mod dynamics;
 mod kinematics;
+mod tracking;
 
 use maker_arm::state::JointCommand;
 use maker_arm::{ArmConfig, HoldController, RunningArm, Session, SessionState, SimArm};
+use maker_arm::{Controller, LoopRt};
 use maker_arm_protocol as p;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -126,7 +129,7 @@ fn override_f64(d: &Bound<'_, PyDict>, key: &str, slot: &mut f64) -> PyResult<()
 
 /// Build an ArmConfig from the v1 profile plus the numeric overrides in `profile`.
 /// Names, models, and motor ids are never taken from Python.
-fn config_from_dict(profile: &Bound<'_, PyDict>) -> PyResult<ArmConfig> {
+pub(crate) fn config_from_dict(profile: &Bound<'_, PyDict>) -> PyResult<ArmConfig> {
     let mut c = ArmConfig::maker_arm_v1();
     if let Some(joints) = profile.get_item("joints")? {
         let joints = joints.downcast::<pyo3::types::PyList>()?;
@@ -197,6 +200,8 @@ fn maker_arm_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(clamp_command, m)?)?;
     m.add_class::<Arm>()?;
     m.add_class::<kinematics::Kinematics>()?;
+    m.add_class::<dynamics::Dynamics>()?;
+    m.add_class::<tracking::Tracking>()?;
     Ok(())
 }
 
@@ -246,6 +251,51 @@ const STARTING: &str = "starting";
 /// and surfaces the error.
 const LOOP_STOPPED: &str = "loop_stopped";
 
+impl Arm {
+    /// Raises unless the session is idle and enabled. Without this gate the loop thread died
+    /// on its first tick with a wrong-state error, `snapshot()` returned None forever, and
+    /// `state()` reported "enabled" for an arm with no torque at all.
+    fn require_enabled(&self, what: &str) -> PyResult<()> {
+        if let ArmHandle::Idle(s) = &self.handle {
+            if s.state() != SessionState::Enabled {
+                return Err(PyRuntimeError::new_err(format!(
+                    "{what} requires an enabled session, but this one is {}; \
+                     call enable() first",
+                    state_str(s.state())
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Moves the idle session into the loop with `controller`. On an `rt` failure the session
+    /// comes back and the handle stays idle.
+    fn start_loop(
+        &mut self,
+        controller: Box<dyn Controller>,
+        rt: Option<(i32, usize)>,
+    ) -> PyResult<()> {
+        let rt = rt.map(|(priority, cpu)| LoopRt { priority, cpu });
+        match std::mem::replace(&mut self.handle, ArmHandle::Empty) {
+            ArmHandle::Idle(s) => match s.start(controller, rt) {
+                Ok(running) => {
+                    self.handle = ArmHandle::Running(running);
+                    Ok(())
+                }
+                Err(e) => {
+                    let e = *e;
+                    self.handle = ArmHandle::Idle(e.session);
+                    Err(PyRuntimeError::new_err(e.error.to_string()))
+                }
+            },
+            other => {
+                self.handle = other;
+                Err(PyRuntimeError::new_err("loop already running"))
+            }
+        }
+    }
+}
+
 #[pymethods]
 impl Arm {
     /// Connect to the built-in 7-motor simulator.
@@ -281,32 +331,37 @@ impl Arm {
 
     /// Spawn the 200 Hz control loop holding the current pose.
     ///
-    /// Requires an enabled session: raises RuntimeError otherwise. Without
-    /// this gate the loop thread died on its first tick with a wrong-state
-    /// error, `snapshot()` returned None forever, and `state()` reported
-    /// "enabled" for an arm with no torque at all -- an operator told the
-    /// arm is holding might stop supporting it.
-    fn start_hold(&mut self) -> PyResult<()> {
-        if let ArmHandle::Idle(s) = &self.handle {
-            if s.state() != SessionState::Enabled {
-                return Err(PyRuntimeError::new_err(format!(
-                    "start_hold requires an enabled session, but this one is {}; \
-                     call enable() first",
-                    state_str(s.state())
-                )));
-            }
+    /// Requires an enabled session: raises RuntimeError otherwise. `rt` is an optional
+    /// `(priority, cpu)` pair: the loop thread runs at SCHED_FIFO `priority`, pinned to `cpu`,
+    /// or the call raises and the session stays idle.
+    #[pyo3(signature = (rt = None))]
+    fn start_hold(&mut self, rt: Option<(i32, usize)>) -> PyResult<()> {
+        self.require_enabled("start_hold")?;
+        let hold = HoldController::from_config(&self.config);
+        self.start_loop(Box::new(hold), rt)
+    }
+
+    /// Move `tracking`'s controller into the 200 Hz loop. Requires an enabled session, as
+    /// `start_hold` does. After this, `tracking.update` raises; `push`, `now` and
+    /// `telemetry` keep working from any thread. `rt` as for `start_hold`.
+    ///
+    /// Raises RuntimeError for a `tracking` built with `contact=False` (rung F has no error
+    /// clamp) and for one with a plan or a pending push (their stamps belong to another
+    /// clock: push after this call, with `now()`). If the start fails, the session stays
+    /// idle and `tracking` stays usable.
+    #[pyo3(signature = (tracking, rt = None))]
+    fn start_tracking(
+        &mut self,
+        tracking: &tracking::Tracking,
+        rt: Option<(i32, usize)>,
+    ) -> PyResult<()> {
+        self.require_enabled("start_tracking")?;
+        let ctrl = tracking.enter_loop()?;
+        let result = self.start_loop(Box::new(ctrl), rt);
+        if result.is_err() {
+            tracking.leave_loop();
         }
-        match std::mem::replace(&mut self.handle, ArmHandle::Empty) {
-            ArmHandle::Idle(s) => {
-                let hold = HoldController::from_config(&self.config);
-                self.handle = ArmHandle::Running(s.start(Box::new(hold)));
-                Ok(())
-            }
-            other => {
-                self.handle = other;
-                Err(PyRuntimeError::new_err("loop already running"))
-            }
-        }
+        result
     }
 
     /// Retarget the running loop to hold the pose it is at right now.

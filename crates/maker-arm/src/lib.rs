@@ -8,15 +8,19 @@ pub mod clamp;
 pub mod config;
 pub mod control_loop;
 pub mod controller;
+pub mod dynamics;
 pub mod health;
 pub mod kinematics;
 pub mod session;
 pub mod sim;
 pub mod state;
+pub mod tracking;
 
 pub use clamp::{clamp_command, ClampError};
 pub use config::{ArmConfig, JointConfig, MotorModel};
-pub use control_loop::{HoldHandle, RunningArm, Snapshot, TickOutcome};
+pub use control_loop::{
+    HoldHandle, LoopRt, RtError, RunningArm, Snapshot, StartError, TickOutcome,
+};
 pub use controller::{Controller, HoldController};
 pub use health::{FaultReason, HealthMonitor};
 pub use session::{Session, SessionError, SessionState};

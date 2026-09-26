@@ -1,6 +1,6 @@
 use maker_arm::{
-    ArmCommand, ArmConfig, ArmState, Controller, FaultReason, HoldController, JointCommand,
-    Session, SessionState, SimArm,
+    ArmCommand, ArmConfig, ArmState, Controller, FaultReason, HoldController, JointCommand, LoopRt,
+    RtError, Session, SessionState, SimArm,
 };
 use std::f64::consts::TAU;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -262,7 +262,9 @@ fn run_paces_ticks_and_running_arm_lifecycle_works() {
     assert!(dt > 0.08 && dt < 0.5, "elapsed {dt}");
 
     // threaded wrapper
-    let running = s.start(Box::new(HoldController::from_config(&c)));
+    let running = s
+        .start(Box::new(HoldController::from_config(&c)), None)
+        .expect("start");
     std::thread::sleep(std::time::Duration::from_millis(50));
     let snap = running.snapshot().expect("snapshot");
     assert_eq!(snap.state, SessionState::Enabled);
@@ -463,7 +465,7 @@ fn dropping_a_running_arm_stops_the_background_thread() {
         ticks: ticks.clone(),
         inner: HoldController::from_config(&c),
     };
-    let running = s.start(Box::new(controller));
+    let running = s.start(Box::new(controller), None).expect("start");
 
     // Let it tick a handful of times before we drop instead of releasing
     // properly.
@@ -594,7 +596,9 @@ fn loop_finished_reports_a_dead_control_thread_honestly() {
     c.hold_on_fault = false;
     let mut s = enabled_session(&c);
     s.backend_as_sim().unwrap().inject_fault(2, 0x01);
-    let running = s.start(Box::new(HoldController::from_config(&c)));
+    let running = s
+        .start(Box::new(HoldController::from_config(&c)), None)
+        .expect("start");
     let deadline = Instant::now() + std::time::Duration::from_secs(5);
     while !running.loop_finished() && Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -613,4 +617,76 @@ fn loop_finished_reports_a_dead_control_thread_honestly() {
         snap.fault.is_some(),
         "the final snapshot must carry the fault"
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn start_with_an_invalid_cpu_fails_and_returns_the_session() {
+    let c = fast(ArmConfig::maker_arm_v1());
+    let s = enabled_session(&c);
+    let rt = Some(LoopRt {
+        priority: 80,
+        cpu: 1000,
+    });
+    let err = s
+        .start(Box::new(HoldController::from_config(&c)), rt)
+        .err()
+        .expect("CPU 1000 does not exist on any test host");
+    assert!(matches!(err.error, RtError::Cpu { cpu: 1000, .. }));
+    // The loop thread is gone and the session came back as it was: it can start again.
+    assert_eq!(err.session.state(), SessionState::Enabled);
+    let running = err
+        .session
+        .start(Box::new(HoldController::from_config(&c)), None)
+        .expect("a start without rt");
+    let (_, res) = running.stop_and_disable();
+    res.expect("clean stop");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn start_with_an_out_of_range_priority_fails_and_returns_the_session() {
+    let c = fast(ArmConfig::maker_arm_v1());
+    let mut s = enabled_session(&c);
+    for priority in [0, 100] {
+        let rt = Some(LoopRt { priority, cpu: 0 });
+        let err = s
+            .start(Box::new(HoldController::from_config(&c)), rt)
+            .err()
+            .expect("SCHED_FIFO has no such priority");
+        assert_eq!(err.error, RtError::PriorityRange { priority });
+        assert!(err.error.to_string().contains("1..=99"), "{}", err.error);
+        s = err.session;
+    }
+    assert_eq!(s.state(), SessionState::Enabled);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn start_without_the_rtprio_right_fails_and_returns_the_session() {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes one rlimit that we own; geteuid has no preconditions.
+    let euid = unsafe {
+        libc::getrlimit(libc::RLIMIT_RTPRIO, &mut lim);
+        libc::geteuid()
+    };
+    if euid == 0 || lim.rlim_cur >= 80 {
+        eprintln!("skipped: this host grants rtprio 80; T2 on the Thor covers the success path");
+        return;
+    }
+    let c = fast(ArmConfig::maker_arm_v1());
+    let s = enabled_session(&c);
+    let rt = Some(LoopRt {
+        priority: 80,
+        cpu: 0,
+    });
+    let err = s
+        .start(Box::new(HoldController::from_config(&c)), rt)
+        .err()
+        .expect("no rtprio right, so SCHED_FIFO 80 must be refused");
+    assert!(matches!(err.error, RtError::Priority { priority: 80, .. }));
+    assert_eq!(err.session.state(), SessionState::Enabled);
 }

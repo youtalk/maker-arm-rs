@@ -1,6 +1,9 @@
 """Golden parity with the protocol vectors — the same numbers as the Rust
 tests and the official SDK, asserted through the Python surface."""
 
+import threading
+import time
+
 import maker_arm_rs as m
 
 
@@ -342,6 +345,216 @@ def test_kinematics_solve_recovers_a_pose_and_solve_path_walks():
     assert k.solve_path([targets[0], far], q_true, [], 0.2) is None
 
 
+def test_start_hold_with_an_impossible_rt_fails_and_keeps_the_session():
+    a = m.Arm.sim()
+    a.enable()
+    with pytest.raises(RuntimeError, match="CPU 1000"):
+        a.start_hold(rt=(80, 1000))
+    assert a.state() == "enabled"
+    a.start_hold()  # the session is still usable
+    a.stop()
+
+
 def test_kinematics_rejects_a_chain_without_six_revolute_joints():
     with pytest.raises(ValueError, match="revolute"):
         m.Kinematics(mount_rpy=(0, 0, 0), links=[], lower=[0.0] * 6, upper=[1.0] * 6, tool_axis=(1, 0, 0), jaw_axis=(0, 1, 0))
+
+
+# --- Dynamics: RNEA, mass matrix, gravity and friction behind a thin surface ---------
+
+Z_AXIS = (0.0, 0.0, 1.0)
+CHAIN = [((0.1, 0.0, 0.0), (0.0, 0.0, 0.0), Z_AXIS)] * 6
+BODY = (0.5, (0.05, 0.0, 0.0), ((1e-3, 0.0, 0.0), (0.0, 2e-3, 0.0), (0.0, 0.0, 2e-3)))
+
+
+def _planar_dynamics(gravity=(0.0, -9.81, 0.0)):
+    return m.Dynamics((0.0, 0.0, 0.0), CHAIN, [BODY] * 6, gravity=gravity)
+
+
+def test_dynamics_gravity_of_a_planar_chain():
+    # Joint i sits at x = 0.1 (i + 1), body k's center at 0.1 (k + 1) + 0.05; at q = 0 the
+    # chain lies along +x, so G_i = m g sum_{k >= i} (0.1 (k - i) + 0.05).
+    d = _planar_dynamics()
+    g = d.gravity([0.0] * 6)
+    for i in range(6):
+        want = 0.5 * 9.81 * sum(0.1 * (k - i) + 0.05 for k in range(i, 6))
+        assert abs(g[i] - want) < 1e-9
+    assert all(abs(v) < 1e-12 for v in _planar_dynamics((0.0, 0.0, -9.81)).gravity([0.3] * 6))
+
+
+def test_dynamics_mass_matrix_and_inverse_agree():
+    d = _planar_dynamics()
+    q = [0.1, -0.4, 0.7, 0.2, -0.3, 0.5]
+    m_ = d.mass_matrix(q)
+    g = d.gravity(q)
+    for i in range(6):
+        e = [0.0] * 6
+        e[i] = 1.0
+        col = d.inverse(q, [0.0] * 6, e)
+        assert all(abs(col[k] - g[k] - m_[k][i]) < 1e-9 for k in range(6))
+    assert d.friction([1.0] * 6) == [0.0] * 6
+
+
+def test_dynamics_refuses_bad_models():
+    bad = (-1.0, BODY[1], BODY[2])
+    with pytest.raises(ValueError, match="mass"):
+        m.Dynamics((0.0, 0.0, 0.0), CHAIN, [BODY] * 5 + [bad])
+    with pytest.raises(ValueError, match="6 bodies"):
+        m.Dynamics((0.0, 0.0, 0.0), CHAIN, [BODY] * 5)
+    with pytest.raises(ValueError, match="friction"):
+        m.Dynamics((0.0, 0.0, 0.0), CHAIN, [BODY] * 6, friction=[(0.1, 0.0, 0.0)] * 6)
+
+
+# --- Tracking: the compliant tracking controller behind a thread-safe handle --------
+
+def test_tracking_holds_the_start_pose_with_gravity_feed_forward():
+    d = _planar_dynamics()
+    tr = m.Tracking(d, params={"contact": False})
+    q = [0.1, -0.2, 0.3, 0.0, 0.2, -0.1, -1.0]
+    out = tr.update(0.0, q, [0.0] * 7, [0.0] * 7)
+    assert len(out) == 7
+    g = d.gravity(q[:6])
+    for j in range(6):
+        pos, vel, kp, kd, tau = out[j]
+        assert pos == q[j] and vel == 0.0 and abs(tau - g[j]) < 1e-12
+    assert out[6][0] == -1.0 and out[6][4] == 0.0
+    tel = tr.telemetry()
+    assert set(tel) == {"r", "gate", "offset", "q_r", "tau_ff", "late_ticks", "gaps", "max_interval", "tick_t"}
+    assert tel["tick_t"] == 0.0
+
+
+def test_tracking_rejects_bad_input():
+    d = _planar_dynamics()
+    with pytest.raises(ValueError, match="unknown tracking parameter"):
+        m.Tracking(d, params={"f_R": 10.0})
+    with pytest.raises(ValueError, match="f_r"):
+        m.Tracking(d, params={"f_r": -1.0})
+    tr = m.Tracking(d)
+    with pytest.raises((ValueError, TypeError)):
+        tr.update(0.0, [0.0] * 6, [0.0] * 7, [0.0] * 7)
+    with pytest.raises(ValueError, match="push"):
+        tr.push(0.0, 0.0, [[0.0] * 7])
+    with pytest.raises(ValueError, match="push"):
+        tr.push(0.0, 0.01, [])
+    nan = float("nan")
+    for bad in ([0.0] * 6 + [nan], [nan] + [0.0] * 6):
+        with pytest.raises(ValueError, match="finite"):
+            tr.update(0.0, bad, [0.0] * 7, [0.0] * 7)
+        with pytest.raises(ValueError, match="finite"):
+            tr.update(0.0, [0.0] * 7, bad, [0.0] * 7)
+        with pytest.raises(ValueError, match="finite"):
+            tr.update(0.0, [0.0] * 7, [0.0] * 7, bad)
+    assert tr.telemetry() is None  # nothing reached the controller
+
+
+def test_tracking_runs_in_the_loop_and_other_threads_can_reach_it():
+    a = m.Arm.sim()
+    a.enable()
+    tr = m.Tracking(_planar_dynamics())
+    a.start_tracking(tr)
+    errors, clocks = [], []
+
+    def worker():
+        try:
+            for _ in range(40):
+                snap = a_positions[0]
+                now = tr.now()
+                if now is not None:
+                    clocks.append(now)
+                    tr.push(now + 0.02, 0.05, [snap, snap])
+                tr.telemetry()
+                time.sleep(0.005)
+        except Exception as exc:  # noqa: BLE001 -- the assertion below reports it
+            errors.append(exc)
+
+    deadline = time.time() + 2.0
+    while a.snapshot() is None and time.time() < deadline:
+        time.sleep(0.01)
+    a_positions = [list(a.snapshot()["positions"])]
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join()
+    assert errors == []
+    assert clocks and clocks == sorted(clocks)
+    assert tr.telemetry() is not None
+    assert a.state() == "enabled"
+    with pytest.raises(RuntimeError, match="loop"):
+        tr.update(0.0, [0.0] * 7, [0.0] * 7, [0.0] * 7)
+    b = m.Arm.sim()
+    b.enable()
+    with pytest.raises(RuntimeError, match="already runs"):
+        b.start_tracking(tr)
+    a.stop()
+    b.stop()
+
+
+def test_start_tracking_with_an_impossible_rt_keeps_the_tracking_usable():
+    a = m.Arm.sim()
+    a.enable()
+    tr = m.Tracking(_planar_dynamics())
+    with pytest.raises(RuntimeError, match="CPU 1000"):
+        a.start_tracking(tr, rt=(80, 1000))
+    assert a.state() == "enabled"
+    a.start_tracking(tr)
+    a.stop()
+
+
+def test_start_tracking_requires_an_enabled_session():
+    a = m.Arm.sim()
+    with pytest.raises(RuntimeError, match="start_tracking requires an enabled session"):
+        a.start_tracking(m.Tracking(_planar_dynamics()))
+
+
+def test_a_stopped_loop_reads_as_not_running():
+    # After stop() the loop no longer runs the controller: once the last tick is older than
+    # the motors' CAN_TIMEOUT (0.2 s), now() is None and push raises.
+    a = m.Arm.sim()
+    a.enable()
+    tr = m.Tracking(_planar_dynamics())
+    a.start_tracking(tr)
+    deadline = time.time() + 2.0
+    while a.snapshot() is None and time.time() < deadline:
+        time.sleep(0.01)
+    tr.push(tr.now(), 0.01, [a.snapshot()["positions"]])  # accepted while the loop runs
+    a.stop()
+    tick_t = tr.telemetry()["tick_t"]
+    time.sleep(0.3)
+    assert tr.telemetry()["tick_t"] == tick_t  # the last tick's stamp shows the stop
+    assert tr.now() is None
+    with pytest.raises(RuntimeError, match="not running"):
+        tr.push(0.0, 0.01, [[0.0] * 7])
+
+
+def test_start_tracking_refuses_a_push_made_before_it():
+    a = m.Arm.sim()
+    a.enable()
+    tr = m.Tracking(_planar_dynamics())
+    tr.push(0.0, 0.01, [[0.0] * 7])
+    with pytest.raises(RuntimeError, match="pending push"):
+        a.start_tracking(tr)
+    assert a.state() == "enabled" and a.snapshot() is None  # the arm stays idle
+    tr.update(0.0, [0.0] * 7, [0.0] * 7, [0.0] * 7)  # and tr is not marked as in a loop
+    a.stop()
+
+
+def test_start_tracking_refuses_a_bench_tracking_with_a_plan():
+    a = m.Arm.sim()
+    a.enable()
+    tr = m.Tracking(_planar_dynamics())
+    tr.push(0.0, 0.01, [[0.0] * 7])
+    tr.update(0.0, [0.0] * 7, [0.0] * 7, [0.0] * 7)
+    with pytest.raises(RuntimeError, match="plan"):
+        a.start_tracking(tr)
+    assert a.state() == "enabled" and a.snapshot() is None
+    a.stop()
+
+
+def test_start_tracking_refuses_rung_f():
+    a = m.Arm.sim()
+    a.enable()
+    tr = m.Tracking(_planar_dynamics(), params={"contact": False})
+    with pytest.raises(RuntimeError, match="contact=False"):
+        a.start_tracking(tr)
+    assert a.state() == "enabled" and a.snapshot() is None
+    assert len(tr.update(0.0, [0.0] * 7, [0.0] * 7, [0.0] * 7)) == 7  # still usable
+    a.stop()

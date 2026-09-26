@@ -10,13 +10,117 @@ use crate::health::FaultReason;
 use crate::session::{Session, SessionError, SessionState};
 use crate::state::ArmState;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 pub struct TickOutcome {
     pub fault: Option<FaultReason>,
     pub clamped: bool,
+}
+
+/// Real-time scheduling for the loop thread (tracking design section 10): SCHED_FIFO at
+/// `priority`, pinned to `cpu`. Off unless the caller passes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoopRt {
+    pub priority: i32,
+    pub cpu: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RtError {
+    /// Not Linux: there is no SCHED_FIFO or affinity call to make.
+    Unsupported,
+    /// `sched_setaffinity` refused the CPU.
+    Cpu { cpu: usize, errno: i32 },
+    /// The priority is outside SCHED_FIFO's range on Linux, 1..=99.
+    PriorityRange { priority: i32 },
+    /// `pthread_setschedparam` refused SCHED_FIFO at this priority, usually because the user
+    /// has no rtprio limit that high.
+    Priority { priority: i32, errno: i32 },
+}
+
+impl std::fmt::Display for RtError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RtError::Unsupported => write!(f, "real-time scheduling is only available on Linux"),
+            RtError::Cpu { cpu, errno } => {
+                write!(f, "cannot pin the loop thread to CPU {cpu} (errno {errno})")
+            }
+            RtError::PriorityRange { priority } => write!(
+                f,
+                "SCHED_FIFO priority {priority} is outside the range 1..=99"
+            ),
+            RtError::Priority { priority, errno } => write!(
+                f,
+                "cannot run the loop thread at SCHED_FIFO priority {priority} (errno {errno}); \
+                 the user needs an rtprio limit of at least {priority}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RtError {}
+
+/// `Session::start` failed before the first tick. The loop thread has exited and the session
+/// comes back unchanged, so the caller still owns it.
+#[derive(Debug)]
+pub struct StartError {
+    pub session: Session,
+    pub error: RtError,
+}
+
+impl std::fmt::Display for StartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for StartError {}
+
+/// Pins the calling thread to `rt.cpu`, then switches it to SCHED_FIFO at `rt.priority`.
+/// The caller errors come first, before any syscall: a CPU past the set size and a priority
+/// outside 1..=99 are wrong whatever the privileges are. Then the pin, then the priority.
+#[cfg(target_os = "linux")]
+fn apply_rt(rt: LoopRt) -> Result<(), RtError> {
+    if rt.cpu >= libc::CPU_SETSIZE as usize {
+        return Err(RtError::Cpu {
+            cpu: rt.cpu,
+            errno: libc::EINVAL,
+        });
+    }
+    if !(1..=99).contains(&rt.priority) {
+        return Err(RtError::PriorityRange {
+            priority: rt.priority,
+        });
+    }
+    // SAFETY: `set` and `param` are plain C structs, zeroed before use, and both calls act on
+    // the calling thread only (pid 0 and `pthread_self`).
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_SET(rt.cpu, &mut set);
+        if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) != 0 {
+            return Err(RtError::Cpu {
+                cpu: rt.cpu,
+                errno: std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+            });
+        }
+        let mut param: libc::sched_param = std::mem::zeroed();
+        param.sched_priority = rt.priority;
+        let rc = libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &param);
+        if rc != 0 {
+            return Err(RtError::Priority {
+                priority: rt.priority,
+                errno: rc,
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn apply_rt(_rt: LoopRt) -> Result<(), RtError> {
+    Err(RtError::Unsupported)
 }
 
 impl Session {
@@ -283,17 +387,37 @@ impl Session {
     }
 
     /// Moves the session into a background control thread.
-    pub fn start(mut self, mut controller: Box<dyn Controller>) -> RunningArm {
+    ///
+    /// With `rt`, the thread first pins itself and switches to SCHED_FIFO (tracking design
+    /// section 10). If either call fails, the thread exits before its first tick, and the
+    /// session comes back inside the error. There is no fallback to normal scheduling: a
+    /// silent fallback would hide exactly the risk the option exists to remove.
+    pub fn start(
+        mut self,
+        mut controller: Box<dyn Controller>,
+        rt: Option<LoopRt>,
+    ) -> Result<RunningArm, Box<StartError>> {
         let shared = Arc::new(LoopShared {
             stop: AtomicBool::new(false),
             hold_now: AtomicBool::new(false),
             snapshot: Mutex::new(None),
         });
         let sh = Arc::clone(&shared);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let handle = std::thread::spawn(move || {
+            if let Some(rt) = rt {
+                if let Err(e) = apply_rt(rt) {
+                    let _ = ready_tx.send(Err(e));
+                    return (self, Ok(()));
+                }
+            }
+            let _ = ready_tx.send(Ok(()));
             let period = Duration::from_secs_f64(1.0 / self.config().control_rate_hz);
             let mut next = Instant::now() + period;
             let mut result = Ok(());
+            // A tick's snapshot that `try_lock` could not publish; the next tick replaces it,
+            // and the blocking publish after the loop sends the last one.
+            let mut unpublished = None;
             while !sh.stop.load(Ordering::Relaxed) {
                 if sh.hold_now.swap(false, Ordering::Relaxed) {
                     let mut hold = HoldController::from_config(self.config());
@@ -307,14 +431,27 @@ impl Session {
                         break;
                     }
                 }
-                // Poison-tolerant like `RunningArm::snapshot`: a panicking
-                // reader must not turn every later publish into a second
-                // panic that kills the control thread outright.
-                *sh.snapshot.lock().unwrap_or_else(|e| e.into_inner()) = Some(Snapshot {
+                // `try_lock`, never `lock`: std mutexes have no priority inheritance, so
+                // with `rt` the loop would wait behind a normal-priority reader cloning the
+                // snapshot. Poison-tolerant like `RunningArm::snapshot`: a panicking
+                // reader must not turn every later publish into a second panic that
+                // kills the control thread outright.
+                let snap = Snapshot {
                     state: self.state(),
                     fault: self.fault.clone(),
                     arm: self.arm_state(),
-                });
+                };
+                unpublished = match sh.snapshot.try_lock() {
+                    Ok(mut out) => {
+                        *out = Some(snap);
+                        None
+                    }
+                    Err(TryLockError::Poisoned(e)) => {
+                        *e.into_inner() = Some(snap);
+                        None
+                    }
+                    Err(TryLockError::WouldBlock) => Some(snap),
+                };
                 if self.state() == SessionState::Connected {
                     break; // disabled by hold_on_fault=false
                 }
@@ -327,14 +464,28 @@ impl Session {
                 // rather than repaying them as a burst of MIT frames.
                 next = next.max(Instant::now());
             }
+            if let Some(snap) = unpublished {
+                *sh.snapshot.lock().unwrap_or_else(|e| e.into_inner()) = Some(snap);
+            }
             if result.is_ok() && self.state() != SessionState::Connected {
                 result = self.disable().and(result);
             }
             (self, result)
         });
-        RunningArm {
-            shared,
-            handle: Some(handle),
+        match ready_rx
+            .recv()
+            .expect("the loop thread reports before its first tick")
+        {
+            Ok(()) => Ok(RunningArm {
+                shared,
+                handle: Some(handle),
+            }),
+            Err(error) => {
+                let (session, _) = handle
+                    .join()
+                    .expect("the loop thread returns the session after an rt failure");
+                Err(Box::new(StartError { session, error }))
+            }
         }
     }
 }
@@ -443,5 +594,34 @@ impl Drop for RunningArm {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ArmConfig, SimArm};
+
+    #[test]
+    fn a_reader_holding_the_snapshot_lock_does_not_stall_the_loop() {
+        let mut c = ArmConfig::maker_arm_v1();
+        c.inter_frame_us = 0;
+        let mut s = Session::connect(Box::new(SimArm::new(&c)), c.clone()).expect("connect");
+        s.enable().expect("enable");
+        let running = s
+            .start(Box::new(HoldController::from_config(&c)), None)
+            .expect("start");
+        std::thread::sleep(Duration::from_millis(50));
+        let before = running.snapshot().expect("ticked").arm.tick;
+        {
+            let _reader = running.shared.snapshot.lock().unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        // About 44 ticks at 200 Hz; a loop blocked on the lock gets about 5.
+        let ticks = running.snapshot().unwrap().arm.tick - before;
+        assert!(ticks >= 20, "{ticks} ticks while a reader held the lock");
+        let (_, res) = running.stop_and_disable();
+        res.expect("clean stop");
     }
 }
