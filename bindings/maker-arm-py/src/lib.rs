@@ -10,6 +10,7 @@ mod kinematics;
 
 use maker_arm::state::JointCommand;
 use maker_arm::{ArmConfig, HoldController, RunningArm, Session, SessionState, SimArm};
+use maker_arm::{Controller, LoopRt};
 use maker_arm_protocol as p;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -246,6 +247,51 @@ const STARTING: &str = "starting";
 /// and surfaces the error.
 const LOOP_STOPPED: &str = "loop_stopped";
 
+impl Arm {
+    /// Raises unless the session is idle and enabled. Without this gate the loop thread died
+    /// on its first tick with a wrong-state error, `snapshot()` returned None forever, and
+    /// `state()` reported "enabled" for an arm with no torque at all.
+    fn require_enabled(&self, what: &str) -> PyResult<()> {
+        if let ArmHandle::Idle(s) = &self.handle {
+            if s.state() != SessionState::Enabled {
+                return Err(PyRuntimeError::new_err(format!(
+                    "{what} requires an enabled session, but this one is {}; \
+                     call enable() first",
+                    state_str(s.state())
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Moves the idle session into the loop with `controller`. On an `rt` failure the session
+    /// comes back and the handle stays idle.
+    fn start_loop(
+        &mut self,
+        controller: Box<dyn Controller>,
+        rt: Option<(i32, usize)>,
+    ) -> PyResult<()> {
+        let rt = rt.map(|(priority, cpu)| LoopRt { priority, cpu });
+        match std::mem::replace(&mut self.handle, ArmHandle::Empty) {
+            ArmHandle::Idle(s) => match s.start(controller, rt) {
+                Ok(running) => {
+                    self.handle = ArmHandle::Running(running);
+                    Ok(())
+                }
+                Err(e) => {
+                    let e = *e;
+                    self.handle = ArmHandle::Idle(e.session);
+                    Err(PyRuntimeError::new_err(e.error.to_string()))
+                }
+            },
+            other => {
+                self.handle = other;
+                Err(PyRuntimeError::new_err("loop already running"))
+            }
+        }
+    }
+}
+
 #[pymethods]
 impl Arm {
     /// Connect to the built-in 7-motor simulator.
@@ -281,32 +327,14 @@ impl Arm {
 
     /// Spawn the 200 Hz control loop holding the current pose.
     ///
-    /// Requires an enabled session: raises RuntimeError otherwise. Without
-    /// this gate the loop thread died on its first tick with a wrong-state
-    /// error, `snapshot()` returned None forever, and `state()` reported
-    /// "enabled" for an arm with no torque at all -- an operator told the
-    /// arm is holding might stop supporting it.
-    fn start_hold(&mut self) -> PyResult<()> {
-        if let ArmHandle::Idle(s) = &self.handle {
-            if s.state() != SessionState::Enabled {
-                return Err(PyRuntimeError::new_err(format!(
-                    "start_hold requires an enabled session, but this one is {}; \
-                     call enable() first",
-                    state_str(s.state())
-                )));
-            }
-        }
-        match std::mem::replace(&mut self.handle, ArmHandle::Empty) {
-            ArmHandle::Idle(s) => {
-                let hold = HoldController::from_config(&self.config);
-                self.handle = ArmHandle::Running(s.start(Box::new(hold)));
-                Ok(())
-            }
-            other => {
-                self.handle = other;
-                Err(PyRuntimeError::new_err("loop already running"))
-            }
-        }
+    /// Requires an enabled session: raises RuntimeError otherwise. `rt` is an optional
+    /// `(priority, cpu)` pair: the loop thread runs at SCHED_FIFO `priority`, pinned to `cpu`,
+    /// or the call raises and the session stays idle.
+    #[pyo3(signature = (rt = None))]
+    fn start_hold(&mut self, rt: Option<(i32, usize)>) -> PyResult<()> {
+        self.require_enabled("start_hold")?;
+        let hold = HoldController::from_config(&self.config);
+        self.start_loop(Box::new(hold), rt)
     }
 
     /// Retarget the running loop to hold the pose it is at right now.

@@ -148,7 +148,9 @@ fn main() -> Result<(), String> {
             let mut session =
                 Session::connect(backend, config.clone()).map_err(|e| e.to_string())?;
             session.enable().map_err(|e| e.to_string())?;
-            let running = session.start(Box::new(HoldController::from_config(&config)));
+            let running = session
+                .start(Box::new(HoldController::from_config(&config)), None)
+                .expect("a start without rt cannot fail");
             // EVERYTHING from here to `confirm_release` runs with a live,
             // torque-on `RunningArm` on the stack, and `RunningArm`'s
             // `Drop` disables the motors. So any panic or `?` in this span

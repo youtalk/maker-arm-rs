@@ -14,3 +14,6 @@ socketcan = ["maker-arm-transport/socketcan"]
 [dependencies]
 maker-arm-protocol = { path = "../maker-arm-protocol" }
 maker-arm-transport = { path = "../maker-arm-transport" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

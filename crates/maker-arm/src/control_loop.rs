@@ -19,6 +19,98 @@ pub struct TickOutcome {
     pub clamped: bool,
 }
 
+/// Real-time scheduling for the loop thread (tracking design section 10): SCHED_FIFO at
+/// `priority`, pinned to `cpu`. Off unless the caller passes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoopRt {
+    pub priority: i32,
+    pub cpu: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RtError {
+    /// Not Linux: there is no SCHED_FIFO or affinity call to make.
+    Unsupported,
+    /// `sched_setaffinity` refused the CPU.
+    Cpu { cpu: usize, errno: i32 },
+    /// `pthread_setschedparam` refused SCHED_FIFO at this priority, usually because the user
+    /// has no rtprio limit that high.
+    Priority { priority: i32, errno: i32 },
+}
+
+impl std::fmt::Display for RtError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RtError::Unsupported => write!(f, "real-time scheduling is only available on Linux"),
+            RtError::Cpu { cpu, errno } => {
+                write!(f, "cannot pin the loop thread to CPU {cpu} (errno {errno})")
+            }
+            RtError::Priority { priority, errno } => write!(
+                f,
+                "cannot run the loop thread at SCHED_FIFO priority {priority} (errno {errno}); \
+                 the user needs an rtprio limit of at least {priority}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RtError {}
+
+/// `Session::start` failed before the first tick. The loop thread has exited and the session
+/// comes back unchanged, so the caller still owns it.
+#[derive(Debug)]
+pub struct StartError {
+    pub session: Session,
+    pub error: RtError,
+}
+
+impl std::fmt::Display for StartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for StartError {}
+
+/// Pins the calling thread to `rt.cpu`, then switches it to SCHED_FIFO at `rt.priority`.
+/// The pin goes first: an invalid CPU is a caller error whatever the privileges are.
+#[cfg(target_os = "linux")]
+fn apply_rt(rt: LoopRt) -> Result<(), RtError> {
+    if rt.cpu >= libc::CPU_SETSIZE as usize {
+        return Err(RtError::Cpu {
+            cpu: rt.cpu,
+            errno: libc::EINVAL,
+        });
+    }
+    // SAFETY: `set` and `param` are plain C structs, zeroed before use, and both calls act on
+    // the calling thread only (pid 0 and `pthread_self`).
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_SET(rt.cpu, &mut set);
+        if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) != 0 {
+            return Err(RtError::Cpu {
+                cpu: rt.cpu,
+                errno: std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+            });
+        }
+        let mut param: libc::sched_param = std::mem::zeroed();
+        param.sched_priority = rt.priority;
+        let rc = libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &param);
+        if rc != 0 {
+            return Err(RtError::Priority {
+                priority: rt.priority,
+                errno: rc,
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn apply_rt(_rt: LoopRt) -> Result<(), RtError> {
+    Err(RtError::Unsupported)
+}
+
 impl Session {
     pub fn fault(&self) -> Option<&FaultReason> {
         self.fault.as_ref()
@@ -283,14 +375,31 @@ impl Session {
     }
 
     /// Moves the session into a background control thread.
-    pub fn start(mut self, mut controller: Box<dyn Controller>) -> RunningArm {
+    ///
+    /// With `rt`, the thread first pins itself and switches to SCHED_FIFO (tracking design
+    /// section 10). If either call fails, the thread exits before its first tick, and the
+    /// session comes back inside the error. There is no fallback to normal scheduling: a
+    /// silent fallback would hide exactly the risk the option exists to remove.
+    pub fn start(
+        mut self,
+        mut controller: Box<dyn Controller>,
+        rt: Option<LoopRt>,
+    ) -> Result<RunningArm, Box<StartError>> {
         let shared = Arc::new(LoopShared {
             stop: AtomicBool::new(false),
             hold_now: AtomicBool::new(false),
             snapshot: Mutex::new(None),
         });
         let sh = Arc::clone(&shared);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let handle = std::thread::spawn(move || {
+            if let Some(rt) = rt {
+                if let Err(e) = apply_rt(rt) {
+                    let _ = ready_tx.send(Err(e));
+                    return (self, Ok(()));
+                }
+            }
+            let _ = ready_tx.send(Ok(()));
             let period = Duration::from_secs_f64(1.0 / self.config().control_rate_hz);
             let mut next = Instant::now() + period;
             let mut result = Ok(());
@@ -332,9 +441,20 @@ impl Session {
             }
             (self, result)
         });
-        RunningArm {
-            shared,
-            handle: Some(handle),
+        match ready_rx
+            .recv()
+            .expect("the loop thread reports before its first tick")
+        {
+            Ok(()) => Ok(RunningArm {
+                shared,
+                handle: Some(handle),
+            }),
+            Err(error) => {
+                let (session, _) = handle
+                    .join()
+                    .expect("the loop thread returns the session after an rt failure");
+                Err(Box::new(StartError { session, error }))
+            }
         }
     }
 }

@@ -342,6 +342,16 @@ def test_kinematics_solve_recovers_a_pose_and_solve_path_walks():
     assert k.solve_path([targets[0], far], q_true, [], 0.2) is None
 
 
+def test_start_hold_with_an_impossible_rt_fails_and_keeps_the_session():
+    a = m.Arm.sim()
+    a.enable()
+    with pytest.raises(RuntimeError, match="CPU 1000"):
+        a.start_hold(rt=(80, 1000))
+    assert a.state() == "enabled"
+    a.start_hold()  # the session is still usable
+    a.stop()
+
+
 def test_kinematics_rejects_a_chain_without_six_revolute_joints():
     with pytest.raises(ValueError, match="revolute"):
         m.Kinematics(mount_rpy=(0, 0, 0), links=[], lower=[0.0] * 6, upper=[1.0] * 6, tool_axis=(1, 0, 0), jaw_axis=(0, 1, 0))
