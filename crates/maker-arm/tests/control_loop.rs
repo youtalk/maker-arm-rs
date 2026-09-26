@@ -645,6 +645,24 @@ fn start_with_an_invalid_cpu_fails_and_returns_the_session() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn start_with_an_out_of_range_priority_fails_and_returns_the_session() {
+    let c = fast(ArmConfig::maker_arm_v1());
+    let mut s = enabled_session(&c);
+    for priority in [0, 100] {
+        let rt = Some(LoopRt { priority, cpu: 0 });
+        let err = s
+            .start(Box::new(HoldController::from_config(&c)), rt)
+            .err()
+            .expect("SCHED_FIFO has no such priority");
+        assert_eq!(err.error, RtError::PriorityRange { priority });
+        assert!(err.error.to_string().contains("1..=99"), "{}", err.error);
+        s = err.session;
+    }
+    assert_eq!(s.state(), SessionState::Enabled);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn start_without_the_rtprio_right_fails_and_returns_the_session() {
     let mut lim = libc::rlimit {
         rlim_cur: 0,

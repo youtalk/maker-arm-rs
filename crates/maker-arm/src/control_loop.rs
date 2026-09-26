@@ -10,7 +10,7 @@ use crate::health::FaultReason;
 use crate::session::{Session, SessionError, SessionState};
 use crate::state::ArmState;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
@@ -33,6 +33,8 @@ pub enum RtError {
     Unsupported,
     /// `sched_setaffinity` refused the CPU.
     Cpu { cpu: usize, errno: i32 },
+    /// The priority is outside SCHED_FIFO's range on Linux, 1..=99.
+    PriorityRange { priority: i32 },
     /// `pthread_setschedparam` refused SCHED_FIFO at this priority, usually because the user
     /// has no rtprio limit that high.
     Priority { priority: i32, errno: i32 },
@@ -45,6 +47,10 @@ impl std::fmt::Display for RtError {
             RtError::Cpu { cpu, errno } => {
                 write!(f, "cannot pin the loop thread to CPU {cpu} (errno {errno})")
             }
+            RtError::PriorityRange { priority } => write!(
+                f,
+                "SCHED_FIFO priority {priority} is outside the range 1..=99"
+            ),
             RtError::Priority { priority, errno } => write!(
                 f,
                 "cannot run the loop thread at SCHED_FIFO priority {priority} (errno {errno}); \
@@ -73,13 +79,19 @@ impl std::fmt::Display for StartError {
 impl std::error::Error for StartError {}
 
 /// Pins the calling thread to `rt.cpu`, then switches it to SCHED_FIFO at `rt.priority`.
-/// The pin goes first: an invalid CPU is a caller error whatever the privileges are.
+/// The caller errors come first, before any syscall: a CPU past the set size and a priority
+/// outside 1..=99 are wrong whatever the privileges are. Then the pin, then the priority.
 #[cfg(target_os = "linux")]
 fn apply_rt(rt: LoopRt) -> Result<(), RtError> {
     if rt.cpu >= libc::CPU_SETSIZE as usize {
         return Err(RtError::Cpu {
             cpu: rt.cpu,
             errno: libc::EINVAL,
+        });
+    }
+    if !(1..=99).contains(&rt.priority) {
+        return Err(RtError::PriorityRange {
+            priority: rt.priority,
         });
     }
     // SAFETY: `set` and `param` are plain C structs, zeroed before use, and both calls act on
@@ -403,6 +415,9 @@ impl Session {
             let period = Duration::from_secs_f64(1.0 / self.config().control_rate_hz);
             let mut next = Instant::now() + period;
             let mut result = Ok(());
+            // A tick's snapshot that `try_lock` could not publish; the next tick replaces it,
+            // and the blocking publish after the loop sends the last one.
+            let mut unpublished = None;
             while !sh.stop.load(Ordering::Relaxed) {
                 if sh.hold_now.swap(false, Ordering::Relaxed) {
                     let mut hold = HoldController::from_config(self.config());
@@ -416,14 +431,27 @@ impl Session {
                         break;
                     }
                 }
-                // Poison-tolerant like `RunningArm::snapshot`: a panicking
-                // reader must not turn every later publish into a second
-                // panic that kills the control thread outright.
-                *sh.snapshot.lock().unwrap_or_else(|e| e.into_inner()) = Some(Snapshot {
+                // `try_lock`, never `lock`: std mutexes have no priority inheritance, so
+                // with `rt` the loop would wait behind a normal-priority reader cloning the
+                // snapshot. Poison-tolerant like `RunningArm::snapshot`: a panicking
+                // reader must not turn every later publish into a second panic that
+                // kills the control thread outright.
+                let snap = Snapshot {
                     state: self.state(),
                     fault: self.fault.clone(),
                     arm: self.arm_state(),
-                });
+                };
+                unpublished = match sh.snapshot.try_lock() {
+                    Ok(mut out) => {
+                        *out = Some(snap);
+                        None
+                    }
+                    Err(TryLockError::Poisoned(e)) => {
+                        *e.into_inner() = Some(snap);
+                        None
+                    }
+                    Err(TryLockError::WouldBlock) => Some(snap),
+                };
                 if self.state() == SessionState::Connected {
                     break; // disabled by hold_on_fault=false
                 }
@@ -435,6 +463,9 @@ impl Session {
                 // Same catch-up clamp as `run()`: drop missed deadlines
                 // rather than repaying them as a burst of MIT frames.
                 next = next.max(Instant::now());
+            }
+            if let Some(snap) = unpublished {
+                *sh.snapshot.lock().unwrap_or_else(|e| e.into_inner()) = Some(snap);
             }
             if result.is_ok() && self.state() != SessionState::Connected {
                 result = self.disable().and(result);
@@ -563,5 +594,34 @@ impl Drop for RunningArm {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ArmConfig, SimArm};
+
+    #[test]
+    fn a_reader_holding_the_snapshot_lock_does_not_stall_the_loop() {
+        let mut c = ArmConfig::maker_arm_v1();
+        c.inter_frame_us = 0;
+        let mut s = Session::connect(Box::new(SimArm::new(&c)), c.clone()).expect("connect");
+        s.enable().expect("enable");
+        let running = s
+            .start(Box::new(HoldController::from_config(&c)), None)
+            .expect("start");
+        std::thread::sleep(Duration::from_millis(50));
+        let before = running.snapshot().expect("ticked").arm.tick;
+        {
+            let _reader = running.shared.snapshot.lock().unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        // About 44 ticks at 200 Hz; a loop blocked on the lock gets about 5.
+        let ticks = running.snapshot().unwrap().arm.tick - before;
+        assert!(ticks >= 20, "{ticks} ticks while a reader held the lock");
+        let (_, res) = running.stop_and_disable();
+        res.expect("clean stop");
     }
 }
