@@ -55,27 +55,56 @@ impl Controller for LoopTracking {
     }
 }
 
+/// The compliant tracking controller (tracking design sections 6, 7, 9 and 10).
+///
+/// The default `tau_th` is infinite, which means no yield: until a calibrated deadband is
+/// passed, only the error clamp `e_max` acts on the contact side.
 #[pyclass(frozen)]
 pub struct Tracking {
     pub(crate) ctrl: Arc<Mutex<TrackingController>>,
     shared: Arc<maker_arm::tracking::TrackingShared>,
     pub(crate) in_loop: AtomicBool,
+    /// The motors' CAN_TIMEOUT (s): in a loop, a last tick older than this means the loop no
+    /// longer runs this controller (stopped, fault hold or `hold_now`).
+    stale_s: f64,
 }
 
 impl Tracking {
     /// The controller for `Arm.start_tracking`, restarted so its first loop tick begins from
-    /// the measured pose. Marks the handle as running in a loop.
+    /// the measured pose, with no clock and fresh telemetry. Marks the handle as running in a
+    /// loop. Refuses rung F and a handle with a plan or a pending push, and a refusal leaves
+    /// the handle as it was.
     pub(crate) fn enter_loop(&self) -> PyResult<LoopTracking> {
+        // The flag first: a handle already in a loop is refused without taking the lock its
+        // loop thread ticks under.
         if self.in_loop.swap(true, Ordering::SeqCst) {
             return Err(PyRuntimeError::new_err(
                 "this Tracking already runs in a loop",
             ));
         }
-        self.ctrl
+        let ready = self
+            .ctrl
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .restart();
+            .restart_for_loop();
+        if let Err(e) = ready {
+            self.leave_loop();
+            return Err(PyRuntimeError::new_err(e.to_string()));
+        }
         Ok(LoopTracking(Arc::clone(&self.ctrl)))
+    }
+
+    /// The loop clock now, None before the first tick. In a loop whose last tick is older
+    /// than `stale_s`, an error: the loop no longer runs this controller.
+    fn live_now(&self) -> PyResult<Option<f64>> {
+        match self.shared.clock() {
+            Some((_, age)) if age > self.stale_s && self.in_loop.load(Ordering::SeqCst) => {
+                Err(PyRuntimeError::new_err(format!(
+                    "the loop is not running this Tracking: its last tick was {age:.3} s ago"
+                )))
+            }
+            clock => Ok(clock.map(|(now, _)| now)),
+        }
     }
 
     /// Undo `enter_loop` after a failed start.
@@ -108,14 +137,17 @@ impl Tracking {
             ctrl: Arc::new(Mutex::new(ctrl)),
             shared,
             in_loop: AtomicBool::new(false),
+            stale_s: f64::from(config.motor_can_timeout_ms) / 1000.0,
         })
     }
 
     /// Row k of `targets` (six joints and the gripper) is due at `t0 + k dt` on the loop
-    /// clock. Replaces the plan from `t0` on.
+    /// clock. Replaces the plan from `t0` on. In a loop, raises RuntimeError once the loop no
+    /// longer runs this controller (see `now`).
     fn push(&self, t0: f64, dt: f64, targets: Vec<Row>) -> PyResult<()> {
-        self.shared
-            .push(Push::new(t0, dt, targets).map_err(value_err)?);
+        let p = Push::new(t0, dt, targets).map_err(value_err)?;
+        self.live_now()?;
+        self.shared.push(p);
         Ok(())
     }
 
@@ -136,6 +168,9 @@ impl Tracking {
         }
         if !t.is_finite() {
             return Err(PyValueError::new_err("t must be finite"));
+        }
+        if q.iter().chain(&dq).chain(&tau).any(|v| !v.is_finite()) {
+            return Err(PyValueError::new_err("q, dq and tau must be finite"));
         }
         let state = ArmState {
             motors: (0..ROW)
@@ -161,9 +196,15 @@ impl Tracking {
             .collect())
     }
 
-    /// The loop clock (seconds since connect) now, or None before the first tick.
+    /// The loop clock now: the last tick's `t` plus the wall time since that tick. In a loop
+    /// that is seconds since connect. On the bench (`update` from Python) it is the caller's
+    /// last `t` plus wall time, so it mixes the caller's sim time with wall time.
+    ///
+    /// None before the first tick, and None in a loop whose last tick is older than the
+    /// motors' CAN_TIMEOUT (0.2 s): the loop is stopped, fault-holding or in `hold_now`, and
+    /// no longer runs this controller.
     fn now(&self) -> Option<f64> {
-        self.shared.now()
+        self.live_now().ok().flatten()
     }
 
     fn telemetry(&self, py: Python<'_>) -> PyResult<Option<Py<PyDict>>> {
@@ -179,6 +220,7 @@ impl Tracking {
         d.set_item("late_ticks", t.late_ticks)?;
         d.set_item("gaps", t.gaps)?;
         d.set_item("max_interval", t.max_interval)?;
+        d.set_item("tick_t", t.tick_t)?;
         Ok(Some(d.into()))
     }
 }

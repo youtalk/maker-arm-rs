@@ -73,6 +73,7 @@ pub enum TrackingError {
     Param { name: &'static str, detail: String },
     Profile { joints: usize },
     Push { detail: &'static str },
+    Loop { detail: &'static str },
 }
 
 impl fmt::Display for TrackingError {
@@ -85,6 +86,7 @@ impl fmt::Display for TrackingError {
                 write!(f, "the profile has {joints} joints, tracking needs {ROW}")
             }
             TrackingError::Push { detail } => write!(f, "bad push: {detail}"),
+            TrackingError::Loop { detail } => write!(f, "cannot run in a loop: {detail}"),
         }
     }
 }
@@ -236,6 +238,8 @@ pub struct Telemetry {
     pub late_ticks: u64,
     pub gaps: u64,
     pub max_interval: f64,
+    /// The tick clock of the last tick (s, `ArmState::t`).
+    pub tick_t: f64,
 }
 
 /// The half of the controller other threads reach: pushes in, telemetry and the clock out.
@@ -261,13 +265,17 @@ impl TrackingShared {
         *self.telemetry.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The loop clock now: the tick clock (the latest good `ArmState::t`, seconds since
-    /// connect) plus the wall time since that tick. None before the first tick.
-    pub fn now(&self) -> Option<f64> {
+    /// `(now, age)`: the loop clock now, which is the tick clock (the latest good
+    /// `ArmState::t`, seconds since connect) plus the wall time since that tick, and that
+    /// wall time (s). None before the first tick.
+    pub fn clock(&self) -> Option<(f64, f64)> {
         self.clock
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .map(|(t, at)| t + at.elapsed().as_secs_f64())
+            .map(|(t, at)| {
+                let age = at.elapsed().as_secs_f64();
+                (t + age, age)
+            })
     }
 }
 
@@ -360,10 +368,36 @@ impl TrackingController {
         Arc::clone(&self.shared)
     }
 
-    /// Forget the filter and contact state; the next update starts again from the measured
-    /// pose at rest. The plan and the telemetry counters stay.
-    pub fn restart(&mut self) {
+    /// Readies the controller for a loop: the next update starts again from the measured pose
+    /// at rest, with no tick clock and fresh telemetry. Refuses rung F, which has no error
+    /// clamp, and a controller with a plan or a pending push: their stamps belong to another
+    /// clock (the bench's, or a guess before the first tick), and dropping them silently
+    /// would be worse.
+    pub fn restart_for_loop(&mut self) -> Result<(), TrackingError> {
+        let fail = |detail| Err(TrackingError::Loop { detail });
+        if !self.params.contact {
+            return fail("contact=False (rung F) has no error clamp and is for the bench only");
+        }
+        let pending = self
+            .shared
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !self.plan.samples.is_empty() || !pending.is_empty() {
+            return fail(
+                "it already has a plan or a pending push, stamped on another clock; \
+                 build a fresh Tracking and push after start_tracking",
+            );
+        }
         self.started = false;
+        self.telemetry = Telemetry::default();
+        *self
+            .shared
+            .telemetry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        *self.shared.clock.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        Ok(())
     }
 
     fn begin(&mut self, t: f64, q: &Joints, dq: &Joints, gripper: f64) {
@@ -589,6 +623,7 @@ impl Controller for TrackingController {
         self.telemetry.offset = self.offset;
         self.telemetry.q_r = q_r;
         self.telemetry.tau_ff = tau_ff;
+        self.telemetry.tick_t = t;
         if let Ok(mut out) = self.shared.telemetry.try_lock() {
             *out = Some(self.telemetry);
         }
@@ -953,6 +988,26 @@ mod tests {
             c.update(&st(t, [0.0; 6], [0.0; 6], tau), H);
         }
         assert!((c.r[0] - 2.0).abs() < 0.01 * 2.0, "r {}", c.r[0]);
+    }
+
+    #[test]
+    fn restart_for_loop_refuses_rung_f_and_an_old_plan_and_resets_the_clock() {
+        assert!(ctrl(free()).restart_for_loop().is_err(), "rung F");
+        let mut c = ctrl(contact(f64::INFINITY));
+        c.update(&at_rest(0.0), H);
+        c.update(&at_rest(0.05), H); // a late tick and a gap on the bench clock
+        c.restart_for_loop().unwrap();
+        assert_eq!(c.shared().clock(), None);
+        assert_eq!(c.shared().telemetry(), None);
+        c.update(&at_rest(7.0), H);
+        let tel = c.shared().telemetry().unwrap();
+        assert_eq!((tel.late_ticks, tel.gaps, tel.tick_t), (0, 0, 7.0));
+        assert_eq!(tel.max_interval, 0.0);
+        c.shared()
+            .push(Push::new(7.0, 0.01, vec![row(0.1)]).unwrap());
+        assert!(c.restart_for_loop().is_err(), "a pending push");
+        c.update(&at_rest(7.005), H);
+        assert!(c.restart_for_loop().is_err(), "a plan");
     }
 
     #[test]

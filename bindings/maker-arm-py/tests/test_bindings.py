@@ -419,7 +419,8 @@ def test_tracking_holds_the_start_pose_with_gravity_feed_forward():
         assert pos == q[j] and vel == 0.0 and abs(tau - g[j]) < 1e-12
     assert out[6][0] == -1.0 and out[6][4] == 0.0
     tel = tr.telemetry()
-    assert set(tel) == {"r", "gate", "offset", "q_r", "tau_ff", "late_ticks", "gaps", "max_interval"}
+    assert set(tel) == {"r", "gate", "offset", "q_r", "tau_ff", "late_ticks", "gaps", "max_interval", "tick_t"}
+    assert tel["tick_t"] == 0.0
 
 
 def test_tracking_rejects_bad_input():
@@ -435,6 +436,15 @@ def test_tracking_rejects_bad_input():
         tr.push(0.0, 0.0, [[0.0] * 7])
     with pytest.raises(ValueError, match="push"):
         tr.push(0.0, 0.01, [])
+    nan = float("nan")
+    for bad in ([0.0] * 6 + [nan], [nan] + [0.0] * 6):
+        with pytest.raises(ValueError, match="finite"):
+            tr.update(0.0, bad, [0.0] * 7, [0.0] * 7)
+        with pytest.raises(ValueError, match="finite"):
+            tr.update(0.0, [0.0] * 7, bad, [0.0] * 7)
+        with pytest.raises(ValueError, match="finite"):
+            tr.update(0.0, [0.0] * 7, [0.0] * 7, bad)
+    assert tr.telemetry() is None  # nothing reached the controller
 
 
 def test_tracking_runs_in_the_loop_and_other_threads_can_reach_it():
@@ -493,3 +503,58 @@ def test_start_tracking_requires_an_enabled_session():
     a = m.Arm.sim()
     with pytest.raises(RuntimeError, match="start_tracking requires an enabled session"):
         a.start_tracking(m.Tracking(_planar_dynamics()))
+
+
+def test_a_stopped_loop_reads_as_not_running():
+    # After stop() the loop no longer runs the controller: once the last tick is older than
+    # the motors' CAN_TIMEOUT (0.2 s), now() is None and push raises.
+    a = m.Arm.sim()
+    a.enable()
+    tr = m.Tracking(_planar_dynamics())
+    a.start_tracking(tr)
+    deadline = time.time() + 2.0
+    while a.snapshot() is None and time.time() < deadline:
+        time.sleep(0.01)
+    tr.push(tr.now(), 0.01, [a.snapshot()["positions"]])  # accepted while the loop runs
+    a.stop()
+    tick_t = tr.telemetry()["tick_t"]
+    time.sleep(0.3)
+    assert tr.telemetry()["tick_t"] == tick_t  # the last tick's stamp shows the stop
+    assert tr.now() is None
+    with pytest.raises(RuntimeError, match="not running"):
+        tr.push(0.0, 0.01, [[0.0] * 7])
+
+
+def test_start_tracking_refuses_a_push_made_before_it():
+    a = m.Arm.sim()
+    a.enable()
+    tr = m.Tracking(_planar_dynamics())
+    tr.push(0.0, 0.01, [[0.0] * 7])
+    with pytest.raises(RuntimeError, match="pending push"):
+        a.start_tracking(tr)
+    assert a.state() == "enabled" and a.snapshot() is None  # the arm stays idle
+    tr.update(0.0, [0.0] * 7, [0.0] * 7, [0.0] * 7)  # and tr is not marked as in a loop
+    a.stop()
+
+
+def test_start_tracking_refuses_a_bench_tracking_with_a_plan():
+    a = m.Arm.sim()
+    a.enable()
+    tr = m.Tracking(_planar_dynamics())
+    tr.push(0.0, 0.01, [[0.0] * 7])
+    tr.update(0.0, [0.0] * 7, [0.0] * 7, [0.0] * 7)
+    with pytest.raises(RuntimeError, match="plan"):
+        a.start_tracking(tr)
+    assert a.state() == "enabled" and a.snapshot() is None
+    a.stop()
+
+
+def test_start_tracking_refuses_rung_f():
+    a = m.Arm.sim()
+    a.enable()
+    tr = m.Tracking(_planar_dynamics(), params={"contact": False})
+    with pytest.raises(RuntimeError, match="contact=False"):
+        a.start_tracking(tr)
+    assert a.state() == "enabled" and a.snapshot() is None
+    assert len(tr.update(0.0, [0.0] * 7, [0.0] * 7, [0.0] * 7)) == 7  # still usable
+    a.stop()

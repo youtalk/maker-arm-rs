@@ -343,8 +343,12 @@ impl Arm {
 
     /// Move `tracking`'s controller into the 200 Hz loop. Requires an enabled session, as
     /// `start_hold` does. After this, `tracking.update` raises; `push`, `now` and
-    /// `telemetry` keep working from any thread. `rt` as for `start_hold`. If the start
-    /// fails, the session stays idle and `tracking` stays usable.
+    /// `telemetry` keep working from any thread. `rt` as for `start_hold`.
+    ///
+    /// Raises RuntimeError for a `tracking` built with `contact=False` (rung F has no error
+    /// clamp) and for one with a plan or a pending push (their stamps belong to another
+    /// clock: push after this call, with `now()`). If the start fails, the session stays
+    /// idle and `tracking` stays usable.
     #[pyo3(signature = (tracking, rt = None))]
     fn start_tracking(
         &mut self,
