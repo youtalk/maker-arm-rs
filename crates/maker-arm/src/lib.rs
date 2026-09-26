@@ -8,6 +8,7 @@ pub mod clamp;
 pub mod config;
 pub mod control_loop;
 pub mod controller;
+pub mod dynamics;
 pub mod health;
 pub mod kinematics;
 pub mod session;

@@ -6,6 +6,7 @@
 // crate entirely (`--exclude maker-arm-py`) so `--all-features` can never
 // reach it. Bindings tests live in the Python suite
 // (`tests/test_bindings.py`), run against a `maturin develop` build.
+mod dynamics;
 mod kinematics;
 
 use maker_arm::state::JointCommand;
@@ -198,6 +199,7 @@ fn maker_arm_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(clamp_command, m)?)?;
     m.add_class::<Arm>()?;
     m.add_class::<kinematics::Kinematics>()?;
+    m.add_class::<dynamics::Dynamics>()?;
     Ok(())
 }
 

@@ -355,3 +355,48 @@ def test_start_hold_with_an_impossible_rt_fails_and_keeps_the_session():
 def test_kinematics_rejects_a_chain_without_six_revolute_joints():
     with pytest.raises(ValueError, match="revolute"):
         m.Kinematics(mount_rpy=(0, 0, 0), links=[], lower=[0.0] * 6, upper=[1.0] * 6, tool_axis=(1, 0, 0), jaw_axis=(0, 1, 0))
+
+
+# --- Dynamics: RNEA, mass matrix, gravity and friction behind a thin surface ---------
+
+Z_AXIS = (0.0, 0.0, 1.0)
+CHAIN = [((0.1, 0.0, 0.0), (0.0, 0.0, 0.0), Z_AXIS)] * 6
+BODY = (0.5, (0.05, 0.0, 0.0), ((1e-3, 0.0, 0.0), (0.0, 2e-3, 0.0), (0.0, 0.0, 2e-3)))
+
+
+def _planar_dynamics(gravity=(0.0, -9.81, 0.0)):
+    return m.Dynamics((0.0, 0.0, 0.0), CHAIN, [BODY] * 6, gravity=gravity)
+
+
+def test_dynamics_gravity_of_a_planar_chain():
+    # Joint i sits at x = 0.1 (i + 1), body k's center at 0.1 (k + 1) + 0.05; at q = 0 the
+    # chain lies along +x, so G_i = m g sum_{k >= i} (0.1 (k - i) + 0.05).
+    d = _planar_dynamics()
+    g = d.gravity([0.0] * 6)
+    for i in range(6):
+        want = 0.5 * 9.81 * sum(0.1 * (k - i) + 0.05 for k in range(i, 6))
+        assert abs(g[i] - want) < 1e-9
+    assert all(abs(v) < 1e-12 for v in _planar_dynamics((0.0, 0.0, -9.81)).gravity([0.3] * 6))
+
+
+def test_dynamics_mass_matrix_and_inverse_agree():
+    d = _planar_dynamics()
+    q = [0.1, -0.4, 0.7, 0.2, -0.3, 0.5]
+    m_ = d.mass_matrix(q)
+    g = d.gravity(q)
+    for i in range(6):
+        e = [0.0] * 6
+        e[i] = 1.0
+        col = d.inverse(q, [0.0] * 6, e)
+        assert all(abs(col[k] - g[k] - m_[k][i]) < 1e-9 for k in range(6))
+    assert d.friction([1.0] * 6) == [0.0] * 6
+
+
+def test_dynamics_refuses_bad_models():
+    bad = (-1.0, BODY[1], BODY[2])
+    with pytest.raises(ValueError, match="mass"):
+        m.Dynamics((0.0, 0.0, 0.0), CHAIN, [BODY] * 5 + [bad])
+    with pytest.raises(ValueError, match="6 bodies"):
+        m.Dynamics((0.0, 0.0, 0.0), CHAIN, [BODY] * 5)
+    with pytest.raises(ValueError, match="friction"):
+        m.Dynamics((0.0, 0.0, 0.0), CHAIN, [BODY] * 6, friction=[(0.1, 0.0, 0.0)] * 6)
