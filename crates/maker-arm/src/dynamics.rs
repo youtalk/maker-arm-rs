@@ -25,12 +25,44 @@ pub struct Body {
     pub inertia: Mat3,
 }
 
-/// `F(dq) = coulomb * tanh(dq / eps) + viscous * dq`. All zero until MA2 fits them.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+/// `F(dq) = (coulomb + (static_ - coulomb) exp(-(dq / stribeck_v)^2)) tanh(dq / eps)
+/// + viscous * dq`. With `static_ = coulomb` the Stribeck term vanishes and the law is
+/// `coulomb * tanh(dq / eps) + viscous * dq`. The default is zero friction (`static_` 0,
+/// `stribeck_v` 1.0) until an identification fits them.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Friction {
     pub coulomb: f64,
     pub viscous: f64,
     pub eps: f64,
+    /// Breakaway friction (N m), at least `coulomb`.
+    pub static_: f64,
+    /// Stribeck velocity (rad/s), positive.
+    pub stribeck_v: f64,
+}
+
+impl Friction {
+    /// Main's three-term law: `static_ = coulomb` (no Stribeck term), `stribeck_v` 1.0.
+    pub fn new(coulomb: f64, viscous: f64, eps: f64) -> Friction {
+        Friction {
+            coulomb,
+            viscous,
+            eps,
+            static_: coulomb,
+            stribeck_v: 1.0,
+        }
+    }
+}
+
+impl Default for Friction {
+    fn default() -> Self {
+        Friction {
+            coulomb: 0.0,
+            viscous: 0.0,
+            eps: 0.0,
+            static_: 0.0,
+            stribeck_v: 1.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -41,6 +73,7 @@ pub enum DynamicsError {
     Mass { body: usize },
     Inertia { body: usize, reason: &'static str },
     Friction { joint: usize },
+    Armature { joint: usize },
 }
 
 impl fmt::Display for DynamicsError {
@@ -59,9 +92,12 @@ impl fmt::Display for DynamicsError {
             }
             DynamicsError::Friction { joint } => write!(
                 f,
-                "joint {joint} friction needs coulomb, viscous and eps >= 0, and eps > 0 \
-                 when coulomb > 0"
+                "joint {joint} friction needs finite coulomb, viscous and eps >= 0, \
+                 static_ >= coulomb, stribeck_v > 0, and eps > 0 when static_ > 0"
             ),
+            DynamicsError::Armature { joint } => {
+                write!(f, "joint {joint} armature must be finite and >= 0")
+            }
         }
     }
 }
@@ -88,6 +124,8 @@ pub struct Dynamics {
     bodies: [Body; ARM_DOF],
     friction: [Friction; ARM_DOF],
     gravity: Vec3,
+    /// Reflected rotor inertia (kg m^2) per joint, added to the mass matrix diagonal.
+    armature: [f64; ARM_DOF],
 }
 
 fn add(a: &Vec3, b: &Vec3) -> Vec3 {
@@ -181,11 +219,13 @@ fn check_body(i: usize, b: &Body) -> Result<(), DynamicsError> {
 }
 
 fn check_friction(j: usize, f: &Friction) -> Result<(), DynamicsError> {
-    let ok = all_finite(&[f.coulomb, f.viscous, f.eps])
+    let ok = all_finite(&[f.coulomb, f.viscous, f.eps, f.static_, f.stribeck_v])
         && f.coulomb >= 0.0
         && f.viscous >= 0.0
         && f.eps >= 0.0
-        && (f.coulomb == 0.0 || f.eps > 0.0);
+        && f.static_ >= f.coulomb
+        && f.stribeck_v > 0.0
+        && (f.static_ == 0.0 || f.eps > 0.0);
     if ok {
         Ok(())
     } else {
@@ -200,6 +240,7 @@ impl Dynamics {
         bodies: [Body; ARM_DOF],
         friction: [Friction; ARM_DOF],
         gravity: Vec3,
+        armature: [f64; ARM_DOF],
     ) -> Result<Dynamics, DynamicsError> {
         let got = links.iter().filter(|l| l.axis.is_some()).count();
         if got != ARM_DOF {
@@ -231,6 +272,11 @@ impl Dynamics {
         }
         for (j, f) in friction.iter().enumerate() {
             check_friction(j, f)?;
+        }
+        for (j, a) in armature.iter().enumerate() {
+            if !(a.is_finite() && *a >= 0.0) {
+                return Err(DynamicsError::Armature { joint: j });
+            }
         }
         let mut joints = [Joint {
             rot: IDENTITY,
@@ -266,6 +312,7 @@ impl Dynamics {
             bodies,
             friction,
             gravity,
+            armature,
         })
     }
 
@@ -325,9 +372,14 @@ impl Dynamics {
         tau
     }
 
-    /// Joint torques for the motion (q, dq, ddq), gravity included, friction not.
+    /// Joint torques for the motion (q, dq, ddq), gravity and armature included, friction
+    /// not.
     pub fn inverse(&self, q: &Joints, dq: &Joints, ddq: &Joints) -> Joints {
-        self.rnea(q, dq, ddq, &self.gravity)
+        let mut tau = self.rnea(q, dq, ddq, &self.gravity);
+        for j in 0..ARM_DOF {
+            tau[j] += self.armature[j] * ddq[j];
+        }
+        tau
     }
 
     /// G(q): the torque that holds the arm still against gravity.
@@ -351,6 +403,7 @@ impl Dynamics {
             for i in 0..ARM_DOF {
                 m[i][j] = col[i];
             }
+            m[j][j] += self.armature[j];
         }
         m
     }
@@ -359,10 +412,11 @@ impl Dynamics {
         let mut out = [0.0; ARM_DOF];
         for j in 0..ARM_DOF {
             let f = &self.friction[j];
-            let coulomb = if f.coulomb == 0.0 {
+            let coulomb = if f.static_ == 0.0 {
                 0.0
             } else {
-                f.coulomb * (dq[j] / f.eps).tanh()
+                let x = dq[j] / f.stribeck_v;
+                (f.coulomb + (f.static_ - f.coulomb) * (-x * x).exp()) * (dq[j] / f.eps).tanh()
             };
             out[j] = coulomb + f.viscous * dq[j];
         }
@@ -411,6 +465,7 @@ mod tests {
             [b0, b1, speck(), speck(), speck(), speck()],
             [Friction::default(); ARM_DOF],
             [0.0, -G, 0.0],
+            [0.0; ARM_DOF],
         )
         .unwrap()
     }
@@ -457,6 +512,7 @@ mod tests {
             bodies,
             [Friction::default(); ARM_DOF],
             [0.0, 0.0, -G],
+            [0.0; ARM_DOF],
         )
         .unwrap()
     }
@@ -576,17 +632,14 @@ mod tests {
         let links: Vec<Link> = (0..6)
             .map(|_| Link::new([0.1, 0.0, 0.0], [0.0; 3], Z))
             .collect();
-        let f = Friction {
-            coulomb: 0.2,
-            viscous: 0.05,
-            eps: 0.01,
-        };
+        let f = Friction::new(0.2, 0.05, 0.01);
         let d = Dynamics::new(
             [0.0; 3],
             &links,
             [rod(0.5, 0.05, 2e-3); 6],
             [f; 6],
             [0.0, 0.0, -G],
+            [0.0; 6],
         )
         .unwrap();
         let out = d.friction(&[0.5, -0.5, 0.0, 0.001, 0.0, 0.0]);
@@ -603,7 +656,7 @@ mod tests {
             .collect();
         let ok = rod(0.5, 0.05, 2e-3);
         let build = |bodies: [Body; 6], friction: [Friction; 6], links: &[Link]| {
-            Dynamics::new([0.0; 3], links, bodies, friction, [0.0, 0.0, -G])
+            Dynamics::new([0.0; 3], links, bodies, friction, [0.0, 0.0, -G], [0.0; 6])
         };
         let nf = [Friction::default(); 6];
         assert!(build([ok; 6], nf, &links).is_ok());
@@ -646,10 +699,124 @@ mod tests {
             coulomb: 0.1,
             viscous: 0.0,
             eps: 0.0,
+            static_: 0.1,
+            ..Friction::default()
         };
         assert!(matches!(
             build([ok; 6], f, &links),
             Err(DynamicsError::Friction { joint: 0 })
         ));
+    }
+
+    fn six_links() -> Vec<Link> {
+        (0..6)
+            .map(|_| Link::new([0.1, 0.0, 0.0], [0.0; 3], Z))
+            .collect()
+    }
+
+    fn with(friction: [Friction; 6], armature: [f64; 6]) -> Result<Dynamics, DynamicsError> {
+        Dynamics::new(
+            [0.0; 3],
+            &six_links(),
+            [rod(0.5, 0.05, 2e-3); 6],
+            friction,
+            [0.0, -G, 0.0],
+            armature,
+        )
+    }
+
+    #[test]
+    fn the_default_friction_is_mains_law() {
+        let f = Friction::default();
+        assert_eq!(f.stribeck_v, 1.0);
+        assert_eq!(f.static_, f.coulomb);
+        let g = Friction::new(0.2, 0.05, 0.01);
+        assert_eq!(g.static_, 0.2);
+        let d = with([g; 6], [0.0; 6]).unwrap();
+        for dq in [-2.0, -0.3, -0.001, 0.0, 0.002, 0.5, 3.0] {
+            let out = d.friction(&[dq; 6]);
+            assert_eq!(out[0], 0.2 * (dq / 0.01f64).tanh() + 0.05 * dq, "dq {dq}");
+        }
+    }
+
+    #[test]
+    fn the_stribeck_term_raises_the_force_near_zero_speed() {
+        let f = Friction {
+            coulomb: 0.2,
+            viscous: 0.05,
+            eps: 0.01,
+            static_: 0.3,
+            stribeck_v: 0.1,
+        };
+        let d = with([f; 6], [0.0; 6]).unwrap();
+        let dq = 0.05;
+        let out = d.friction(&[dq, -dq, 0.0, 5.0, 0.0, 0.0]);
+        let want = (0.2 + 0.1 * (-(dq / 0.1f64).powi(2)).exp()) * (dq / 0.01f64).tanh() + 0.05 * dq;
+        assert!((out[0] - want).abs() < 1e-12);
+        assert!((out[1] + want).abs() < 1e-12);
+        assert!(out[0] > 0.2 * (dq / 0.01f64).tanh() + 0.05 * dq + 0.01);
+        // Far past the Stribeck speed the law returns to Coulomb plus viscous.
+        assert!((out[3] - (0.2 + 0.05 * 5.0)).abs() < 1e-9);
+        assert_eq!(out[2], 0.0);
+    }
+
+    #[test]
+    fn armature_adds_to_the_diagonal_and_to_inverse() {
+        let arm = [0.01, 0.02, 0.03, 0.04, 0.05, 0.06];
+        let plain = with([Friction::default(); 6], [0.0; 6]).unwrap();
+        let heavy = with([Friction::default(); 6], arm).unwrap();
+        let q = [0.1, -0.4, 0.7, 0.2, -0.3, 0.5];
+        let dq = [0.3, -0.2, 0.1, 0.5, -0.4, 0.2];
+        let ddq = [1.0, -2.0, 0.5, 3.0, -1.0, 0.25];
+        let (a, b) = (plain.inverse(&q, &dq, &ddq), heavy.inverse(&q, &dq, &ddq));
+        for j in 0..6 {
+            assert!((b[j] - a[j] - arm[j] * ddq[j]).abs() < 1e-12, "joint {j}");
+        }
+        let (m0, m1) = (plain.mass_matrix(&q), heavy.mass_matrix(&q));
+        for i in 0..6 {
+            for j in 0..6 {
+                let extra = if i == j { arm[i] } else { 0.0 };
+                assert!((m1[i][j] - m0[i][j] - extra).abs() < 1e-12, "({i},{j})");
+            }
+        }
+        // Gravity and Coriolis carry no armature.
+        assert_eq!(plain.gravity(&q), heavy.gravity(&q));
+        assert_eq!(plain.coriolis(&q, &dq), heavy.coriolis(&q, &dq));
+    }
+
+    #[test]
+    fn the_constructor_refuses_a_bad_stribeck_or_armature() {
+        let nf = [Friction::default(); 6];
+        let mut f = nf;
+        f[2] = Friction {
+            static_: 0.1,
+            ..Friction::new(0.2, 0.0, 0.01)
+        };
+        assert!(matches!(
+            with(f, [0.0; 6]),
+            Err(DynamicsError::Friction { joint: 2 })
+        ));
+        let mut f = nf;
+        f[1].stribeck_v = 0.0;
+        assert!(matches!(
+            with(f, [0.0; 6]),
+            Err(DynamicsError::Friction { joint: 1 })
+        ));
+        let mut f = nf;
+        f[4].static_ = f64::NAN;
+        assert!(matches!(
+            with(f, [0.0; 6]),
+            Err(DynamicsError::Friction { joint: 4 })
+        ));
+        for bad in [-1e-3, f64::NAN, f64::INFINITY] {
+            let mut a = [0.0; 6];
+            a[3] = bad;
+            let e = with(nf, a).unwrap_err();
+            assert_eq!(e, DynamicsError::Armature { joint: 3 });
+            assert!(e.to_string().contains("armature"));
+        }
+        assert!(DynamicsError::Friction { joint: 0 }
+            .to_string()
+            .contains("static"));
     }
 }

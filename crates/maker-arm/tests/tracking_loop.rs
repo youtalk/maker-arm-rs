@@ -30,6 +30,7 @@ fn model() -> Dynamics {
         [body; 6],
         [Friction::default(); 6],
         [0.0, -9.81, 0.0],
+        [0.0; 6],
     )
     .unwrap()
 }

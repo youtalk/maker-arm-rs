@@ -675,6 +675,10 @@ mod tests {
     /// Six vertical axes, gravity along them: G = 0 and, at rest, C dq = 0, so a static
     /// arm's observer sees tau_ext = -tau_m exactly.
     fn vertical(gravity: Vec3) -> Dynamics {
+        vertical_with(gravity, [0.0; 6])
+    }
+
+    fn vertical_with(gravity: Vec3, armature: [f64; 6]) -> Dynamics {
         let z = Some([0.0, 0.0, 1.0]);
         let body = Body {
             mass: 0.5,
@@ -690,6 +694,7 @@ mod tests {
             [body; 6],
             [Friction::default(); 6],
             gravity,
+            armature,
         )
         .unwrap()
     }
@@ -937,22 +942,18 @@ mod tests {
         x
     }
 
-    #[test]
-    fn observer_recovers_a_constant_push_on_a_moving_arm() {
-        // A six-link planar arm under gravity swings every joint 0.5 rad at 0.5 Hz (up to
-        // 1.57 rad/s) under computed torque, while a constant external torque acts on it. RK4
-        // at 1 ms integrates the true dynamics, with the motor torque held over each 5 ms
-        // tick as the MIT loop holds its command, and the observer sees the true q, dq and
-        // that torque.
-        let d = vertical([0.0, -9.81, 0.0]);
+    /// A six-link planar arm under gravity swings every joint `amp` rad at `w_ref` rad/s
+    /// under computed torque from `d` (the controller's model), while `ext` acts on it. RK4
+    /// at 1 ms integrates the true dynamics of `plant`, with the motor torque held over each
+    /// 5 ms tick as the MIT loop holds its command, and the observer sees the true q, dq and
+    /// that torque. Returns the worst `|r - ext|` after 0.5 s and the top joint speed.
+    fn swing(plant: &Dynamics, d: &Dynamics, ext: Joints, amp: f64, w_ref: f64) -> (f64, f64) {
         let mut c = TrackingController::new(
             d.clone(),
             contact(f64::INFINITY),
             &ArmConfig::maker_arm_v1(),
         )
         .unwrap();
-        let ext = [0.3, -0.2, 0.15, -0.1, 0.05, 0.08];
-        let (amp, w_ref) = (0.5, PI);
         let reference = |t: f64| -> (Joints, Joints, Joints) {
             let phase = |j: usize| w_ref * t + j as f64;
             (
@@ -962,9 +963,9 @@ mod tests {
             )
         };
         let accel = |q: &Joints, dq: &Joints, tau: &Joints| -> Joints {
-            let bias = d.inverse(q, dq, &[0.0; ARM_DOF]);
+            let bias = plant.inverse(q, dq, &[0.0; ARM_DOF]);
             solve(
-                d.mass_matrix(q),
+                plant.mass_matrix(q),
                 std::array::from_fn(|j| tau[j] + ext[j] - bias[j]),
             )
         };
@@ -1004,6 +1005,15 @@ mod tests {
                 });
             }
         }
+        (worst, fastest)
+    }
+
+    #[test]
+    fn observer_recovers_a_constant_push_on_a_moving_arm() {
+        // Every joint swings 0.5 rad at 0.5 Hz (up to 1.57 rad/s).
+        let d = vertical([0.0, -9.81, 0.0]);
+        let ext = [0.3, -0.2, 0.15, -0.1, 0.05, 0.08];
+        let (worst, fastest) = swing(&d, &d, ext, 0.5, PI);
         assert!(fastest > 1.4, "the arm must move: {fastest} rad/s");
         // RK4 is converged here (half the step moves `worst` by 1e-11 N m). What is left is
         // the observer's own discretization: it takes C^T dq - G at the tick's end for the
@@ -1012,6 +1022,25 @@ mod tests {
         // it. Dropping either term of `Mdot dq - C dq`, or flipping a sign, gives 0.13 to
         // 0.42 N m.
         assert!(worst < 0.03, "r misses the push by {worst} N m");
+    }
+
+    #[test]
+    fn the_observer_reads_zero_in_free_motion_when_the_model_has_the_armature() {
+        // The plant has rotor inertia; the model is given the same armature.
+        let arm = [0.02, 0.015, 0.01, 0.008, 0.005, 0.003];
+        let plant = vertical_with([0.0, -9.81, 0.0], arm);
+        let (worst, fastest) = swing(&plant, &plant, [0.0; 6], 0.5, PI);
+        assert!(fastest > 1.4, "the arm must move: {fastest} rad/s");
+        // The same discretization floor as the push test (13 mN m); with no push r is
+        // that floor alone.
+        assert!(worst < 0.03, "r reads {worst} N m in free motion");
+        // A model that lacks the armature misreads the rotor inertia as a push.
+        let bare = vertical([0.0, -9.81, 0.0]);
+        let (blind, _) = swing(&plant, &bare, [0.0; 6], 0.5, PI);
+        assert!(
+            blind > 0.1,
+            "a model without the armature reads only {blind} N m"
+        );
     }
 
     #[test]

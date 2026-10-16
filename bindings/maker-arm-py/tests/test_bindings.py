@@ -405,6 +405,49 @@ def test_dynamics_refuses_bad_models():
         m.Dynamics((0.0, 0.0, 0.0), CHAIN, [BODY] * 6, friction=[(0.1, 0.0, 0.0)] * 6)
 
 
+
+def test_dynamics_armature_adds_to_the_diagonal_and_to_inverse():
+    arm = [0.01, 0.02, 0.03, 0.04, 0.05, 0.06]
+    plain = _planar_dynamics()
+    heavy = m.Dynamics((0.0, 0.0, 0.0), CHAIN, [BODY] * 6, gravity=(0.0, -9.81, 0.0), armature=arm)
+    q = [0.1, -0.4, 0.7, 0.2, -0.3, 0.5]
+    ddq = [1.0, -2.0, 0.5, 3.0, -1.0, 0.25]
+    a, b = plain.inverse(q, [0.0] * 6, ddq), heavy.inverse(q, [0.0] * 6, ddq)
+    assert all(abs(b[j] - a[j] - arm[j] * ddq[j]) < 1e-12 for j in range(6))
+    m0, m1 = plain.mass_matrix(q), heavy.mass_matrix(q)
+    for i in range(6):
+        for j in range(6):
+            assert abs(m1[i][j] - m0[i][j] - (arm[i] if i == j else 0.0)) < 1e-12
+
+
+def test_dynamics_friction_takes_three_or_five_entries():
+    three = m.Dynamics((0, 0, 0), CHAIN, [BODY] * 6, friction=[(0.2, 0.05, 0.01)] * 6)
+    five_off = m.Dynamics((0, 0, 0), CHAIN, [BODY] * 6, friction=[(0.2, 0.05, 0.01, 0.2, 1.0)] * 6)
+    dq = [0.05] * 6
+    assert three.friction(dq) == five_off.friction(dq)
+    stribeck = m.Dynamics((0, 0, 0), CHAIN, [BODY] * 6, friction=[(0.2, 0.05, 0.01, 0.3, 0.1)] * 6)
+    assert stribeck.friction(dq)[0] > three.friction(dq)[0] + 0.01
+    mixed = [(0.2, 0.05, 0.01)] * 3 + [(0.2, 0.05, 0.01, 0.3, 0.1)] * 3
+    out = m.Dynamics((0, 0, 0), CHAIN, [BODY] * 6, friction=mixed).friction(dq)
+    assert out[0] == three.friction(dq)[0] and out[5] == stribeck.friction(dq)[5]
+
+
+def test_dynamics_refuses_a_bad_stribeck_or_armature():
+    kw = dict(mount_rpy=(0, 0, 0), links=CHAIN, bodies=[BODY] * 6)
+    with pytest.raises(ValueError, match="static_"):
+        m.Dynamics(**kw, friction=[(0.2, 0.0, 0.01, 0.1, 1.0)] * 6)
+    with pytest.raises(ValueError, match="stribeck_v"):
+        m.Dynamics(**kw, friction=[(0.2, 0.0, 0.01, 0.2, 0.0)] * 6)
+    with pytest.raises(ValueError, match="friction"):
+        m.Dynamics(**kw, friction=[(0.2, 0.0, 0.01, 0.2)] * 6)
+    with pytest.raises(ValueError, match="armature"):
+        m.Dynamics(**kw, armature=[0.0, 0.0, -0.1, 0.0, 0.0, 0.0])
+    with pytest.raises(ValueError, match="armature"):
+        m.Dynamics(**kw, armature=[float("nan")] + [0.0] * 5)
+    with pytest.raises(ValueError, match="6 armature"):
+        m.Dynamics(**kw, armature=[0.0] * 5)
+
+
 # --- Tracking: the compliant tracking controller behind a thread-safe handle --------
 
 def test_tracking_holds_the_start_pose_with_gravity_feed_forward():
