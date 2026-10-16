@@ -1,6 +1,7 @@
 """Golden parity with the protocol vectors — the same numbers as the Rust
 tests and the official SDK, asserted through the Python surface."""
 
+import random
 import threading
 import time
 
@@ -494,34 +495,38 @@ def test_tracking_observer_compensation_cancels_a_held_push_below_the_deadband()
 
 def _residual(history=2, bias=(0.0,) * 6, out_max=1.0, seed=7):
     """The dict the lab's export writes: 12 * history + 6 -> 8 -> 6, torch's weight.tolist()."""
-    import numpy as np
-
-    rng = np.random.default_rng(seed)
+    rng = random.Random(seed)
     n = 12 * history + 6
-    w0, b0 = rng.normal(0.0, 0.3, (8, n)), rng.normal(0.0, 0.1, 8)
-    w1, b1 = rng.normal(0.0, 0.3, (6, 8)), np.asarray(bias, dtype=float)
-    x_mean, x_std = rng.normal(0.0, 0.1, n), rng.uniform(0.5, 2.0, n)
-    x_mean[-6:], x_std[-6:] = 33.0, 5.0  # the temperatures, inside X_BOUND = 10 std
+    w0 = [[rng.gauss(0.0, 0.3) for _ in range(n)] for _ in range(8)]
+    b0 = [rng.gauss(0.0, 0.1) for _ in range(8)]
+    w1 = [[rng.gauss(0.0, 0.3) for _ in range(8)] for _ in range(6)]
+    x_mean = [rng.gauss(0.0, 0.1) for _ in range(n)]
+    x_std = [rng.uniform(0.5, 2.0) for _ in range(n)]
+    x_mean[-6:], x_std[-6:] = [33.0] * 6, [5.0] * 6  # the temperatures, inside X_BOUND = 10 std
     return {
         "history": history,
-        "layers": [[w0.tolist(), b0.tolist()], [w1.tolist(), b1.tolist()]],
-        "x_mean": x_mean.tolist(),
-        "x_std": x_std.tolist(),
+        "layers": [[w0, b0], [w1, [float(v) for v in bias]]],
+        "x_mean": x_mean,
+        "x_std": x_std,
         "y_scale": [0.5] * 6,
         "out_max": [out_max] * 6,
     }
 
 
-def test_mlp_matches_numpy_on_the_export_format():
-    import numpy as np
+def _forward(layers, x):
+    """w1 @ tanh(w0 @ x + b0) + b1 in plain Python."""
+    (w0, b0), (w1, b1) = layers
+    h = [math.tanh(sum(w * v for w, v in zip(row, x)) + b) for row, b in zip(w0, b0)]
+    return [sum(w * v for w, v in zip(row, h)) + b for row, b in zip(w1, b1)]
 
+
+def test_mlp_matches_numpy_on_the_export_format():
     r = _residual()
-    x = np.linspace(-1.0, 1.0, 30)
-    (w0, b0), (w1, b1) = [(np.array(w), np.array(b)) for w, b in r["layers"]]
-    want = w1 @ np.tanh(w0 @ x + b0) + b1
-    got = m.Mlp(r["layers"]).forward(x.tolist())
+    x = [-1.0 + 2.0 * i / 29 for i in range(30)]
+    want = _forward(r["layers"], x)
+    got = m.Mlp(r["layers"]).forward(x)
     assert len(got) == 6
-    assert np.max(np.abs(np.array(got) - want)) < 1e-12
+    assert max(abs(g - w) for g, w in zip(got, want)) < 1e-12
     with pytest.raises(ValueError, match="layer 1"):
         m.Mlp([r["layers"][0], [[[0.0] * 7] * 6, [0.0] * 6]])
     with pytest.raises(ValueError, match="layer 0"):
@@ -531,8 +536,6 @@ def test_mlp_matches_numpy_on_the_export_format():
 
 
 def test_tracking_residual_enters_the_feed_forward_and_the_telemetry():
-    import numpy as np
-
     d = _planar_dynamics()
     r = _residual(history=2)
     q = [0.1, -0.2, 0.3, 0.0, 0.2, -0.1, -1.0]
@@ -543,12 +546,11 @@ def test_tracking_residual_enters_the_feed_forward_and_the_telemetry():
         a = plain.update(k * 0.005, q, [0.0] * 7, [0.0] * 7)
         b = tr.update(k * 0.005, q, [0.0] * 7, [0.0] * 7, temperature=temps)
     # The reference by hand: two ticks of [q, dq], oldest first, then the temperatures.
-    x = np.array((q[:6] + [0.0] * 6) * 2 + temps[:6])
-    x = (x - np.array(r["x_mean"])) / np.array(r["x_std"])
-    (w0, b0), (w1, b1) = [(np.array(w), np.array(b)) for w, b in r["layers"]]
-    want = np.clip((w1 @ np.tanh(w0 @ x + b0) + b1) * 0.5, -1.0, 1.0)
+    x = (q[:6] + [0.0] * 6) * 2 + temps[:6]
+    x = [(v - mu) / sd for v, mu, sd in zip(x, r["x_mean"], r["x_std"])]
+    want = [max(-1.0, min(1.0, v * 0.5)) for v in _forward(r["layers"], x)]
     tel = tr.telemetry()
-    assert np.max(np.abs(np.array(tel["tau_res"]) - want)) < 1e-12
+    assert max(abs(g - w) for g, w in zip(tel["tau_res"], want)) < 1e-12
     assert tel["residual_skips"] == 1  # the first tick
     for j in range(6):
         assert abs(b[j][4] - (a[j][4] + want[j])) < 1e-12
