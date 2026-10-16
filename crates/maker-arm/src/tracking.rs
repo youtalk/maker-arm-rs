@@ -5,9 +5,12 @@
 //! Contact side: a momentum observer estimates the external torque `r`; past a per-joint
 //! deadband an admittance moves the reference along the push; a contact gate `g` removes
 //! the inertial, Coriolis, friction and velocity feed-forward while the arm is blocked; an
-//! error clamp caps the spring torque at `kp e_max`. Everything integrates over the MEASURED
-//! tick interval, so a late tick on a non-RT kernel does not corrupt the state. The output
-//! is a desire like any controller's: the loop's `clamp_command` decides what is sent.
+//! error clamp caps the spring torque at `kp e_max`. Behind `dob` (off by default), a
+//! low-pass copy of `r` clamped to the deadband is subtracted from the command torque, so a
+//! push below the deadband is cancelled and one above it is left to the admittance.
+//! Everything integrates over the MEASURED tick interval, so a late tick on a non-RT kernel
+//! does not corrupt the state. The output is a desire like any controller's: the loop's
+//! `clamp_command` decides what is sent.
 
 use crate::config::ArmConfig;
 pub use crate::control_loop::RING_TICKS;
@@ -50,6 +53,11 @@ pub struct TrackingParams {
     pub gate_quiet: f64,
     /// False is rung F: no observer, admittance, gate or error clamp.
     pub contact: bool,
+    /// Observer compensation (MS5 revision section 8.1): below the deadband, a low-pass
+    /// copy of `r` is subtracted from the command torque, clamped per joint to `tau_th`.
+    pub dob: bool,
+    /// Corner of the compensation's low-pass (Hz).
+    pub dob_f: f64,
 }
 
 impl Default for TrackingParams {
@@ -67,6 +75,8 @@ impl Default for TrackingParams {
             gate_rise: 0.100,       // INITIAL
             gate_quiet: 0.050,      // INITIAL
             contact: true,
+            dob: false,
+            dob_f: 5.0, // INITIAL: session 6 picks it from the bench sweep
         }
     }
 }
@@ -125,6 +135,22 @@ impl TrackingParams {
                 return Err(TrackingError::Param {
                     name: "tau_th",
                     detail: format!("{v} is not positive"),
+                });
+            }
+        }
+        positive("dob_f", self.dob_f)?;
+        if self.dob {
+            if !self.contact {
+                return Err(TrackingError::Param {
+                    name: "dob",
+                    detail: "contact=False (rung F) has no observer to compensate with".into(),
+                });
+            }
+            // The compensation is clamped to the deadband: an infinite one leaves it unbounded.
+            if let Some(v) = self.tau_th.iter().find(|v| v.is_infinite()) {
+                return Err(TrackingError::Param {
+                    name: "dob",
+                    detail: format!("needs a finite tau_th on every joint, one is {v}"),
                 });
             }
         }
@@ -238,6 +264,8 @@ pub struct Telemetry {
     pub offset: Joints,
     pub q_r: Joints,
     pub tau_ff: Joints,
+    /// The observer compensation added to `tau_ff` in the command (N m), zero with dob off.
+    pub tau_dob: Joints,
     pub late_ticks: u64,
     pub gaps: u64,
     pub max_interval: f64,
@@ -320,6 +348,8 @@ pub struct TrackingController {
     offset: Joints,
     offset_rate: Joints,
     r: Joints,
+    /// `r` through the compensation's low-pass at `dob_f`.
+    r_f: Joints,
     p_prev: Joints,
     m_prev: JointMatrix,
     gate: f64,
@@ -372,6 +402,7 @@ impl TrackingController {
             offset: zero,
             offset_rate: zero,
             r: zero,
+            r_f: zero,
             p_prev: zero,
             m_prev: [[0.0; ARM_DOF]; ARM_DOF],
             gate: 1.0,
@@ -431,6 +462,7 @@ impl TrackingController {
         self.offset = [0.0; ARM_DOF];
         self.offset_rate = [0.0; ARM_DOF];
         self.r = [0.0; ARM_DOF];
+        self.r_f = [0.0; ARM_DOF];
         self.gate = 1.0;
         self.quiet = 0.0;
         self.m_prev = self.dynamics.mass_matrix(q);
@@ -485,6 +517,23 @@ impl TrackingController {
         }
         self.p_prev = p;
         self.m_prev = m;
+    }
+
+    /// Observer compensation: `r_f` follows `r` through a first-order low-pass at `dob_f`,
+    /// exact over the tick for an `r` held over it; on a gap tick it restarts at 0 as `r`
+    /// does. Returns `-clamp(r_f, -tau_th, tau_th)` per joint, so the compensation never
+    /// grows past the deadband, where the admittance takes over.
+    fn compensate(&mut self, h: f64, gap: bool) -> Joints {
+        if gap {
+            self.r_f = [0.0; ARM_DOF];
+        } else if h > 0.0 {
+            let a = 1.0 - (-2.0 * PI * self.params.dob_f * h).exp();
+            for j in 0..ARM_DOF {
+                self.r_f[j] += a * (self.r[j] - self.r_f[j]);
+            }
+        }
+        let th = &self.params.tau_th;
+        std::array::from_fn(|j| -self.r_f[j].clamp(-th[j], th[j]))
     }
 
     /// Deadband admittance `D_a d(offset)/dt + K_a offset = dz(r)` by backward Euler (stable
@@ -610,8 +659,12 @@ impl Controller for TrackingController {
             self.ddq_d[j] = w * w * (u[j] - self.q_d[j]) - 2.0 * w * self.dq_d[j];
         }
 
+        let mut tau_dob = [0.0; ARM_DOF];
         if self.params.contact {
             self.observe(&q, &dq, &tau_m, h, gap);
+            if self.params.dob {
+                tau_dob = self.compensate(h, gap);
+            }
             self.yield_and_gate(h, gap);
         }
 
@@ -638,7 +691,12 @@ impl Controller for TrackingController {
                 vel: self.gate * dq_r[j],
                 kp: self.kp[j],
                 kd: self.kd[j],
-                tau: tau_ff[j],
+                // With dob off the command is tau_ff itself, so not even a -0.0 changes.
+                tau: if self.params.dob {
+                    tau_ff[j] + tau_dob[j]
+                } else {
+                    tau_ff[j]
+                },
             });
         }
         cmd.push(JointCommand {
@@ -654,6 +712,7 @@ impl Controller for TrackingController {
         self.telemetry.offset = self.offset;
         self.telemetry.q_r = q_r;
         self.telemetry.tau_ff = tau_ff;
+        self.telemetry.tau_dob = tau_dob;
         self.telemetry.tick_t = t;
         if let Ok(mut out) = self.shared.telemetry.try_lock() {
             *out = Some(self.telemetry);
@@ -666,6 +725,7 @@ impl Controller for TrackingController {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clamp::clamp_command;
     use crate::dynamics::{Body, Friction};
     use crate::kinematics::{Link, Vec3};
     use crate::state::MotorState;
@@ -962,16 +1022,6 @@ mod tests {
                 std::array::from_fn(|j| -amp * w_ref * w_ref * phase(j).sin()),
             )
         };
-        let accel = |q: &Joints, dq: &Joints, tau: &Joints| -> Joints {
-            let bias = plant.inverse(q, dq, &[0.0; ARM_DOF]);
-            solve(
-                plant.mass_matrix(q),
-                std::array::from_fn(|j| tau[j] + ext[j] - bias[j]),
-            )
-        };
-        let axpy =
-            |a: &Joints, s: f64, b: &Joints| -> Joints { std::array::from_fn(|j| a[j] + s * b[j]) };
-        let step = 0.001;
         let (mut q, mut dq, _) = reference(0.0);
         let (mut tau, mut worst, mut fastest) = ([0.0; ARM_DOF], 0.0_f64, 0.0_f64);
         for k in 0..=800 {
@@ -989,23 +1039,47 @@ mod tests {
                 ddq_ref[j] + 100.0 * (q_ref[j] - q[j]) + 20.0 * (dq_ref[j] - dq[j])
             });
             tau = d.inverse(&q, &dq, &ddq);
-            for _ in 0..5 {
-                let a1 = accel(&q, &dq, &tau);
-                let (q2, v2) = (axpy(&q, step / 2.0, &dq), axpy(&dq, step / 2.0, &a1));
-                let a2 = accel(&q2, &v2, &tau);
-                let (q3, v3) = (axpy(&q, step / 2.0, &v2), axpy(&dq, step / 2.0, &a2));
-                let a3 = accel(&q3, &v3, &tau);
-                let (q4, v4) = (axpy(&q, step, &v3), axpy(&dq, step, &a3));
-                let a4 = accel(&q4, &v4, &tau);
-                q = std::array::from_fn(|j| {
-                    q[j] + step / 6.0 * (dq[j] + 2.0 * v2[j] + 2.0 * v3[j] + v4[j])
-                });
-                dq = std::array::from_fn(|j| {
-                    dq[j] + step / 6.0 * (a1[j] + 2.0 * a2[j] + 2.0 * a3[j] + a4[j])
-                });
-            }
+            (q, dq) = rk4_tick(plant, ext, q, dq, 0.001, |_, _| tau);
         }
         (worst, fastest)
+    }
+
+    /// One 5 ms tick of the true dynamics of `plant` under the motor torque `motor(q, dq)`
+    /// and `ext`, by RK4 at `step`.
+    fn rk4_tick(
+        plant: &Dynamics,
+        ext: Joints,
+        mut q: Joints,
+        mut dq: Joints,
+        step: f64,
+        motor: impl Fn(&Joints, &Joints) -> Joints,
+    ) -> (Joints, Joints) {
+        let accel = |q: &Joints, dq: &Joints| -> Joints {
+            let tau = motor(q, dq);
+            let bias = plant.inverse(q, dq, &[0.0; ARM_DOF]);
+            solve(
+                plant.mass_matrix(q),
+                std::array::from_fn(|j| tau[j] + ext[j] - bias[j]),
+            )
+        };
+        let axpy =
+            |a: &Joints, s: f64, b: &Joints| -> Joints { std::array::from_fn(|j| a[j] + s * b[j]) };
+        for _ in 0..(H / step).round() as usize {
+            let a1 = accel(&q, &dq);
+            let (q2, v2) = (axpy(&q, step / 2.0, &dq), axpy(&dq, step / 2.0, &a1));
+            let a2 = accel(&q2, &v2);
+            let (q3, v3) = (axpy(&q, step / 2.0, &v2), axpy(&dq, step / 2.0, &a2));
+            let a3 = accel(&q3, &v3);
+            let (q4, v4) = (axpy(&q, step, &v3), axpy(&dq, step, &a3));
+            let a4 = accel(&q4, &v4);
+            q = std::array::from_fn(|j| {
+                q[j] + step / 6.0 * (dq[j] + 2.0 * v2[j] + 2.0 * v3[j] + v4[j])
+            });
+            dq = std::array::from_fn(|j| {
+                dq[j] + step / 6.0 * (a1[j] + 2.0 * a2[j] + 2.0 * a3[j] + a4[j])
+            });
+        }
+        (q, dq)
     }
 
     #[test]
@@ -1328,6 +1402,238 @@ mod tests {
             vertical([0.0, 0.0, -9.81]),
             TrackingParams::default(),
             &short
+        )
+        .is_err());
+    }
+
+    /// A recorded 200-tick state sequence with a plan on every joint, a push past the
+    /// deadband on joint 2, noise on every reading, a repeated stamp and a 30 ms gap. The
+    /// readings come from integer arithmetic alone, so they are the same on every platform.
+    /// Returns the FNV-1a digest of the bits of every command field, in tick order.
+    fn pin_digest(params: TrackingParams) -> u64 {
+        let mut c = TrackingController::new(
+            vertical([0.0, -9.81, 0.0]),
+            params,
+            &ArmConfig::maker_arm_v1(),
+        )
+        .unwrap();
+        let mut seed: u64 = 20261016;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0
+        };
+        let rows: Vec<Row> = (0..=120)
+            .map(|k| {
+                let mut r = [0.0; ROW];
+                for (j, v) in r.iter_mut().take(ARM_DOF).enumerate() {
+                    *v = 0.002 * k as f64 * (j as f64 - 2.5) / 2.5;
+                }
+                r[ARM_DOF] = -1.0;
+                r
+            })
+            .collect();
+        c.shared().push(Push::new(0.0, 0.01, rows).unwrap());
+        let mut digest: u64 = 0xcbf29ce484222325;
+        let mut t = 0.0;
+        for k in 0..200 {
+            if k == 150 {
+                t += 0.025; // this tick lands 30 ms after the last
+            }
+            let q: Joints = std::array::from_fn(|j| 0.1 * j as f64 + 0.01 * next());
+            let dq: Joints = std::array::from_fn(|_| 0.2 * next());
+            let mut tau: Joints = std::array::from_fn(|_| 0.3 * next());
+            if (40..90).contains(&k) {
+                tau[1] -= 1.5;
+            }
+            let out = c.update(&st(t, q, dq, tau), H);
+            for jc in &out {
+                for v in [jc.pos, jc.vel, jc.kp, jc.kd, jc.tau] {
+                    for b in v.to_bits().to_le_bytes() {
+                        digest = (digest ^ u64::from(b)).wrapping_mul(0x100000001b3);
+                    }
+                }
+            }
+            if k != 100 {
+                t += H; // tick 101 repeats tick 100's stamp
+            }
+        }
+        digest
+    }
+
+    /// The digests of `pin_digest` on main (d816104, which gives fadf948's commands), with
+    /// `contact(0.5)` and with rung F, per architecture: libm may round a last bit
+    /// differently elsewhere. An architecture without an entry prints its digests.
+    const PIN: &[(&str, u64, u64)] = &[("aarch64", 0x943a1b511aea7702, 0xe33d60f953c86b5a)];
+
+    #[test]
+    fn with_dob_off_the_commands_are_mains() {
+        let off = |dob_f: f64, base: TrackingParams| TrackingParams { dob_f, ..base };
+        let on = pin_digest(contact(0.5));
+        let free_d = pin_digest(free());
+        // dob_f does nothing while dob is off.
+        assert_eq!(pin_digest(off(0.7, contact(0.5))), on);
+        assert_eq!(pin_digest(off(40.0, free())), free_d);
+        match PIN.iter().find(|p| p.0 == std::env::consts::ARCH) {
+            Some(&(_, want_on, want_free)) => {
+                assert_eq!(on, want_on, "contact: {on:#018x}");
+                assert_eq!(free_d, want_free, "rung F: {free_d:#018x}");
+            }
+            None => println!(
+                "no pin for {}: contact {on:#018x} free {free_d:#018x}",
+                std::env::consts::ARCH
+            ),
+        }
+    }
+
+    /// The tests' plant (the model itself, under gravity) held at mid-range by the controller
+    /// with `ext` acting on it: the motor runs the MIT law on the clamped command, held over
+    /// each tick, and reports its torque. Returns the controller, the final pose, the start
+    /// pose and the joint 2 offset at 0.5 s.
+    fn hold_against(ext: Joints, dob: bool) -> (TrackingController, Joints, Joints, f64) {
+        let config = ArmConfig::maker_arm_v1();
+        let plant = vertical([0.0, -9.81, 0.0]);
+        let mut p = contact(0.5);
+        p.dob = dob;
+        let mut c = TrackingController::new(plant.clone(), p, &config).unwrap();
+        let q0: Joints =
+            std::array::from_fn(|j| (config.joints[j].q_lo + config.joints[j].q_hi) / 2.0);
+        let (mut q, mut dq) = (q0, [0.0; ARM_DOF]);
+        let mit = |cmd: &ArmCommand, q: &Joints, dq: &Joints| -> Joints {
+            std::array::from_fn(|j| {
+                let m = &cmd[j];
+                m.kp * (m.pos - q[j]) + m.kd * (m.vel - dq[j]) + m.tau
+            })
+        };
+        let mut tau = [0.0; ARM_DOF];
+        let mut half = 0.0;
+        for k in 0..=200 {
+            let out = c.update(&st(k as f64 * H, q, dq, tau), H);
+            let (cmd, _) = clamp_command(&out, &config).unwrap();
+            if k == 100 {
+                half = c.offset[1];
+            }
+            (q, dq) = rk4_tick(&plant, ext, q, dq, 0.0005, |q, dq| mit(&cmd, q, dq));
+            tau = mit(&cmd, &q, &dq);
+        }
+        (c, q, q0, half)
+    }
+
+    #[test]
+    fn a_held_external_torque_is_cancelled_up_to_the_deadband() {
+        let mut ext = [0.0; ARM_DOF];
+        ext[1] = 0.3;
+        let (c, q, q0, _) = hold_against(ext, true);
+        let tel = c.shared().telemetry().unwrap();
+        assert!(
+            (tel.tau_dob[1] + 0.3).abs() < 0.02,
+            "tau_dob {}",
+            tel.tau_dob[1]
+        );
+        assert_eq!(tel.offset[1], 0.0, "below the deadband the reference stays");
+        // The compensation takes the push off the spring: the pose error shrinks.
+        let (_, q_off, _, _) = hold_against(ext, false);
+        let (with, without) = ((q[1] - q0[1]).abs(), (q_off[1] - q0[1]).abs());
+        assert!(without > 1e-3, "the push must bend the arm: {without} rad");
+        assert!(
+            with < 0.1 * without,
+            "error {with} rad with dob, {without} without"
+        );
+
+        ext[1] = 0.8;
+        let (c, _, _, half) = hold_against(ext, true);
+        let tel = c.shared().telemetry().unwrap();
+        assert_eq!(
+            tel.tau_dob[1], -0.5,
+            "the compensation stops at the deadband"
+        );
+        // The admittance yields along the push towards (0.8 - 0.5) / K_a.
+        let ka = 0.25 * ArmConfig::maker_arm_v1().joints[1].kp;
+        assert!(
+            tel.offset[1] > half && half > 0.0,
+            "{half} then {}",
+            tel.offset[1]
+        );
+        assert!(tel.offset[1] > 0.6 * 0.3 / ka, "offset {}", tel.offset[1]);
+    }
+
+    #[test]
+    fn a_gap_tick_restarts_the_compensation_at_zero() {
+        let mut p = contact(0.5);
+        p.dob = true;
+        let mut c = ctrl(p);
+        let mut tau = [0.0; 6];
+        tau[0] = -0.3; // a static arm reads tau_ext = -tau_m
+        let mut t = 0.0;
+        for _ in 0..=100 {
+            c.update(&st(t, [0.0; 6], [0.0; 6], tau), H);
+            t += H;
+        }
+        let tel = c.shared().telemetry().unwrap();
+        assert!((tel.tau_dob[0] + 0.3).abs() < 1e-3, "{}", tel.tau_dob[0]);
+        t += 0.025; // this tick lands 30 ms after the last
+        let out = c.update(&st(t, [0.0; 6], [0.0; 6], tau), H);
+        let tel = c.shared().telemetry().unwrap();
+        assert_eq!(tel.tau_dob, [0.0; 6]);
+        assert_eq!(out[0].tau, tel.tau_ff[0]);
+        // One tick later it follows r again from zero, not from before the gap.
+        t += H;
+        c.update(&st(t, [0.0; 6], [0.0; 6], tau), H);
+        let a = (1.0 - (-2.0 * PI * 5.0 * H).exp()) * c.r[0];
+        let tel = c.shared().telemetry().unwrap();
+        assert!(
+            (tel.tau_dob[0] + a).abs() < 1e-12,
+            "{} vs {}",
+            tel.tau_dob[0],
+            -a
+        );
+    }
+
+    #[test]
+    fn with_dob_off_the_compensation_reads_zero() {
+        let mut c = ctrl(contact(0.5));
+        let mut tau = [0.0; 6];
+        tau[0] = -0.3;
+        for k in 0..=100 {
+            c.update(&st(k as f64 * H, [0.0; 6], [0.0; 6], tau), H);
+        }
+        assert_eq!(c.shared().telemetry().unwrap().tau_dob, [0.0; 6]);
+    }
+
+    #[test]
+    fn dob_needs_a_finite_deadband() {
+        let check = |f: fn(&mut TrackingParams)| {
+            let mut p = contact(0.5);
+            p.dob = true;
+            f(&mut p);
+            p.validate()
+        };
+        assert!(check(|_| {}).is_ok());
+        assert!(check(|p| p.tau_th = [f64::INFINITY; ARM_DOF]).is_err());
+        assert!(check(|p| p.tau_th[4] = f64::INFINITY).is_err());
+        assert!(check(|p| p.dob_f = 0.0).is_err());
+        assert!(check(|p| p.dob_f = -5.0).is_err());
+        assert!(check(|p| p.dob_f = f64::NAN).is_err());
+        assert!(check(|p| p.dob_f = f64::INFINITY).is_err());
+        assert!(
+            check(|p| p.contact = false).is_err(),
+            "rung F has no observer"
+        );
+        // The default stays valid, and dob_f is checked with dob off too.
+        assert!(TrackingParams::default().validate().is_ok());
+        let p = TrackingParams {
+            dob_f: 0.0,
+            ..TrackingParams::default()
+        };
+        assert!(p.validate().is_err());
+        assert!(TrackingController::new(
+            vertical([0.0, 0.0, -9.81]),
+            TrackingParams {
+                dob: true,
+                ..TrackingParams::default()
+            },
+            &ArmConfig::maker_arm_v1()
         )
         .is_err());
     }

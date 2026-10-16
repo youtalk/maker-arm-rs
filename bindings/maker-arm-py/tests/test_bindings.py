@@ -462,8 +462,33 @@ def test_tracking_holds_the_start_pose_with_gravity_feed_forward():
         assert pos == q[j] and vel == 0.0 and abs(tau - g[j]) < 1e-12
     assert out[6][0] == -1.0 and out[6][4] == 0.0
     tel = tr.telemetry()
-    assert set(tel) == {"r", "gate", "offset", "q_r", "tau_ff", "late_ticks", "gaps", "max_interval", "tick_t"}
+    assert set(tel) == {
+        "r", "gate", "offset", "q_r", "tau_ff", "tau_dob", "late_ticks", "gaps", "max_interval",
+        "tick_t",
+    }
     assert tel["tick_t"] == 0.0
+
+
+def test_tracking_observer_compensation_cancels_a_held_push_below_the_deadband():
+    d = _planar_dynamics()
+    q = [0.1, -0.2, 0.3, 0.0, 0.2, -0.1, -1.0]
+    tau = [0.0, -0.3, 0.0, 0.0, 0.0, 0.0, 0.0]  # a static arm reads tau_ext = -tau_m
+    g = d.gravity(q[:6])
+    tau = [tau[j] + (g[j] if j < 6 else 0.0) for j in range(7)]
+    off = m.Tracking(d, params={"tau_th": [0.5] * 6, "dob_f": 7.0})
+    on = m.Tracking(d, params={"tau_th": [0.5] * 6, "dob": True, "dob_f": 7.0})
+    for k in range(201):
+        a = off.update(k * 0.005, q, [0.0] * 7, tau)
+        b = on.update(k * 0.005, q, [0.0] * 7, tau)
+    assert off.telemetry()["tau_dob"] == [0.0] * 6
+    tel = on.telemetry()
+    assert abs(tel["tau_dob"][1] + 0.3) < 1e-3
+    assert abs(b[1][4] - (a[1][4] - 0.3)) < 1e-3
+    assert on.drain()["tau_dob"][-1] == tel["tau_dob"]
+    with pytest.raises(ValueError, match="dob"):
+        m.Tracking(d, params={"dob": True})  # the default tau_th is infinite
+    with pytest.raises(ValueError, match="dob_f"):
+        m.Tracking(d, params={"tau_th": [0.5] * 6, "dob": True, "dob_f": 0.0})
 
 
 def test_tracking_rejects_bad_input():
@@ -641,7 +666,7 @@ def test_tracking_drain_gives_one_row_per_tick_and_counts_the_drops():
     a.stop()
     assert d["dropped"] == 0 and len(d["tick_t"]) >= len(loop["t"]) > 20
     assert d["tick_t"][: len(loop["t"])] == loop["t"]
-    for col in ("r", "offset", "q_r", "tau_ff"):
+    for col in ("r", "offset", "q_r", "tau_ff", "tau_dob"):
         assert len(d[col]) == len(d["tick_t"]) and len(d[col][0]) == 6
     assert len(d["gate"]) == len(d["tick_t"])
     assert tr.drain()["tick_t"] == []

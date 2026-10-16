@@ -32,6 +32,8 @@ fn params_from_dict(d: &Bound<'_, PyDict>) -> PyResult<TrackingParams> {
             "gate_rise" => p.gate_rise = value.extract()?,
             "gate_quiet" => p.gate_quiet = value.extract()?,
             "contact" => p.contact = value.extract()?,
+            "dob" => p.dob = value.extract()?,
+            "dob_f" => p.dob_f = value.extract()?,
             other => {
                 return Err(PyValueError::new_err(format!(
                     "unknown tracking parameter {other}"
@@ -208,7 +210,7 @@ impl Tracking {
     }
 
     /// The telemetry of every tick since the last drain as columns, oldest first: `tick_t`,
-    /// `gate`, and `r`, `offset`, `q_r` and `tau_ff` as one six-wide list per tick. `dropped`
+    /// `gate`, and `r`, `offset`, `q_r`, `tau_ff` and `tau_dob` as one six-wide list per tick. `dropped`
     /// counts the ticks lost since the last drain because the ring held only 4000, or because a
     /// controller was dropped with rows still queued. Join with `Arm.drain` on `tick_t` and
     /// `t`, not on the index: a tick that faulted the arm has a row in one and not the other.
@@ -221,6 +223,10 @@ impl Tracking {
         d.set_item("offset", rows.iter().map(|t| t.offset).collect::<Vec<_>>())?;
         d.set_item("q_r", rows.iter().map(|t| t.q_r).collect::<Vec<_>>())?;
         d.set_item("tau_ff", rows.iter().map(|t| t.tau_ff).collect::<Vec<_>>())?;
+        d.set_item(
+            "tau_dob",
+            rows.iter().map(|t| t.tau_dob).collect::<Vec<_>>(),
+        )?;
         d.set_item("dropped", dropped)?;
         Ok(d.into())
     }
@@ -235,6 +241,7 @@ impl Tracking {
         d.set_item("offset", t.offset)?;
         d.set_item("q_r", t.q_r)?;
         d.set_item("tau_ff", t.tau_ff)?;
+        d.set_item("tau_dob", t.tau_dob)?;
         d.set_item("late_ticks", t.late_ticks)?;
         d.set_item("gaps", t.gaps)?;
         d.set_item("max_interval", t.max_interval)?;
