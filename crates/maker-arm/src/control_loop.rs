@@ -117,6 +117,20 @@ impl<T> RingWriter<T> {
         }
     }
 
+    /// Forgets everything queued and counted, for a restart.
+    pub fn clear(&mut self) {
+        self.pending.clear();
+        self.dropped = 0;
+    }
+
+    /// Takes the queue out without a lock and returns how many records it lost: the queued
+    /// ones plus the drops not yet reported. For a writer that is being dropped.
+    pub fn abandon(&mut self) -> u64 {
+        let n = self.pending.len() as u64 + std::mem::take(&mut self.dropped);
+        self.pending.clear();
+        n
+    }
+
     /// Blocking flush for the end of a loop.
     pub fn flush_blocking(&mut self, ring: &Mutex<TickRing<T>>) {
         self.flush(&mut ring.lock().unwrap_or_else(|e| e.into_inner()));

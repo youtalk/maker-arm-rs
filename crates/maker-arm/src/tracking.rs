@@ -18,6 +18,7 @@ use crate::kinematics::{Joints, ARM_DOF};
 use crate::state::{ArmCommand, ArmState, JointCommand};
 use std::f64::consts::PI;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -253,6 +254,8 @@ pub struct TrackingShared {
     telemetry: Mutex<Option<Telemetry>>,
     clock: Mutex<Option<(f64, Instant)>>,
     ring: Mutex<TickRing<Telemetry>>,
+    /// Rows a dropped controller still held, counted into the next drain's `dropped`.
+    lost: AtomicU64,
 }
 
 impl TrackingShared {
@@ -270,9 +273,11 @@ impl TrackingShared {
 
     /// The telemetry of every `update` call since the last drain, oldest first, and the number
     /// dropped since then because the ring (`RING_TICKS`) was full. A nonzero count marks a
-    /// gap in the records.
+    /// gap in the records. Join with the loop's records on `tick_t` (their `t`), not on the
+    /// index: a tick that faulted the arm has a loop record and no row here, or the reverse.
     pub fn drain(&self) -> (Vec<Telemetry>, u64) {
-        self.ring.lock().unwrap_or_else(|e| e.into_inner()).take()
+        let (rows, dropped) = self.ring.lock().unwrap_or_else(|e| e.into_inner()).take();
+        (rows, dropped + self.lost.swap(0, Ordering::Relaxed))
     }
 
     /// `(now, age)`: the loop clock now, which is the tick clock (the latest good
@@ -403,6 +408,10 @@ impl TrackingController {
         }
         self.started = false;
         self.telemetry = Telemetry::default();
+        // Bench rows from before the loop must not reach the first drain. The loop does not
+        // hold the ring yet, so the blocking lock is safe.
+        self.ring.clear();
+        let _ = self.shared.drain();
         *self
             .shared
             .telemetry
@@ -514,6 +523,16 @@ impl TrackingController {
                 }
             }
         }
+    }
+}
+
+impl Drop for TrackingController {
+    /// Rows still queued (their `try_lock` failed) are counted as lost, so the next drain
+    /// reports them. No blocking lock: the loop drops the controller on a `hold_now` swap.
+    fn drop(&mut self) {
+        self.ring.try_flush(&self.shared.ring);
+        let n = self.ring.abandon();
+        self.shared.lost.fetch_add(n, Ordering::Relaxed);
     }
 }
 
@@ -1119,6 +1138,39 @@ mod tests {
         assert!(c.restart_for_loop().is_err(), "a pending push");
         c.update(&at_rest(7.005), H);
         assert!(c.restart_for_loop().is_err(), "a plan");
+    }
+
+    #[test]
+    fn a_dropped_controller_reports_the_rows_it_still_held() {
+        let mut c = ctrl(contact(f64::INFINITY));
+        let shared = c.shared();
+        c.update(&at_rest(0.0), H);
+        {
+            let _reader = shared.ring.lock().unwrap();
+            c.update(&at_rest(0.005), H);
+            c.update(&at_rest(0.010), H);
+            drop(c); // the ring is locked: both rows stay queued
+        }
+        let (rows, dropped) = shared.drain();
+        assert_eq!((rows.len(), dropped), (1, 2));
+        assert_eq!(shared.drain().1, 0);
+    }
+
+    #[test]
+    fn restart_for_loop_clears_the_bench_rows() {
+        let mut c = ctrl(contact(f64::INFINITY));
+        let shared = c.shared();
+        c.update(&at_rest(0.0), H);
+        {
+            let _reader = shared.ring.lock().unwrap();
+            c.update(&at_rest(0.005), H); // queued, not in the ring
+        }
+        c.restart_for_loop().unwrap();
+        assert_eq!(shared.drain(), (vec![], 0));
+        c.update(&at_rest(7.0), H);
+        let (rows, dropped) = shared.drain();
+        assert_eq!((rows.len(), dropped), (1, 0));
+        assert_eq!(rows[0].tick_t, 7.0);
     }
 
     #[test]

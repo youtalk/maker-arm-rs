@@ -449,7 +449,7 @@ impl Arm {
     /// `cmd_kp`, `cmd_kd` and `cmd_tau` are the command that went out after the clamp; each of
     /// those holds one list per tick, seven wide. `dropped` counts the ticks lost since the
     /// last drain because the ring held only 4000: a nonzero value marks a gap, never a
-    /// silent one. Works after the loop died, so the last ticks before a fault stay readable.
+    /// silent one. Join with `Tracking.drain` on `t`, not on the index. Works after the loop died, so the last ticks before a fault stay readable.
     fn drain(&self, py: Python<'_>) -> PyResult<Option<Py<PyDict>>> {
         let ArmHandle::Running(r) = &self.handle else {
             return Ok(None);

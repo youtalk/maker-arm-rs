@@ -209,7 +209,9 @@ impl Tracking {
 
     /// The telemetry of every tick since the last drain as columns, oldest first: `tick_t`,
     /// `gate`, and `r`, `offset`, `q_r` and `tau_ff` as one six-wide list per tick. `dropped`
-    /// counts the ticks lost since the last drain because the ring held only 4000.
+    /// counts the ticks lost since the last drain because the ring held only 4000, or because a
+    /// controller was dropped with rows still queued. Join with `Arm.drain` on `tick_t` and
+    /// `t`, not on the index: a tick that faulted the arm has a row in one and not the other.
     fn drain(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         let (rows, dropped) = self.shared.drain();
         let d = PyDict::new(py);

@@ -576,6 +576,7 @@ def test_drain_returns_the_ticks_since_the_last_drain():
         assert len(d[col]) == len(d["t"]) and len(d[col][0]) == 7
     assert len(d["tick"]) == len(d["clamped"]) == len(d["t"])
     assert d["tick"] == list(range(d["tick"][0], d["tick"][0] + len(d["tick"])))
+    time.sleep(0.05)
     assert arm.drain()["t"][0] > d["t"][-1]
     arm.stop()
 
