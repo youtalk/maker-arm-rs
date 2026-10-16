@@ -463,9 +463,10 @@ def test_tracking_holds_the_start_pose_with_gravity_feed_forward():
     assert out[6][0] == -1.0 and out[6][4] == 0.0
     tel = tr.telemetry()
     assert set(tel) == {
-        "r", "gate", "offset", "q_r", "tau_ff", "tau_dob", "late_ticks", "gaps", "max_interval",
-        "tick_t",
+        "r", "gate", "offset", "q_r", "tau_ff", "tau_dob", "tau_res", "residual_skips",
+        "late_ticks", "gaps", "max_interval", "tick_t",
     }
+    assert tel["tau_res"] == [0.0] * 6 and tel["residual_skips"] == 0
     assert tel["tick_t"] == 0.0
 
 
@@ -489,6 +490,84 @@ def test_tracking_observer_compensation_cancels_a_held_push_below_the_deadband()
         m.Tracking(d, params={"dob": True})  # the default tau_th is infinite
     with pytest.raises(ValueError, match="dob_f"):
         m.Tracking(d, params={"tau_th": [0.5] * 6, "dob": True, "dob_f": 0.0})
+
+
+def _residual(history=2, bias=(0.0,) * 6, out_max=1.0, seed=7):
+    """The dict the lab's export writes: 12 * history + 6 -> 8 -> 6, torch's weight.tolist()."""
+    import numpy as np
+
+    rng = np.random.default_rng(seed)
+    n = 12 * history + 6
+    w0, b0 = rng.normal(0.0, 0.3, (8, n)), rng.normal(0.0, 0.1, 8)
+    w1, b1 = rng.normal(0.0, 0.3, (6, 8)), np.asarray(bias, dtype=float)
+    return {
+        "history": history,
+        "layers": [[w0.tolist(), b0.tolist()], [w1.tolist(), b1.tolist()]],
+        "x_mean": rng.normal(0.0, 0.1, n).tolist(),
+        "x_std": rng.uniform(0.5, 2.0, n).tolist(),
+        "y_scale": [0.5] * 6,
+        "out_max": [out_max] * 6,
+    }
+
+
+def test_mlp_matches_numpy_on_the_export_format():
+    import numpy as np
+
+    r = _residual()
+    x = np.linspace(-1.0, 1.0, 30)
+    (w0, b0), (w1, b1) = [(np.array(w), np.array(b)) for w, b in r["layers"]]
+    want = w1 @ np.tanh(w0 @ x + b0) + b1
+    got = m.Mlp(r["layers"]).forward(x.tolist())
+    assert len(got) == 6
+    assert np.max(np.abs(np.array(got) - want)) < 1e-12
+    with pytest.raises(ValueError, match="layer 1"):
+        m.Mlp([r["layers"][0], [[[0.0] * 7] * 6, [0.0] * 6]])
+    with pytest.raises(ValueError, match="layer 0"):
+        m.Mlp([[[[0.0] * 3, [0.0] * 2], [0.0, 0.0]]])  # ragged rows
+    with pytest.raises(ValueError):
+        m.Mlp(r["layers"]).forward([0.0] * 29)
+
+
+def test_tracking_residual_enters_the_feed_forward_and_the_telemetry():
+    import numpy as np
+
+    d = _planar_dynamics()
+    r = _residual(history=2)
+    q = [0.1, -0.2, 0.3, 0.0, 0.2, -0.1, -1.0]
+    temps = [31.0, 32.0, 33.0, 34.0, 35.0, 36.0, 30.0]
+    plain = m.Tracking(d, params={"contact": False})
+    tr = m.Tracking(d, params={"contact": False}, residual=r)
+    for k in range(3):
+        a = plain.update(k * 0.005, q, [0.0] * 7, [0.0] * 7)
+        b = tr.update(k * 0.005, q, [0.0] * 7, [0.0] * 7, temperature=temps)
+    # The reference by hand: two ticks of [q, dq], oldest first, then the temperatures.
+    x = np.array((q[:6] + [0.0] * 6) * 2 + temps[:6])
+    x = (x - np.array(r["x_mean"])) / np.array(r["x_std"])
+    (w0, b0), (w1, b1) = [(np.array(w), np.array(b)) for w, b in r["layers"]]
+    want = np.clip((w1 @ np.tanh(w0 @ x + b0) + b1) * 0.5, -1.0, 1.0)
+    tel = tr.telemetry()
+    assert np.max(np.abs(np.array(tel["tau_res"]) - want)) < 1e-12
+    assert tel["residual_skips"] == 1  # the first tick
+    for j in range(6):
+        assert abs(b[j][4] - (a[j][4] + want[j])) < 1e-12
+    dr = tr.drain()
+    assert dr["residual_skips"] == [1, 1, 1] and dr["tau_res"][0] == [0.0] * 6
+    assert plain.telemetry()["tau_res"] == [0.0] * 6
+
+
+def test_tracking_refuses_a_bad_residual():
+    d = _planar_dynamics()
+    r = _residual(history=2)
+    with pytest.raises(ValueError, match="layer 0"):
+        m.Tracking(d, residual=dict(r, history=3))
+    with pytest.raises(ValueError, match="x_std"):
+        m.Tracking(d, residual=dict(r, x_std=[0.0] * 30))
+    with pytest.raises(ValueError, match="out_max"):
+        m.Tracking(d, residual=dict(r, out_max=[-1.0] * 6))
+    with pytest.raises(ValueError, match="unknown residual field"):
+        m.Tracking(d, residual=dict(r, y_mean=[0.0] * 6))
+    with pytest.raises(ValueError, match="missing"):
+        m.Tracking(d, residual={k: v for k, v in r.items() if k != "x_mean"})
 
 
 def test_tracking_rejects_bad_input():
@@ -666,7 +745,7 @@ def test_tracking_drain_gives_one_row_per_tick_and_counts_the_drops():
     a.stop()
     assert d["dropped"] == 0 and len(d["tick_t"]) >= len(loop["t"]) > 20
     assert d["tick_t"][: len(loop["t"])] == loop["t"]
-    for col in ("r", "offset", "q_r", "tau_ff", "tau_dob"):
+    for col in ("r", "offset", "q_r", "tau_ff", "tau_dob", "tau_res"):
         assert len(d[col]) == len(d["tick_t"]) and len(d[col][0]) == 6
     assert len(d["gate"]) == len(d["tick_t"])
     assert tr.drain()["tick_t"] == []

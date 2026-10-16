@@ -7,7 +7,9 @@
 //! the inertial, Coriolis, friction and velocity feed-forward while the arm is blocked; an
 //! error clamp caps the spring torque at `kp e_max`. Behind `dob` (off by default), a
 //! low-pass copy of `r` clamped to the deadband is subtracted from the command torque, so a
-//! push below the deadband is cancelled and one above it is left to the admittance.
+//! push below the deadband is cancelled and one above it is left to the admittance. With a
+//! learned residual (`ResidualModel`, MS5 revision section 8.2), its torque `tau_res` joins
+//! the model next to friction, in the observer and in the gated feed-forward.
 //! Everything integrates over the MEASURED tick interval, so a late tick on a non-RT kernel
 //! does not corrupt the state. The output is a desire like any controller's: the loop's
 //! `clamp_command` decides what is sent.
@@ -18,6 +20,7 @@ use crate::control_loop::{RingWriter, TickRing};
 use crate::controller::Controller;
 use crate::dynamics::{Dynamics, JointMatrix};
 use crate::kinematics::{Joints, ARM_DOF};
+use crate::residual::ResidualModel;
 use crate::state::{ArmCommand, ArmState, JointCommand};
 use std::f64::consts::PI;
 use std::fmt;
@@ -266,6 +269,12 @@ pub struct Telemetry {
     pub tau_ff: Joints,
     /// The observer compensation added to `tau_ff` in the command (N m), zero with dob off.
     pub tau_dob: Joints,
+    /// The learned residual torque in the observer's model and the feed-forward (N m), zero
+    /// without a residual and on a skip.
+    pub tau_res: Joints,
+    /// Ticks whose residual was skipped (zero): the history not yet full, after a start or a
+    /// gap, or a non-finite input or output. Cumulative.
+    pub residual_skips: u64,
     pub late_ticks: u64,
     pub gaps: u64,
     pub max_interval: f64,
@@ -354,6 +363,11 @@ pub struct TrackingController {
     m_prev: JointMatrix,
     gate: f64,
     quiet: f64,
+    residual: Option<ResidualModel>,
+    /// This tick's residual torque, held over a repeated stamp.
+    tau_res: Joints,
+    /// The first tick since `begin`, which records its reading although its h is 0.
+    res_fresh: bool,
     telemetry: Telemetry,
     ring: RingWriter<Telemetry>,
 }
@@ -363,6 +377,7 @@ impl TrackingController {
         dynamics: Dynamics,
         params: TrackingParams,
         config: &ArmConfig,
+        residual: Option<ResidualModel>,
     ) -> Result<TrackingController, TrackingError> {
         params.validate()?;
         if config.joints.len() != ROW {
@@ -407,6 +422,9 @@ impl TrackingController {
             m_prev: [[0.0; ARM_DOF]; ARM_DOF],
             gate: 1.0,
             quiet: 0.0,
+            residual,
+            tau_res: zero,
+            res_fresh: true,
             telemetry: Telemetry::default(),
             ring: RingWriter::default(),
         })
@@ -465,6 +483,11 @@ impl TrackingController {
         self.r_f = [0.0; ARM_DOF];
         self.gate = 1.0;
         self.quiet = 0.0;
+        self.tau_res = [0.0; ARM_DOF];
+        self.res_fresh = true;
+        if let Some(res) = &mut self.residual {
+            res.reset();
+        }
         self.m_prev = self.dynamics.mass_matrix(q);
         self.p_prev = mat6_vec(&self.m_prev, dq);
         self.t_prev = t;
@@ -510,7 +533,12 @@ impl TrackingController {
             let decay = (-self.params.k_o * h).exp();
             for j in 0..ARM_DOF {
                 // C^T dq = Mdot dq - C dq.
-                let beta = mdot_dq[j] - c_dq[j] - g[j] - f[j];
+                let mut beta = mdot_dq[j] - c_dq[j] - g[j] - f[j];
+                // The residual is model torque like friction. Without one, beta is untouched,
+                // so not even a -0.0 changes.
+                if self.residual.is_some() {
+                    beta -= self.tau_res[j];
+                }
                 let ext = (p[j] - self.p_prev[j]) / h - tau_m[j] - beta;
                 self.r[j] = decay * self.r[j] + (1.0 - decay) * ext;
             }
@@ -535,6 +563,32 @@ impl TrackingController {
         }
         let th = &self.params.tau_th;
         std::array::from_fn(|j| -self.r_f[j].clamp(-th[j], th[j]))
+    }
+
+    /// The learned residual for this tick from the measured q, dq and arm temperatures. A tick
+    /// that integrates something adds its reading to the history; a gap restarts the history
+    /// first, because the ticks before it are no longer the last `history` ticks of motion. A
+    /// repeated or backward stamp (h = 0 after the first tick) adds nothing and holds the last
+    /// value. A skip gives zero and is counted.
+    fn residual_step(&mut self, q: &Joints, dq: &Joints, temps: &Joints, h: f64, gap: bool) {
+        let Some(res) = &mut self.residual else {
+            return;
+        };
+        if h <= 0.0 && !self.res_fresh {
+            return;
+        }
+        self.res_fresh = false;
+        if gap {
+            res.reset();
+        }
+        res.record(q, dq);
+        match res.evaluate(temps) {
+            Some(v) => self.tau_res = v,
+            None => {
+                self.tau_res = [0.0; ARM_DOF];
+                self.telemetry.residual_skips += 1;
+            }
+        }
     }
 
     /// Deadband admittance `D_a d(offset)/dt + K_a offset = dz(r)` by backward Euler (stable
@@ -604,11 +658,13 @@ impl Controller for TrackingController {
         }
         let t = state.t;
         let (mut q, mut dq, mut tau_m) = ([0.0; ARM_DOF], [0.0; ARM_DOF], [0.0; ARM_DOF]);
+        let mut temps = [0.0; ARM_DOF];
         for j in 0..ARM_DOF {
             let m = &state.motors[j];
             q[j] = m.position;
             dq[j] = m.velocity;
             tau_m[j] = m.torque;
+            temps[j] = m.temperature;
         }
         if !self.started {
             self.begin(t, &q, &dq, state.motors[ARM_DOF].position);
@@ -660,6 +716,7 @@ impl Controller for TrackingController {
             self.ddq_d[j] = w * w * (u[j] - self.q_d[j]) - 2.0 * w * self.dq_d[j];
         }
 
+        self.residual_step(&q, &dq, &temps, h, gap);
         let mut tau_dob = [0.0; ARM_DOF];
         if self.params.contact {
             self.observe(&q, &dq, &tau_m, h, gap);
@@ -680,7 +737,13 @@ impl Controller for TrackingController {
         let mut tau_ff = [0.0; ARM_DOF];
         let mut cmd = Vec::with_capacity(ROW);
         for j in 0..ARM_DOF {
-            tau_ff[j] = g_r[j] + self.gate * (full[j] - g_r[j] + fr[j]);
+            // The residual is gated like friction; without one the sum is main's, bit for bit.
+            let model = if self.residual.is_some() {
+                full[j] - g_r[j] + fr[j] + self.tau_res[j]
+            } else {
+                full[j] - g_r[j] + fr[j]
+            };
+            tau_ff[j] = g_r[j] + self.gate * model;
             let pos = if self.params.contact {
                 let e = self.params.e_max[j];
                 q[j] + (q_r[j] - q[j]).clamp(-e, e)
@@ -714,6 +777,7 @@ impl Controller for TrackingController {
         self.telemetry.q_r = q_r;
         self.telemetry.tau_ff = tau_ff;
         self.telemetry.tau_dob = tau_dob;
+        self.telemetry.tau_res = self.tau_res;
         self.telemetry.tick_t = t;
         if let Ok(mut out) = self.shared.telemetry.try_lock() {
             *out = Some(self.telemetry);
@@ -729,6 +793,7 @@ mod tests {
     use crate::clamp::clamp_command;
     use crate::dynamics::{Body, Friction};
     use crate::kinematics::{Link, Vec3};
+    use crate::residual::ResidualModel;
     use crate::state::MotorState;
 
     const H: f64 = 0.005;
@@ -765,6 +830,7 @@ mod tests {
             vertical([0.0, 0.0, -9.81]),
             params,
             &ArmConfig::maker_arm_v1(),
+            None,
         )
         .unwrap()
     }
@@ -935,7 +1001,8 @@ mod tests {
     #[test]
     fn feed_forward_is_gravity_at_rest_and_full_rnea_in_motion() {
         let d = vertical([0.0, -9.81, 0.0]);
-        let mut c = TrackingController::new(d.clone(), free(), &ArmConfig::maker_arm_v1()).unwrap();
+        let mut c =
+            TrackingController::new(d.clone(), free(), &ArmConfig::maker_arm_v1(), None).unwrap();
         let q0 = [0.2, -0.3, 0.4, 0.1, -0.2, 0.3];
         let out = c.update(&st(0.0, q0, [0.0; 6], [0.0; 6]), H);
         let g = d.gravity(&q0);
@@ -1013,6 +1080,7 @@ mod tests {
             d.clone(),
             contact(f64::INFINITY),
             &ArmConfig::maker_arm_v1(),
+            None,
         )
         .unwrap();
         let reference = |t: f64| -> (Joints, Joints, Joints) {
@@ -1402,7 +1470,8 @@ mod tests {
         assert!(TrackingController::new(
             vertical([0.0, 0.0, -9.81]),
             TrackingParams::default(),
-            &short
+            &short,
+            None
         )
         .is_err());
     }
@@ -1412,10 +1481,15 @@ mod tests {
     /// readings come from integer arithmetic alone, so they are the same on every platform.
     /// Returns the FNV-1a digest of the bits of every command field, in tick order.
     fn pin_digest(params: TrackingParams) -> u64 {
+        pin_digest_with(params, None)
+    }
+
+    fn pin_digest_with(params: TrackingParams, residual: Option<ResidualModel>) -> u64 {
         let mut c = TrackingController::new(
             vertical([0.0, -9.81, 0.0]),
             params,
             &ArmConfig::maker_arm_v1(),
+            residual,
         )
         .unwrap();
         let mut seed: u64 = 20261016;
@@ -1486,11 +1560,21 @@ mod tests {
     /// each tick, and reports its torque. Returns the controller, the final pose, the start
     /// pose and the joint 2 offset at 0.5 s.
     fn hold_against(ext: Joints, dob: bool) -> (TrackingController, Joints, Joints, f64) {
+        hold_against_with(ext, dob, None, |_| {})
+    }
+
+    /// `hold_against` with a residual, calling `each` on the controller after every tick.
+    fn hold_against_with(
+        ext: Joints,
+        dob: bool,
+        residual: Option<ResidualModel>,
+        mut each: impl FnMut(&TrackingController),
+    ) -> (TrackingController, Joints, Joints, f64) {
         let config = ArmConfig::maker_arm_v1();
         let plant = vertical([0.0, -9.81, 0.0]);
         let mut p = contact(0.5);
         p.dob = dob;
-        let mut c = TrackingController::new(plant.clone(), p, &config).unwrap();
+        let mut c = TrackingController::new(plant.clone(), p, &config, residual).unwrap();
         let q0: Joints =
             std::array::from_fn(|j| (config.joints[j].q_lo + config.joints[j].q_hi) / 2.0);
         let (mut q, mut dq) = (q0, [0.0; ARM_DOF]);
@@ -1508,6 +1592,7 @@ mod tests {
             if k == 100 {
                 half = c.offset[1];
             }
+            each(&c);
             (q, dq) = rk4_tick(&plant, ext, q, dq, 0.0005, |q, dq| mit(&cmd, q, dq));
             tau = mit(&cmd, &q, &dq);
         }
@@ -1592,6 +1677,154 @@ mod tests {
     }
 
     #[test]
+    fn a_known_residual_keeps_the_observer_at_zero() {
+        // The plant carries an extra 0.2 N m load on joint 3 (index 2) that the identified
+        // model misses: without a residual the observer reads it as a push.
+        let mut ext = [0.0; ARM_DOF];
+        ext[2] = -0.2;
+        let mut blind = 0.0_f64;
+        hold_against_with(ext, false, None, |c| blind = c.r[2]);
+        assert!(
+            (blind + 0.2).abs() < 0.01,
+            "r reads {blind} N m without the residual"
+        );
+        // A residual that gives exactly that load (the motor torque it takes) keeps r at
+        // zero once its history of 4 ticks is full and the observer has settled, and the
+        // feed-forward carries the load.
+        let mut bias = [0.0; ARM_DOF];
+        bias[2] = 0.2;
+        let (mut worst, mut k) = (0.0_f64, 0);
+        let (c, q, q0, _) = hold_against_with(
+            ext,
+            false,
+            Some(crate::residual::tests::constant(4, bias, 1.0)),
+            |c| {
+                // The skipped ticks let r start toward the load; it decays with the
+                // observer's 1/k_o = 20 ms, so the check starts 5 of those (20 ticks) later.
+                if k >= 4 + 20 {
+                    worst = worst.max(c.r[2].abs());
+                }
+                k += 1;
+            },
+        );
+        assert!(worst < 0.01, "r reads {worst} N m with the residual");
+        let tel = c.shared().telemetry().unwrap();
+        assert_eq!(tel.tau_res, bias);
+        assert_eq!(tel.residual_skips, 3, "the 4th tick fills the history");
+        assert!(
+            (q[2] - q0[2]).abs() < 1e-4,
+            "the load bends joint 3 by {}",
+            q[2] - q0[2]
+        );
+    }
+
+    #[test]
+    fn the_residual_enters_the_feed_forward_gated_like_friction() {
+        let mut bias = [0.0; ARM_DOF];
+        bias[1] = 0.25;
+        let mk = |r| {
+            TrackingController::new(vertical([0.0; 3]), free(), &ArmConfig::maker_arm_v1(), r)
+                .unwrap()
+        };
+        let (mut a, mut b) = (
+            mk(None),
+            mk(Some(crate::residual::tests::constant(2, bias, 1.0))),
+        );
+        for k in 0..4 {
+            let (x, y) = (
+                a.update(&at_rest(k as f64 * H), H),
+                b.update(&at_rest(k as f64 * H), H),
+            );
+            let want = if k >= 1 { 0.25 } else { 0.0 }; // the second tick fills the history
+            assert_eq!(y[1].tau - x[1].tau, want, "tick {k}");
+            assert_eq!(y[0].tau, x[0].tau);
+        }
+        // Blocked: the gate removes it with friction and the inertial terms.
+        let mut c = TrackingController::new(
+            vertical([0.0; 3]),
+            contact(0.5),
+            &ArmConfig::maker_arm_v1(),
+            Some(crate::residual::tests::constant(2, bias, 1.0)),
+        )
+        .unwrap();
+        let mut tau = [0.0; 6];
+        tau[0] = -3.0;
+        let mut out = Vec::new();
+        for k in 0..=40 {
+            out = c.update(&st(k as f64 * H, [0.0; 6], [0.0; 6], tau), H);
+        }
+        assert_eq!(c.gate, 0.0);
+        assert_eq!(out[1].tau, 0.0, "gravity is zero on this arm");
+        assert_eq!(c.shared().telemetry().unwrap().tau_res, bias);
+    }
+
+    #[test]
+    fn a_gap_restarts_the_residual_history_and_a_repeated_stamp_holds_it() {
+        let mut c = TrackingController::new(
+            vertical([0.0, 0.0, -9.81]),
+            free(),
+            &ArmConfig::maker_arm_v1(),
+            Some(crate::residual::tests::constant(3, [0.1; 6], 1.0)),
+        )
+        .unwrap();
+        let mut t = 0.0;
+        for _ in 0..3 {
+            c.update(&at_rest(t), H);
+            t += H;
+        }
+        let tel = c.shared().telemetry().unwrap();
+        assert_eq!((tel.tau_res, tel.residual_skips), ([0.1; 6], 2));
+        c.update(&at_rest(t - H), H); // the same stamp again
+        let tel = c.shared().telemetry().unwrap();
+        assert_eq!((tel.tau_res, tel.residual_skips), ([0.1; 6], 2));
+        t += 0.025; // this tick lands 30 ms after the last: stale history
+        for n in 0..3 {
+            c.update(&at_rest(t), H);
+            t += H;
+            let tel = c.shared().telemetry().unwrap();
+            let want = if n < 2 { [0.0; 6] } else { [0.1; 6] };
+            assert_eq!(tel.tau_res, want, "tick {n} after the gap");
+        }
+        assert_eq!(c.shared().telemetry().unwrap().residual_skips, 4);
+        // A NaN temperature is a skip, and the commands stay finite.
+        let mut s = at_rest(t);
+        s.motors[3].temperature = f64::NAN;
+        let out = c.update(&s, H);
+        assert!(out.iter().all(|j| j.tau.is_finite()));
+        let tel = c.shared().telemetry().unwrap();
+        assert_eq!((tel.tau_res, tel.residual_skips), ([0.0; 6], 5));
+    }
+
+    #[test]
+    fn without_a_residual_the_commands_are_task_4s() {
+        // pin_digest passes no residual; these are the PIN digests and c8626ef's digest of the
+        // dob-on sequence.
+        let mut p = contact(0.5);
+        p.dob = true;
+        let on = pin_digest(contact(0.5));
+        let free_d = pin_digest(free());
+        let dob = pin_digest_with(p, None);
+        match PIN.iter().find(|p| p.0 == std::env::consts::ARCH) {
+            Some(&(_, want_on, want_free)) => {
+                assert_eq!(on, want_on, "contact: {on:#018x}");
+                assert_eq!(free_d, want_free, "rung F: {free_d:#018x}");
+            }
+            None => println!("no pin for {}", std::env::consts::ARCH),
+        }
+        if let Some(&(_, want)) = PIN_DOB.iter().find(|p| p.0 == std::env::consts::ARCH) {
+            assert_eq!(dob, want, "dob on: {dob:#018x}");
+        }
+        // A residual changes them, so the digest does see it.
+        let r = crate::residual::tests::constant(2, [0.01; 6], 1.0);
+        assert_ne!(pin_digest_with(contact(0.5), Some(r)), on);
+    }
+
+    /// `pin_digest` of `contact(0.5)` with `dob` on, on c8626ef (task 4's head), per
+    /// architecture.
+    // TODO: add the x86_64 (ubuntu-latest) digest from the first CI log.
+    const PIN_DOB: &[(&str, u64)] = &[("aarch64", 0x004477863f471ee4)];
+
+    #[test]
     fn with_dob_off_the_compensation_reads_zero() {
         let mut c = ctrl(contact(0.5));
         let mut tau = [0.0; 6];
@@ -1634,7 +1867,8 @@ mod tests {
                 dob: true,
                 ..TrackingParams::default()
             },
-            &ArmConfig::maker_arm_v1()
+            &ArmConfig::maker_arm_v1(),
+            None
         )
         .is_err());
     }

@@ -39,7 +39,7 @@ fn model() -> Dynamics {
 fn a_session_runs_1000_tracking_ticks_without_a_fault() {
     let c = fast(ArmConfig::maker_arm_v1());
     let mut s = enabled_session(&c);
-    let mut ctrl = TrackingController::new(model(), TrackingParams::default(), &c).unwrap();
+    let mut ctrl = TrackingController::new(model(), TrackingParams::default(), &c, None).unwrap();
     let start = s.positions();
     let rows = (0..=100)
         .map(|k| {
@@ -63,7 +63,7 @@ fn a_session_runs_1000_tracking_ticks_without_a_fault() {
 fn a_non_finite_model_output_ends_in_the_fault_hold() {
     let c = fast(ArmConfig::maker_arm_v1());
     let mut s = enabled_session(&c);
-    let mut ctrl = TrackingController::new(model(), TrackingParams::default(), &c).unwrap();
+    let mut ctrl = TrackingController::new(model(), TrackingParams::default(), &c, None).unwrap();
     s.tick(&mut ctrl).expect("first tick");
     let mut absurd = [1e300; ROW];
     absurd[ROW - 1] = s.positions()[ROW - 1];
@@ -88,7 +88,7 @@ fn a_non_finite_model_output_ends_in_the_fault_hold() {
 fn a_tracking_loop_drains_one_telemetry_per_tick_matching_the_loop_records() {
     let c = fast(ArmConfig::maker_arm_v1());
     let s = enabled_session(&c);
-    let ctrl = TrackingController::new(model(), TrackingParams::default(), &c).unwrap();
+    let ctrl = TrackingController::new(model(), TrackingParams::default(), &c, None).unwrap();
     let shared = ctrl.shared();
     let running = s.start(Box::new(ctrl), None).expect("start");
     std::thread::sleep(std::time::Duration::from_millis(200));
@@ -109,7 +109,7 @@ fn a_tracking_loop_drains_one_telemetry_per_tick_matching_the_loop_records() {
 fn a_full_tracking_ring_counts_what_it_dropped() {
     let c = fast(ArmConfig::maker_arm_v1());
     let mut s = enabled_session(&c);
-    let mut ctrl = TrackingController::new(model(), TrackingParams::default(), &c).unwrap();
+    let mut ctrl = TrackingController::new(model(), TrackingParams::default(), &c, None).unwrap();
     let shared = ctrl.shared();
     for _ in 0..RING_TICKS + 25 {
         s.tick(&mut ctrl).expect("tick");

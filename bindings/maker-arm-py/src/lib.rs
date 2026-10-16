@@ -419,6 +419,7 @@ fn maker_arm_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<kinematics::Kinematics>()?;
     m.add_class::<dynamics::Dynamics>()?;
     m.add_class::<tracking::Tracking>()?;
+    m.add_class::<tracking::Mlp>()?;
     Ok(())
 }
 
