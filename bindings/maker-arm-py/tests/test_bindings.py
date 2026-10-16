@@ -602,3 +602,116 @@ def test_tracking_drain_gives_one_row_per_tick_and_counts_the_drops():
         assert len(d[col]) == len(d["tick_t"]) and len(d[col][0]) == 6
     assert len(d["gate"]) == len(d["tick_t"])
     assert tr.drain()["tick_t"] == []
+
+
+# --- Reduced caps and joint calibration for an arm session ------------------------------
+
+
+def _clamped_joint2_tau(profile):
+    a = m.Arm.sim(profile=profile) if profile is not None else m.Arm.sim()
+    a.enable()
+    heavy = (100.0, BODY[1], BODY[2])  # gravity on joint 2 then asks for several N m
+    a.start_tracking(m.Tracking(m.Dynamics((0.0, 0.0, 0.0), CHAIN, [heavy] * 6, gravity=(0.0, -9.81, 0.0))))
+    time.sleep(0.3)
+    d = a.drain()
+    a.stop()
+    return [row[1] for row in d["cmd_tau"]]
+
+
+def test_a_reduced_cap_reaches_the_clamp():
+    free = _clamped_joint2_tau(None)
+    assert max(abs(t) for t in free) > 3.0  # the test bites: gravity asks for more than 3 N m
+    p = m.profile()
+    p["joints"][1]["tau_max"] = 3.0
+    capped = _clamped_joint2_tau(p)
+    assert capped and max(abs(t) for t in capped) <= 3.0 + 1e-9
+    assert max(abs(t) for t in capped) > 2.9
+
+
+def test_a_reduced_cap_reaches_hold_and_the_clamp_function_is_unchanged():
+    p = m.profile()
+    p["joints"][1]["tau_max"] = 3.0
+    out, clamped = m.clamp_command([(0.0, 0.0, 0.0, 0.0, 9.0)] * 7, p)
+    assert clamped and out[1][4] == 3.0
+
+
+@pytest.mark.parametrize(
+    "edit, field",
+    [
+        (lambda p: p["joints"][1].update(tau_max=p["joints"][1]["tau_max"] * 1.5), "joints[1].tau_max"),
+        (lambda p: p["joints"][2].update(kp=p["joints"][2]["kp"] * 2), "joints[2].kp"),
+        (lambda p: p["joints"][3].update(kd=p["joints"][3]["kd"] + 1.0), "joints[3].kd"),
+        (lambda p: p["joints"][0].update(q_lo=p["joints"][0]["q_lo"] - 0.1), "joints[0].q_lo"),
+        (lambda p: p["joints"][4].update(q_hi=p["joints"][4]["q_hi"] + 0.1), "joints[4].q_hi"),
+        (lambda p: p.update(max_velocity=p["max_velocity"] * 2), "max_velocity"),
+        (lambda p: p["joints"][5].update(direction=0.5), "joints[5].direction"),
+        (lambda p: p["joints"][5].update(direction=0.0), "joints[5].direction"),
+        (lambda p: p["joints"][2].update(offset=3.2), "joints[2].offset"),
+        (lambda p: p["joints"][2].update(offset=float("nan")), "joints[2].offset"),
+        (lambda p: p["joints"][1].update(tau_max=float("inf")), "joints[1].tau_max"),
+        (lambda p: p["joints"][1].update(kp=float("nan")), "joints[1].kp"),
+        (lambda p: p.update(max_velocity=float("nan")), "max_velocity"),
+    ],
+)
+def test_a_raised_or_non_finite_value_is_refused_before_connect(edit, field):
+    p = m.profile()
+    edit(p)
+    with pytest.raises(ValueError, match=field.replace("[", r"\[").replace("]", r"\]")):
+        m.Arm.sim(profile=p)
+
+
+def test_a_raised_cap_is_refused_before_connect():
+    p = m.profile()
+    p["joints"][1]["tau_max"] *= 1.5
+    with pytest.raises(ValueError, match="tau_max"):
+        m.Arm.sim(profile=p)
+
+
+def test_socketcan_refuses_a_bad_profile_before_the_socket_opens():
+    p = m.profile()
+    p["joints"][1]["tau_max"] *= 1.5
+    # An interface that does not exist: opening it would raise RuntimeError, so a ValueError
+    # proves the profile was checked first.
+    with pytest.raises(ValueError, match="tau_max"):
+        m.Arm.socketcan("nocan99", profile=p)
+
+
+def test_a_lowered_range_and_gains_are_accepted():
+    p = m.profile()
+    p["joints"][0]["q_lo"] += 0.1
+    p["joints"][0]["q_hi"] -= 0.1
+    p["joints"][0]["kp"] *= 0.5
+    p["max_velocity"] *= 0.5
+    a = m.Arm.sim(profile=p)
+    a.enable()
+    a.stop()
+
+
+def test_a_flipped_direction_maps_motor_to_joint():
+    v1 = m.profile()
+    p = m.profile()
+    for i, (d, o) in {0: (-1.0, 0.4), 2: (-1.0, -0.7), 4: (1.0, 0.3)}.items():
+        p["joints"][i]["direction"] = d
+        p["joints"][i]["offset"] = o
+    a = m.Arm.sim(profile=p)
+    a.enable()
+    a.start_hold()
+    time.sleep(0.2)
+    snap = a.snapshot()
+    d = a.drain()
+    a.stop()
+    # The sim parks every motor at the joint-range midpoint through the same map the session
+    # reads back with, so joint coordinates come out as the midpoints for any direction/offset.
+    for i, j in enumerate(v1["joints"][:6]):
+        mid = (j["q_lo"] + j["q_hi"]) / 2.0
+        assert abs(snap["positions"][i] - mid) < 1e-3, i
+        assert abs(d["cmd_pos"][-1][i] - mid) < 1e-3, i
+
+
+def test_clamp_command_reads_direction_and_offset_without_changing_clamping():
+    p = m.profile()
+    p["joints"][0]["direction"] = -1.0
+    p["joints"][0]["offset"] = 0.4
+    mids = [(j["q_lo"] + j["q_hi"]) / 2.0 for j in p["joints"]]
+    out, clamped = m.clamp_command([(q, 0.0, 0.0, 0.0, 0.0) for q in mids], p)
+    assert not clamped

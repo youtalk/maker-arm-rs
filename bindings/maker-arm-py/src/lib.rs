@@ -147,12 +147,121 @@ pub(crate) fn config_from_dict(profile: &Bound<'_, PyDict>) -> PyResult<ArmConfi
             override_f64(d, "kp", &mut j.kp)?;
             override_f64(d, "kd", &mut j.kd)?;
             override_f64(d, "tau_max", &mut j.tau_max)?;
+            override_f64(d, "direction", &mut j.direction)?;
+            override_f64(d, "offset", &mut j.offset)?;
         }
     }
     override_f64(profile, "max_velocity", &mut c.max_velocity)?;
     override_f64(profile, "kp_max", &mut c.kp_max)?;
     override_f64(profile, "kd_max", &mut c.kd_max)?;
     override_f64(profile, "limit_margin", &mut c.limit_margin)?;
+    Ok(c)
+}
+
+/// The config an arm session runs with: the v1 profile with the numeric overrides in
+/// `profile`, after checking that no override loosens a v1 limit. A session may only be
+/// stricter than `maker_arm_v1`: per joint `kp`, `kd` and `tau_max` at most the v1 value and
+/// `[q_lo, q_hi]` inside the v1 range, `max_velocity` at most v1, `direction` exactly -1 or
+/// +1 and `|offset| <= pi`. Every number must be finite. The error is a ValueError that names
+/// the field (for example `joints[1].tau_max`); callers run this before any connection opens.
+pub(crate) fn reduced_config(profile: &Bound<'_, PyDict>) -> PyResult<ArmConfig> {
+    let c = config_from_dict(profile)?;
+    let v1 = ArmConfig::maker_arm_v1();
+    let bad = |field: String, why: String| PyValueError::new_err(format!("{field}: {why}"));
+    let finite = |field: String, x: f64| {
+        if x.is_finite() {
+            Ok(())
+        } else {
+            Err(bad(field, format!("{x} is not finite")))
+        }
+    };
+    let at_most = |field: String, x: f64, cap: f64| {
+        if x <= cap {
+            Ok(())
+        } else {
+            Err(bad(
+                field,
+                format!("{x} exceeds the maker_arm_v1 value {cap}"),
+            ))
+        }
+    };
+    for (i, (j, b)) in c.joints.iter().zip(v1.joints.iter()).enumerate() {
+        for (name, x) in [
+            ("kp", j.kp),
+            ("kd", j.kd),
+            ("tau_max", j.tau_max),
+            ("q_lo", j.q_lo),
+            ("q_hi", j.q_hi),
+            ("direction", j.direction),
+            ("offset", j.offset),
+        ] {
+            finite(format!("joints[{i}].{name}"), x)?;
+        }
+        at_most(format!("joints[{i}].kp"), j.kp, b.kp)?;
+        at_most(format!("joints[{i}].kd"), j.kd, b.kd)?;
+        at_most(format!("joints[{i}].tau_max"), j.tau_max, b.tau_max)?;
+        for (name, x) in [("kp", j.kp), ("kd", j.kd), ("tau_max", j.tau_max)] {
+            if x < 0.0 {
+                return Err(bad(
+                    format!("joints[{i}].{name}"),
+                    format!("{x} is negative"),
+                ));
+            }
+        }
+        if j.q_lo < b.q_lo {
+            return Err(bad(
+                format!("joints[{i}].q_lo"),
+                format!("{} is below the maker_arm_v1 value {}", j.q_lo, b.q_lo),
+            ));
+        }
+        if j.q_hi > b.q_hi {
+            return Err(bad(
+                format!("joints[{i}].q_hi"),
+                format!("{} is above the maker_arm_v1 value {}", j.q_hi, b.q_hi),
+            ));
+        }
+        if j.q_lo >= j.q_hi {
+            return Err(bad(
+                format!("joints[{i}].q_lo"),
+                format!("range [{}, {}] is empty", j.q_lo, j.q_hi),
+            ));
+        }
+        if j.direction != 1.0 && j.direction != -1.0 {
+            return Err(bad(
+                format!("joints[{i}].direction"),
+                format!("{} is not -1.0 or 1.0", j.direction),
+            ));
+        }
+        if j.offset.abs() > std::f64::consts::PI {
+            return Err(bad(
+                format!("joints[{i}].offset"),
+                format!("|{}| exceeds pi", j.offset),
+            ));
+        }
+    }
+    finite("max_velocity".into(), c.max_velocity)?;
+    at_most("max_velocity".into(), c.max_velocity, v1.max_velocity)?;
+    if c.max_velocity <= 0.0 {
+        return Err(bad("max_velocity".into(), "must be positive".into()));
+    }
+    // Not loosenable from a session profile: these stay the v1 values.
+    for (name, x, v) in [
+        ("kp_max", c.kp_max, v1.kp_max),
+        ("kd_max", c.kd_max, v1.kd_max),
+        ("limit_margin", c.limit_margin, v1.limit_margin),
+    ] {
+        finite(name.into(), x)?;
+        if name == "limit_margin" {
+            if x < v {
+                return Err(bad(
+                    name.into(),
+                    format!("{x} is below the maker_arm_v1 value {v}"),
+                ));
+            }
+        } else {
+            at_most(name.into(), x, v)?;
+        }
+    }
     Ok(c)
 }
 
@@ -227,6 +336,13 @@ struct Arm {
     config: ArmConfig,
 }
 
+fn session_config(profile: Option<&Bound<'_, PyDict>>) -> PyResult<ArmConfig> {
+    match profile {
+        Some(p) => reduced_config(p),
+        None => Ok(ArmConfig::maker_arm_v1()),
+    }
+}
+
 fn err<E: std::fmt::Display>(e: E) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
 }
@@ -299,9 +415,15 @@ impl Arm {
 #[pymethods]
 impl Arm {
     /// Connect to the built-in 7-motor simulator.
+    ///
+    /// `profile` (optional) is `maker_arm_rs.profile()` with numeric edits that may only
+    /// tighten it: lower `kp`, `kd`, `tau_max`, a narrower `q_lo`/`q_hi`, a lower
+    /// `max_velocity`, and per joint `direction` (-1.0 or 1.0) and `offset` (|offset| <= pi).
+    /// Anything else raises ValueError naming the field, before the session connects.
     #[staticmethod]
-    fn sim() -> PyResult<Arm> {
-        let config = ArmConfig::maker_arm_v1();
+    #[pyo3(signature = (profile = None))]
+    fn sim(profile: Option<&Bound<'_, PyDict>>) -> PyResult<Arm> {
+        let config = session_config(profile)?;
         let session =
             Session::connect(Box::new(SimArm::new(&config)), config.clone()).map_err(err)?;
         Ok(Arm {
@@ -311,9 +433,11 @@ impl Arm {
     }
 
     /// Connect over SocketCAN, e.g. Arm.socketcan("can0").
+    /// `profile` as for `sim`; it is checked before the socket opens.
     #[staticmethod]
-    fn socketcan(interface: &str) -> PyResult<Arm> {
-        let config = ArmConfig::maker_arm_v1();
+    #[pyo3(signature = (interface, profile = None))]
+    fn socketcan(interface: &str, profile: Option<&Bound<'_, PyDict>>) -> PyResult<Arm> {
+        let config = session_config(profile)?;
         let backend = maker_arm_transport::SocketCanBackend::open(interface).map_err(err)?;
         let session = Session::connect(Box::new(backend), config.clone()).map_err(err)?;
         Ok(Arm {
