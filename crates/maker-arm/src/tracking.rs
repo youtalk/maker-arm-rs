@@ -10,6 +10,8 @@
 //! is a desire like any controller's: the loop's `clamp_command` decides what is sent.
 
 use crate::config::ArmConfig;
+pub use crate::control_loop::RING_TICKS;
+use crate::control_loop::{RingWriter, TickRing};
 use crate::controller::Controller;
 use crate::dynamics::{Dynamics, JointMatrix};
 use crate::kinematics::{Joints, ARM_DOF};
@@ -250,6 +252,7 @@ pub struct TrackingShared {
     pending: Mutex<Vec<Push>>,
     telemetry: Mutex<Option<Telemetry>>,
     clock: Mutex<Option<(f64, Instant)>>,
+    ring: Mutex<TickRing<Telemetry>>,
 }
 
 impl TrackingShared {
@@ -263,6 +266,13 @@ impl TrackingShared {
     /// The last tick's telemetry, or None before the first tick.
     pub fn telemetry(&self) -> Option<Telemetry> {
         *self.telemetry.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The telemetry of every `update` call since the last drain, oldest first, and the number
+    /// dropped since then because the ring (`RING_TICKS`) was full. A nonzero count marks a
+    /// gap in the records.
+    pub fn drain(&self) -> (Vec<Telemetry>, u64) {
+        self.ring.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 
     /// `(now, age)`: the loop clock now, which is the tick clock (the latest good
@@ -310,6 +320,7 @@ pub struct TrackingController {
     gate: f64,
     quiet: f64,
     telemetry: Telemetry,
+    ring: RingWriter<Telemetry>,
 }
 
 impl TrackingController {
@@ -361,6 +372,7 @@ impl TrackingController {
             gate: 1.0,
             quiet: 0.0,
             telemetry: Telemetry::default(),
+            ring: RingWriter::default(),
         })
     }
 
@@ -627,6 +639,7 @@ impl Controller for TrackingController {
         if let Ok(mut out) = self.shared.telemetry.try_lock() {
             *out = Some(self.telemetry);
         }
+        self.ring.record(self.telemetry, &self.shared.ring);
         cmd
     }
 }

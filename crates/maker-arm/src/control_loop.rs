@@ -8,7 +8,8 @@ use crate::clamp::clamp_command;
 use crate::controller::{Controller, HoldController};
 use crate::health::FaultReason;
 use crate::session::{Session, SessionError, SessionState};
-use crate::state::ArmState;
+use crate::state::{ArmCommand, ArmState, MotorState};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
@@ -17,6 +18,109 @@ use std::time::{Duration, Instant};
 pub struct TickOutcome {
     pub fault: Option<FaultReason>,
     pub clamped: bool,
+    /// What this tick read and sent; None when the tick sent nothing (the arm was disabled).
+    pub record: Option<TickRecord>,
+}
+
+/// One tick for the telemetry ring: the state the controller read and the command that went
+/// out after the clamp.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TickRecord {
+    /// `ArmState::t` of the state the controller read.
+    pub t: f64,
+    /// The session tick count after this tick, so the first tick is 1.
+    pub tick: u64,
+    pub motors: Vec<MotorState>,
+    /// The command after `clamp_command`, as encoded for the motors.
+    pub sent: ArmCommand,
+    pub clamped: bool,
+}
+
+/// Ticks the telemetry rings hold: 20 s at 200 Hz. Both rings (the loop's and the tracking
+/// controller's) use this one value.
+pub const RING_TICKS: usize = 4000;
+
+/// A bounded ring of records and the number it dropped since the last `take`.
+#[derive(Debug)]
+pub struct TickRing<T> {
+    buf: VecDeque<T>,
+    dropped: u64,
+}
+
+impl<T> Default for TickRing<T> {
+    fn default() -> Self {
+        TickRing {
+            buf: VecDeque::new(),
+            dropped: 0,
+        }
+    }
+}
+
+impl<T> TickRing<T> {
+    /// The records since the last call, oldest first, and the count dropped since then.
+    pub fn take(&mut self) -> (Vec<T>, u64) {
+        (
+            self.buf.drain(..).collect(),
+            std::mem::take(&mut self.dropped),
+        )
+    }
+}
+
+/// The loop side of a ring. Records wait in a local vector until `try_lock` gets the ring, so
+/// a reader holding the lock delays records by a tick and never blocks the tick. A full ring
+/// drops from the front, and every drop is counted for the next `take`.
+#[derive(Debug)]
+pub struct RingWriter<T> {
+    pending: VecDeque<T>,
+    dropped: u64,
+}
+
+impl<T> Default for RingWriter<T> {
+    fn default() -> Self {
+        RingWriter {
+            pending: VecDeque::new(),
+            dropped: 0,
+        }
+    }
+}
+
+impl<T> RingWriter<T> {
+    fn flush(&mut self, ring: &mut TickRing<T>) {
+        for item in self.pending.drain(..) {
+            if ring.buf.len() >= RING_TICKS {
+                ring.buf.pop_front();
+                ring.dropped += 1;
+            }
+            ring.buf.push_back(item);
+        }
+        ring.dropped += std::mem::take(&mut self.dropped);
+    }
+
+    /// Queues `item` and moves everything queued into `ring` if the lock is free. A reader
+    /// that never lets go cannot grow the queue past `RING_TICKS`: the oldest queued record is
+    /// dropped and counted.
+    pub fn record(&mut self, item: T, ring: &Mutex<TickRing<T>>) {
+        if self.pending.len() >= RING_TICKS {
+            self.pending.pop_front();
+            self.dropped += 1;
+        }
+        self.pending.push_back(item);
+        self.try_flush(ring);
+    }
+
+    /// Moves the queue into `ring` if the lock is free. Poison-tolerant.
+    pub fn try_flush(&mut self, ring: &Mutex<TickRing<T>>) {
+        match ring.try_lock() {
+            Ok(mut r) => self.flush(&mut r),
+            Err(TryLockError::Poisoned(e)) => self.flush(&mut e.into_inner()),
+            Err(TryLockError::WouldBlock) => {}
+        }
+    }
+
+    /// Blocking flush for the end of a loop.
+    pub fn flush_blocking(&mut self, ring: &Mutex<TickRing<T>>) {
+        self.flush(&mut ring.lock().unwrap_or_else(|e| e.into_inner()));
+    }
 }
 
 /// Real-time scheduling for the loop thread (tracking design section 10): SCHED_FIFO at
@@ -214,6 +318,7 @@ impl Session {
                     return Ok(TickOutcome {
                         fault: self.fault.clone(),
                         clamped: false,
+                        record: None,
                     });
                 }
             }
@@ -228,7 +333,7 @@ impl Session {
             controller.update(&snapshot, dt)
         };
 
-        let (cmd, clamped) = match clamp_command(&raw_cmd, &cfg) {
+        let (mut cmd, clamped) = match clamp_command(&raw_cmd, &cfg) {
             Ok(x) => x,
             Err(e) => {
                 // A bad command from a controller is a fault, not a crash:
@@ -243,6 +348,7 @@ impl Session {
                     return Ok(TickOutcome {
                         fault: self.fault.clone(),
                         clamped: false,
+                        record: None,
                     });
                 }
                 let hold_cmd = self
@@ -265,6 +371,7 @@ impl Session {
                 return Ok(TickOutcome {
                     fault: self.fault.clone(),
                     clamped: false,
+                    record: None,
                 });
             }
             let hold_cmd = self
@@ -281,15 +388,24 @@ impl Session {
             // motors' last command until their CAN_TIMEOUT watchdog
             // fires, which is the safe direction.
             let _refused_again = self.send_mit_all(&hold_cmd)?;
+            cmd = hold_cmd;
         }
         // Drain this tick's own MIT replies now: a caller reading
         // `arm_state()` right after `tick()` returns must see the ACTUAL
         // (clamped) values just sent, not a stale cache.
         self.drain()?;
         self.tick += 1;
+        let record = TickRecord {
+            t: snapshot.t,
+            tick: self.tick,
+            motors: snapshot.motors,
+            sent: cmd,
+            clamped,
+        };
         Ok(TickOutcome {
             fault: self.fault.clone(),
             clamped,
+            record: Some(record),
         })
     }
 
@@ -401,6 +517,7 @@ impl Session {
             stop: AtomicBool::new(false),
             hold_now: AtomicBool::new(false),
             snapshot: Mutex::new(None),
+            ring: Mutex::new(TickRing::default()),
         });
         let sh = Arc::clone(&shared);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -418,6 +535,7 @@ impl Session {
             // A tick's snapshot that `try_lock` could not publish; the next tick replaces it,
             // and the blocking publish after the loop sends the last one.
             let mut unpublished = None;
+            let mut records = RingWriter::default();
             while !sh.stop.load(Ordering::Relaxed) {
                 if sh.hold_now.swap(false, Ordering::Relaxed) {
                     let mut hold = HoldController::from_config(self.config());
@@ -425,7 +543,10 @@ impl Session {
                     controller = Box::new(hold);
                 }
                 match self.tick(controller.as_mut()) {
-                    Ok(_) => {}
+                    Ok(outcome) => match outcome.record {
+                        Some(r) => records.record(r, &sh.ring),
+                        None => records.try_flush(&sh.ring),
+                    },
                     Err(e) => {
                         result = Err(e);
                         break;
@@ -464,6 +585,7 @@ impl Session {
                 // rather than repaying them as a burst of MIT frames.
                 next = next.max(Instant::now());
             }
+            records.flush_blocking(&sh.ring);
             if let Some(snap) = unpublished {
                 *sh.snapshot.lock().unwrap_or_else(|e| e.into_inner()) = Some(snap);
             }
@@ -494,6 +616,7 @@ pub struct LoopShared {
     stop: AtomicBool,
     hold_now: AtomicBool,
     snapshot: Mutex<Option<Snapshot>>,
+    ring: Mutex<TickRing<TickRecord>>,
 }
 
 #[derive(Debug, Clone)]
@@ -526,6 +649,17 @@ impl RunningArm {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// The records since the last drain, oldest first, and the number dropped since then
+    /// because the ring (`RING_TICKS`) was full. A nonzero count marks a gap in the records.
+    /// Poison-tolerant like `snapshot`.
+    pub fn drain(&self) -> (Vec<TickRecord>, u64) {
+        self.shared
+            .ring
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
     }
 
     /// True once the control thread has exited -- cleanly, by error, or by
@@ -621,6 +755,102 @@ mod tests {
         // About 44 ticks at 200 Hz; a loop blocked on the lock gets about 5.
         let ticks = running.snapshot().unwrap().arm.tick - before;
         assert!(ticks >= 20, "{ticks} ticks while a reader held the lock");
+        let (_, res) = running.stop_and_disable();
+        res.expect("clean stop");
+    }
+
+    fn sim_session() -> (ArmConfig, Session) {
+        let mut c = ArmConfig::maker_arm_v1();
+        c.inter_frame_us = 0;
+        let mut s = Session::connect(Box::new(SimArm::new(&c)), c.clone()).expect("connect");
+        s.enable().expect("enable");
+        (c, s)
+    }
+
+    /// Hold that keeps the state and the raw command of its last update.
+    struct Spy {
+        hold: HoldController,
+        seen: Option<(ArmState, ArmCommand)>,
+    }
+
+    impl Controller for Spy {
+        fn update(&mut self, state: &ArmState, dt: f64) -> ArmCommand {
+            let raw = self.hold.update(state, dt);
+            self.seen = Some((state.clone(), raw.clone()));
+            raw
+        }
+    }
+
+    #[test]
+    fn every_tick_leaves_one_record_with_the_clamped_command() {
+        let (c, mut s) = sim_session();
+        let mut spy = Spy {
+            hold: HoldController::from_config(&c),
+            seen: None,
+        };
+        for want in 1..=40u64 {
+            let out = s.tick(&mut spy).expect("tick");
+            let r = out.record.expect("a record per tick");
+            let (state, raw) = spy.seen.take().expect("the controller ran");
+            assert_eq!(r.tick, want);
+            assert_eq!(r.t, state.t);
+            assert_eq!(r.motors, state.motors);
+            let (sent, clamped) = clamp_command(&raw, &c).expect("clamp");
+            assert_eq!(r.sent, sent);
+            assert_eq!(r.clamped, clamped);
+        }
+    }
+
+    #[test]
+    fn a_full_ring_drops_the_oldest_and_counts_them() {
+        let ring = Mutex::new(TickRing::default());
+        let mut w = RingWriter::default();
+        for i in 0..RING_TICKS + 10 {
+            w.record(i, &ring);
+        }
+        let (got, dropped) = ring.lock().unwrap().take();
+        assert_eq!(got.len(), RING_TICKS);
+        assert_eq!(dropped, 10);
+        assert_eq!(got[0], 10);
+        assert_eq!(*got.last().unwrap(), RING_TICKS + 9);
+        // The count is per drain.
+        assert_eq!(ring.lock().unwrap().take(), (vec![], 0));
+    }
+
+    #[test]
+    fn a_reader_that_never_lets_go_is_counted_not_silent() {
+        let ring = Mutex::new(TickRing::default());
+        let mut w = RingWriter::default();
+        let held = ring.lock().unwrap();
+        for i in 0..RING_TICKS + 7 {
+            w.record(i, &ring);
+        }
+        drop(held);
+        w.try_flush(&ring);
+        let (got, dropped) = ring.lock().unwrap().take();
+        assert_eq!(got.len(), RING_TICKS);
+        assert_eq!(dropped, 7);
+        assert_eq!(got[0], 7);
+    }
+
+    #[test]
+    fn a_reader_holding_the_ring_lock_does_not_stall_the_loop() {
+        let (c, s) = sim_session();
+        let running = s
+            .start(Box::new(HoldController::from_config(&c)), None)
+            .expect("start");
+        std::thread::sleep(Duration::from_millis(50));
+        let _ = running.drain();
+        {
+            let _reader = running.shared.ring.lock().unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        let (records, dropped) = running.drain();
+        // About 24 ticks at 200 Hz; a loop blocked on the lock gets about 5.
+        assert!(records.len() >= 15, "{} records", records.len());
+        assert_eq!(dropped, 0);
+        assert!(records.windows(2).all(|w| w[1].tick == w[0].tick + 1));
         let (_, res) = running.stop_and_disable();
         res.expect("clean stop");
     }

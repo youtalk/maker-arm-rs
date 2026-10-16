@@ -207,6 +207,22 @@ impl Tracking {
         self.live_now().ok().flatten()
     }
 
+    /// The telemetry of every tick since the last drain as columns, oldest first: `tick_t`,
+    /// `gate`, and `r`, `offset`, `q_r` and `tau_ff` as one six-wide list per tick. `dropped`
+    /// counts the ticks lost since the last drain because the ring held only 4000.
+    fn drain(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let (rows, dropped) = self.shared.drain();
+        let d = PyDict::new(py);
+        d.set_item("tick_t", rows.iter().map(|t| t.tick_t).collect::<Vec<_>>())?;
+        d.set_item("r", rows.iter().map(|t| t.r).collect::<Vec<_>>())?;
+        d.set_item("gate", rows.iter().map(|t| t.gate).collect::<Vec<_>>())?;
+        d.set_item("offset", rows.iter().map(|t| t.offset).collect::<Vec<_>>())?;
+        d.set_item("q_r", rows.iter().map(|t| t.q_r).collect::<Vec<_>>())?;
+        d.set_item("tau_ff", rows.iter().map(|t| t.tau_ff).collect::<Vec<_>>())?;
+        d.set_item("dropped", dropped)?;
+        Ok(d.into())
+    }
+
     fn telemetry(&self, py: Python<'_>) -> PyResult<Option<Py<PyDict>>> {
         let Some(t) = self.shared.telemetry() else {
             return Ok(None);

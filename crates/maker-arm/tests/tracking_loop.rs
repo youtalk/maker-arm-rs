@@ -1,6 +1,6 @@
 use maker_arm::dynamics::{Body, Dynamics, Friction};
 use maker_arm::kinematics::Link;
-use maker_arm::tracking::{Push, TrackingController, TrackingParams, ROW};
+use maker_arm::tracking::{Push, TrackingController, TrackingParams, RING_TICKS, ROW};
 use maker_arm::{ArmConfig, FaultReason, Session, SessionState, SimArm};
 
 fn fast(mut c: ArmConfig) -> ArmConfig {
@@ -81,4 +81,40 @@ fn a_non_finite_model_output_ends_in_the_fault_hold() {
         "a 1e300 plan must overflow the model into a non-finite command"
     );
     assert_eq!(s.state(), SessionState::Fault);
+}
+
+#[test]
+fn a_tracking_loop_drains_one_telemetry_per_tick_matching_the_loop_records() {
+    let c = fast(ArmConfig::maker_arm_v1());
+    let s = enabled_session(&c);
+    let ctrl = TrackingController::new(model(), TrackingParams::default(), &c).unwrap();
+    let shared = ctrl.shared();
+    let running = s.start(Box::new(ctrl), None).expect("start");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let (records, rec_dropped) = running.drain();
+    let (telemetry, tel_dropped) = shared.drain();
+    let (_, res) = running.stop_and_disable();
+    res.expect("clean stop");
+    assert_eq!((rec_dropped, tel_dropped), (0, 0));
+    assert!(records.len() >= 20, "{} ticks", records.len());
+    // The telemetry drain ran a moment later, so it may hold a tick or two more.
+    assert!(telemetry.len() >= records.len());
+    for (r, t) in records.iter().zip(&telemetry) {
+        assert_eq!(t.tick_t, r.t);
+    }
+}
+
+#[test]
+fn a_full_tracking_ring_counts_what_it_dropped() {
+    let c = fast(ArmConfig::maker_arm_v1());
+    let mut s = enabled_session(&c);
+    let mut ctrl = TrackingController::new(model(), TrackingParams::default(), &c).unwrap();
+    let shared = ctrl.shared();
+    for _ in 0..RING_TICKS + 25 {
+        s.tick(&mut ctrl).expect("tick");
+    }
+    let (telemetry, dropped) = shared.drain();
+    assert_eq!(telemetry.len(), RING_TICKS);
+    assert_eq!(dropped, 25);
+    assert_eq!(shared.drain().1, 0);
 }

@@ -558,3 +558,46 @@ def test_start_tracking_refuses_rung_f():
     assert a.state() == "enabled" and a.snapshot() is None
     assert len(tr.update(0.0, [0.0] * 7, [0.0] * 7, [0.0] * 7)) == 7  # still usable
     a.stop()
+
+
+# --- The telemetry ring: every tick's state and sent command, drained from Python ------
+
+
+def test_drain_returns_the_ticks_since_the_last_drain():
+    arm = m.Arm.sim()
+    arm.enable()
+    arm.start_hold()
+    time.sleep(0.25)
+    d = arm.drain()
+    assert 40 <= len(d["t"]) <= 60 and len(d["q"][0]) == 7 and d["dropped"] == 0
+    for col in ("q", "dq", "tau", "temp", "fault_bits", "feedback_age"):
+        assert len(d[col]) == len(d["t"]) and len(d[col][0]) == 7
+    for col in ("cmd_pos", "cmd_vel", "cmd_kp", "cmd_kd", "cmd_tau"):
+        assert len(d[col]) == len(d["t"]) and len(d[col][0]) == 7
+    assert len(d["tick"]) == len(d["clamped"]) == len(d["t"])
+    assert d["tick"] == list(range(d["tick"][0], d["tick"][0] + len(d["tick"])))
+    assert arm.drain()["t"][0] > d["t"][-1]
+    arm.stop()
+
+
+def test_drain_is_none_without_a_loop():
+    arm = m.Arm.sim()
+    arm.enable()
+    assert arm.drain() is None
+
+
+def test_tracking_drain_gives_one_row_per_tick_and_counts_the_drops():
+    a = m.Arm.sim()
+    a.enable()
+    tr = m.Tracking(_planar_dynamics())
+    a.start_tracking(tr)
+    time.sleep(0.25)
+    loop = a.drain()
+    d = tr.drain()
+    a.stop()
+    assert d["dropped"] == 0 and len(d["tick_t"]) >= len(loop["t"]) > 20
+    assert d["tick_t"][: len(loop["t"])] == loop["t"]
+    for col in ("r", "offset", "q_r", "tau_ff"):
+        assert len(d[col]) == len(d["tick_t"]) and len(d[col][0]) == 6
+    assert len(d["gate"]) == len(d["tick_t"])
+    assert tr.drain()["tick_t"] == []

@@ -442,6 +442,60 @@ impl Arm {
         Ok(Some(d.into()))
     }
 
+    /// The ticks since the last drain as columns, oldest first, or None if no loop is running.
+    ///
+    /// `t`, `tick` and `clamped` hold one entry per tick. `q`, `dq`, `tau`, `temp`,
+    /// `fault_bits` and `feedback_age` are what the controller read, and `cmd_pos`, `cmd_vel`,
+    /// `cmd_kp`, `cmd_kd` and `cmd_tau` are the command that went out after the clamp; each of
+    /// those holds one list per tick, seven wide. `dropped` counts the ticks lost since the
+    /// last drain because the ring held only 4000: a nonzero value marks a gap, never a
+    /// silent one. Works after the loop died, so the last ticks before a fault stay readable.
+    fn drain(&self, py: Python<'_>) -> PyResult<Option<Py<PyDict>>> {
+        let ArmHandle::Running(r) = &self.handle else {
+            return Ok(None);
+        };
+        let (records, dropped) = r.drain();
+        let d = PyDict::new(py);
+        d.set_item("t", records.iter().map(|r| r.t).collect::<Vec<_>>())?;
+        d.set_item("tick", records.iter().map(|r| r.tick).collect::<Vec<_>>())?;
+        d.set_item(
+            "clamped",
+            records.iter().map(|r| r.clamped).collect::<Vec<_>>(),
+        )?;
+        let motor = |f: &dyn Fn(&maker_arm::MotorState) -> f64| -> Vec<Vec<f64>> {
+            records
+                .iter()
+                .map(|r| r.motors.iter().map(f).collect())
+                .collect()
+        };
+        d.set_item("q", motor(&|m| m.position))?;
+        d.set_item("dq", motor(&|m| m.velocity))?;
+        d.set_item("tau", motor(&|m| m.torque))?;
+        d.set_item("temp", motor(&|m| m.temperature))?;
+        d.set_item(
+            "fault_bits",
+            // as u16: a Vec<u8> would convert to Python bytes, not a list
+            records
+                .iter()
+                .map(|r| r.motors.iter().map(|m| m.fault_bits as u16).collect())
+                .collect::<Vec<Vec<u16>>>(),
+        )?;
+        d.set_item("feedback_age", motor(&|m| m.feedback_age))?;
+        let sent = |f: &dyn Fn(&maker_arm::JointCommand) -> f64| -> Vec<Vec<f64>> {
+            records
+                .iter()
+                .map(|r| r.sent.iter().map(f).collect())
+                .collect()
+        };
+        d.set_item("cmd_pos", sent(&|c| c.pos))?;
+        d.set_item("cmd_vel", sent(&|c| c.vel))?;
+        d.set_item("cmd_kp", sent(&|c| c.kp))?;
+        d.set_item("cmd_kd", sent(&|c| c.kd))?;
+        d.set_item("cmd_tau", sent(&|c| c.tau))?;
+        d.set_item("dropped", dropped)?;
+        Ok(Some(d.into()))
+    }
+
     /// Disable all motors; joins the loop if one is running.
     fn stop(&mut self) -> PyResult<()> {
         match std::mem::replace(&mut self.handle, ArmHandle::Empty) {
