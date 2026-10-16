@@ -254,3 +254,24 @@ fn a_second_daemon_on_the_same_socket_exits_1() {
     // The probe was no command client, so the first daemon still runs.
     d.connect(Role::Monitor).poll();
 }
+
+#[test]
+fn a_second_daemon_on_a_held_bus_exits_1_before_it_opens_the_bus() {
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::{SocketAddr, UnixListener};
+    // No vcan device of this name exists: a daemon that opened the bus first would fail with
+    // "open <iface>" instead of naming the lock.
+    let iface = format!("vcan{}", std::process::id());
+    let name = format!("maker-arm-bus-{iface}");
+    let addr = SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+    let _held = UnixListener::bind_addr(&addr).unwrap();
+    let dir = scratch_dir();
+    let mut c = std::process::Command::new(common::BIN);
+    c.args(["serve", "--interface", &iface, "--socket"])
+        .arg(dir.join("s.sock"))
+        .args(["--dynamics", common::DYNAMICS]);
+    let (status, _, err) = run_to_exit(c);
+    assert_eq!(status.code(), Some(1));
+    assert!(err.contains(&name) && !err.contains("open "), "{err}");
+    let _ = std::fs::remove_dir_all(dir);
+}

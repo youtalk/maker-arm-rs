@@ -9,8 +9,9 @@ use maker_arm::{ArmConfig, FaultReason, LoopRt, RunningArm, Session, SimArm};
 use maker_arm_cli::files::{self, GripMap, Loaded, ServeOptions};
 use maker_arm_cli::wire::{self, ClientFrame, Mode, Op, Role, StateFrame, WireError};
 use maker_arm_transport::CanBackend;
-use std::io::Write;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::io::{ErrorKind, Write};
+use std::os::linux::net::SocketAddrExt;
+use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -31,6 +32,8 @@ const RT: LoopRt = LoopRt {
 };
 /// The accept loop's period: how late a signal, a disconnect or a fault is acted on.
 const TICK: Duration = Duration::from_millis(10);
+/// The first tick must publish a pose and start the tracking clock within this: 200 ticks.
+const FIRST_TICK: Duration = Duration::from_secs(1);
 
 /// Set by the SIGINT/SIGTERM handler, read by the accept loop.
 static SIGNALED: AtomicBool = AtomicBool::new(false);
@@ -342,6 +345,58 @@ fn socket_path(o: &ServeOptions) -> PathBuf {
     }
 }
 
+/// Holds the abstract socket `maker-arm-bus-<interface>` while it lives, so a second daemon
+/// never opens a bus that one drives: its `RunningArm` drop would disable the first one's
+/// motors. The kernel frees the name when the process dies. `sim` needs no lock, because each
+/// daemon has its own `SimArm`.
+fn bus_lock(interface: &str) -> Result<Option<UnixListener>, String> {
+    if interface == "sim" {
+        return Ok(None);
+    }
+    let name = format!("maker-arm-bus-{interface}");
+    SocketAddr::from_abstract_name(name.as_bytes())
+        .and_then(|a| UnixListener::bind_addr(&a))
+        .map(Some)
+        .map_err(|e| match e.kind() {
+            ErrorKind::AddrInUse => {
+                format!("another daemon already drives {interface}: it holds the lock @{name}")
+            }
+            _ => format!("lock @{name} for {interface}: {e}"),
+        })
+}
+
+/// Waits for the first tick's pose and tracking clock, which Activate needs. A signal, a
+/// stopped loop, a fault or `timeout` ends the wait with an error. Only the controller starts
+/// the clock, and a fault hold never calls it, so a first-tick fault would wait forever.
+fn first_tick(
+    arm: &RunningArm,
+    shared: &TrackingShared,
+    signaled: &AtomicBool,
+    timeout: Duration,
+) -> Result<(), String> {
+    let end = Instant::now() + timeout;
+    loop {
+        if signaled.load(Ordering::Relaxed) {
+            return Err("interrupted before the first tick".into());
+        }
+        if arm.loop_finished() {
+            return Err("the control loop stopped before its first tick".into());
+        }
+        if let Some(snap) = arm.snapshot() {
+            if let Some(f) = snap.fault {
+                return Err(format!("fault at the first tick: {f}"));
+            }
+            if shared.clock().is_some() {
+                return Ok(());
+            }
+        }
+        if Instant::now() >= end {
+            return Err(format!("no first tick within {timeout:?}"));
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 /// Ends a virtual daemon: stop the loop, disable, exit 0. Only `exit_with_client` reaches it.
 fn finish(d: &Daemon, socket: &Path, why: &str) -> ! {
     let arm = d.lock().arm.take();
@@ -369,6 +424,8 @@ pub fn run(o: &ServeOptions, check: bool) -> Result<(), String> {
         return Ok(());
     }
     let socket = socket_path(o);
+    // Before the socket file and the bus: a refused daemon touches neither. Held to exit.
+    let _bus = bus_lock(&o.interface)?;
     if UnixStream::connect(&socket).is_ok() {
         return Err(format!("a daemon already runs on {}", socket.display()));
     }
@@ -410,15 +467,9 @@ pub fn run(o: &ServeOptions, check: bool) -> Result<(), String> {
             return Err(format!("--rt: {}", e.error));
         }
     };
-    // Activate needs the first tick's pose and clock.
-    while arm.snapshot().is_none() || shared.clock().is_none() {
-        if arm.loop_finished() {
-            return Err("the control loop stopped before its first tick".into());
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    // A failure here comes before any client: dropping `arm` releases it as it was before
-    // the start.
+    // A failure from here to the bind comes before any client: dropping `arm` disables it,
+    // as it was a moment before the start.
+    first_tick(&arm, &shared, &SIGNALED, FIRST_TICK)?;
     let listener = UnixListener::bind(&socket)
         .and_then(|l| l.set_nonblocking(true).map(|()| l))
         .map_err(|e| format!("bind {}: {e}", socket.display()))?;
@@ -502,5 +553,69 @@ pub fn run(o: &ServeOptions, check: bool) -> Result<(), String> {
             drop(st);
             finish(&d, &socket, why);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use maker_arm::tracking::TrackingParams;
+
+    /// A tracking loop on a sim arm, with `hook` applied to the sim before enable.
+    fn started(hook: impl FnOnce(&mut SimArm)) -> (RunningArm, Arc<TrackingShared>) {
+        let c = ArmConfig::maker_arm_v1();
+        let mut s = Session::connect(Box::new(SimArm::new(&c)), c.clone()).unwrap();
+        hook(s.backend_as_sim().unwrap());
+        s.enable().unwrap();
+        let v = serde_json::from_str(include_str!("../tests/fixtures/dynamics_test.json"));
+        let (model, _) = files::dynamics_from_json(&v.unwrap()).unwrap();
+        let ctrl = TrackingController::new(model, TrackingParams::default(), &c, None).unwrap();
+        let shared = ctrl.shared();
+        (s.start(Box::new(ctrl), None).unwrap(), shared)
+    }
+
+    #[test]
+    fn the_first_tick_wait_returns_once_the_clock_runs() {
+        let (arm, shared) = started(|_| {});
+        let quiet = AtomicBool::new(false);
+        first_tick(&arm, &shared, &quiet, Duration::from_secs(1)).unwrap();
+        assert!(shared.clock().is_some());
+    }
+
+    #[test]
+    fn a_fault_at_the_first_tick_ends_the_wait_with_its_reason() {
+        // Enable checks no temperature. The first tick's health check does, and the fault hold
+        // never calls the controller, so the tracking clock never starts.
+        let (arm, shared) = started(|sim| sim.set_temperature(3, 80.0));
+        let quiet = AtomicBool::new(false);
+        let t = Instant::now();
+        let e = first_tick(&arm, &shared, &quiet, Duration::from_secs(5)).unwrap_err();
+        assert!(e.contains("over temperature"), "{e}");
+        assert!(t.elapsed() < Duration::from_secs(1));
+        assert!(shared.clock().is_none());
+    }
+
+    #[test]
+    fn a_signal_ends_the_first_tick_wait() {
+        let (arm, shared) = started(|sim| sim.set_temperature(3, 80.0));
+        let e = first_tick(
+            &arm,
+            &shared,
+            &AtomicBool::new(true),
+            Duration::from_secs(5),
+        );
+        assert!(e.unwrap_err().contains("interrupted"));
+    }
+
+    #[test]
+    fn the_bus_lock_is_exclusive_and_freed_on_drop() {
+        let iface = format!("vcan-unit{}", std::process::id());
+        let held = bus_lock(&iface).unwrap();
+        assert!(held.is_some());
+        let e = bus_lock(&iface).unwrap_err();
+        assert!(e.contains(&iface), "{e}");
+        drop(held);
+        assert!(bus_lock(&iface).unwrap().is_some());
+        assert!(bus_lock("sim").unwrap().is_none());
     }
 }
