@@ -165,6 +165,7 @@ pub(crate) fn config_from_dict(profile: &Bound<'_, PyDict>) -> PyResult<ArmConfi
 /// +1 and `|offset| <= pi`. Every number must be finite. The error is a ValueError that names
 /// the field (for example `joints[1].tau_max`); callers run this before any connection opens.
 pub(crate) fn reduced_config(profile: &Bound<'_, PyDict>) -> PyResult<ArmConfig> {
+    check_known_keys(profile)?;
     let c = config_from_dict(profile)?;
     let v1 = ArmConfig::maker_arm_v1();
     let bad = |field: String, why: String| PyValueError::new_err(format!("{field}: {why}"));
@@ -251,6 +252,10 @@ pub(crate) fn reduced_config(profile: &Bound<'_, PyDict>) -> PyResult<ArmConfig>
         ("limit_margin", c.limit_margin, v1.limit_margin),
     ] {
         finite(name.into(), x)?;
+        if name != "limit_margin" && x < 0.0 {
+            // f64::clamp(0.0, kp_max) panics in the control thread when the bound is negative.
+            return Err(bad(name.into(), format!("{x} is negative")));
+        }
         if name == "limit_margin" {
             if x < v {
                 return Err(bad(
@@ -262,7 +267,110 @@ pub(crate) fn reduced_config(profile: &Bound<'_, PyDict>) -> PyResult<ArmConfig>
             at_most(name.into(), x, v)?;
         }
     }
+    // The clamp narrows each joint to [q_lo + m, q_hi - m]; an empty band would panic it.
+    for (i, j) in c.joints.iter().enumerate() {
+        if j.q_hi - j.q_lo <= 2.0 * c.limit_margin {
+            return Err(bad(
+                "limit_margin".into(),
+                format!(
+                    "{} leaves no range on joints[{i}] ([{}, {}])",
+                    c.limit_margin, j.q_lo, j.q_hi
+                ),
+            ));
+        }
+    }
     Ok(c)
+}
+
+/// Session path only: refuse a key `profile()` does not emit (a typo would otherwise be a
+/// silent no-op) and a key that cannot be overridden (motor_id, name, model, control_rate_hz,
+/// feedback_timeout, temp_hold_c) unless it still carries the v1 value.
+fn check_known_keys(profile: &Bound<'_, PyDict>) -> PyResult<()> {
+    const TOP: [&str; 7] = [
+        "max_velocity",
+        "kp_max",
+        "kd_max",
+        "limit_margin",
+        "control_rate_hz",
+        "feedback_timeout",
+        "temp_hold_c",
+    ];
+    const JOINT: [&str; 9] = [
+        "kp",
+        "kd",
+        "tau_max",
+        "q_lo",
+        "q_hi",
+        "direction",
+        "offset",
+        "motor_id",
+        "name",
+    ];
+    // "model" is a passthrough as well.
+    let py = profile.py();
+    let v1 = config_to_dict(py, &ArmConfig::maker_arm_v1())?;
+    let v1 = v1.bind(py);
+    let overridable = [
+        "max_velocity",
+        "kp_max",
+        "kd_max",
+        "limit_margin",
+        "kp",
+        "kd",
+        "tau_max",
+        "q_lo",
+        "q_hi",
+        "direction",
+        "offset",
+    ];
+    let check = |field: String, key: &str, value: Bound<'_, PyAny>, base: &Bound<'_, PyDict>| {
+        if overridable.contains(&key) {
+            return Ok(());
+        }
+        let same = match base.get_item(key)? {
+            Some(b) => value.eq(b)?,
+            None => false,
+        };
+        if same {
+            Ok(())
+        } else {
+            Err(PyValueError::new_err(format!(
+                "{field}: cannot be changed from the maker_arm_v1 value"
+            )))
+        }
+    };
+    for (k, v) in profile.iter() {
+        let key: String = k
+            .extract()
+            .map_err(|_| PyValueError::new_err("profile keys must be strings"))?;
+        if key == "joints" {
+            let joints = v.downcast::<pyo3::types::PyList>()?;
+            let v1_joints = v1
+                .get_item("joints")?
+                .ok_or_else(|| PyValueError::new_err("v1 profile has no joints"))?;
+            let v1_joints = v1_joints.downcast::<pyo3::types::PyList>()?;
+            for (i, (item, base)) in joints.iter().zip(v1_joints.iter()).enumerate() {
+                let d = item.downcast::<PyDict>()?;
+                let base = base.downcast::<PyDict>()?;
+                for (jk, jv) in d.iter() {
+                    let jkey: String = jk.extract().map_err(|_| {
+                        PyValueError::new_err(format!("joints[{i}]: keys must be strings"))
+                    })?;
+                    if !JOINT.contains(&jkey.as_str()) && jkey != "model" {
+                        return Err(PyValueError::new_err(format!(
+                            "joints[{i}].{jkey}: unknown field"
+                        )));
+                    }
+                    check(format!("joints[{i}].{jkey}"), &jkey, jv, base)?;
+                }
+            }
+        } else if TOP.contains(&key.as_str()) {
+            check(key.clone(), &key, v, v1)?;
+        } else {
+            return Err(PyValueError::new_err(format!("{key}: unknown field")));
+        }
+    }
+    Ok(())
 }
 
 /// The single-point command clamp, as a pure function. `cmds` is a list of

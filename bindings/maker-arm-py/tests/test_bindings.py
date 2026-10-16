@@ -628,7 +628,7 @@ def test_a_reduced_cap_reaches_the_clamp():
     assert max(abs(t) for t in capped) > 2.9
 
 
-def test_a_reduced_cap_reaches_hold_and_the_clamp_function_is_unchanged():
+def test_clamp_command_applies_a_reduced_tau_max_override():
     p = m.profile()
     p["joints"][1]["tau_max"] = 3.0
     out, clamped = m.clamp_command([(0.0, 0.0, 0.0, 0.0, 9.0)] * 7, p)
@@ -651,12 +651,21 @@ def test_a_reduced_cap_reaches_hold_and_the_clamp_function_is_unchanged():
         (lambda p: p["joints"][1].update(tau_max=float("inf")), "joints[1].tau_max"),
         (lambda p: p["joints"][1].update(kp=float("nan")), "joints[1].kp"),
         (lambda p: p.update(max_velocity=float("nan")), "max_velocity"),
+        (lambda p: p.update(kp_max=-1.0), "kp_max"),
+        (lambda p: p.update(kd_max=-1.0), "kd_max"),
+        (lambda p: p.update(limit_margin=5.0), "limit_margin"),
+        (lambda p: p["joints"][1].update(tau_mx=3.0), "tau_mx"),
+        (lambda p: p.update(max_velcity=1.0), "max_velcity"),
+        (lambda p: p.update(control_rate_hz=100.0), "control_rate_hz"),
+        (lambda p: p.update(feedback_timeout=p["feedback_timeout"] * 2), "feedback_timeout"),
+        (lambda p: p["joints"][0].update(motor_id=9), r"joints\[0\].motor_id"),
+        (lambda p: p["joints"][0].update(model="RS02"), "model"),
     ],
 )
 def test_a_raised_or_non_finite_value_is_refused_before_connect(edit, field):
     p = m.profile()
     edit(p)
-    with pytest.raises(ValueError, match=field.replace("[", r"\[").replace("]", r"\]")):
+    with pytest.raises(ValueError, match=field if "\\" in field else field.replace("[", r"\[").replace("]", r"\]")):
         m.Arm.sim(profile=p)
 
 
