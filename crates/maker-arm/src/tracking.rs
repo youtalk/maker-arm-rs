@@ -1987,33 +1987,17 @@ mod tests {
         let on = pin_digest(contact(0.5));
         let free_d = pin_digest(free());
         let dob = pin_digest_with(p, None);
-        match PIN.iter().find(|p| p.0 == std::env::consts::ARCH) {
-            Some(&(_, want_on, want_free)) => {
-                assert_eq!(on, want_on, "contact: {on:#018x}");
-                assert_eq!(free_d, want_free, "rung F: {free_d:#018x}");
-            }
-            None => {
-                // with_dob_off_the_commands_are_mains fails under CI for a missing entry.
-                println!("no pin for {}", std::env::consts::ARCH)
-            }
-        }
-        match PIN_DOB.iter().find(|p| p.0 == std::env::consts::ARCH) {
-            Some(&(_, want)) => assert_eq!(dob, want, "dob on: {dob:#018x}"),
-            None => {
-                let msg = format!("no dob pin for {}: {dob:#018x}", std::env::consts::ARCH);
-                assert!(std::env::var_os("CI").is_none(), "{msg}");
-                println!("{msg}");
-            }
-        }
+        assert_eq!(on, PIN.0, "contact: {on:#018x}");
+        assert_eq!(free_d, PIN.1, "rung F: {free_d:#018x}");
+        assert_eq!(dob, PIN_DOB, "dob on: {dob:#018x}");
         // A residual changes them, so the digest does see it.
         let r = crate::residual::tests::constant(2, [0.01; 6], 1.0);
         assert_ne!(pin_digest_with(contact(0.5), Some(r)), on);
     }
 
-    /// `pin_digest` of `contact(0.5)` with `dob` on, on c8626ef (task 4's head), per
-    /// architecture.
-    // TODO: add the x86_64 (ubuntu-latest) digest from the first CI log.
-    const PIN_DOB: &[(&str, u64)] = &[("aarch64", 0x004477863f471ee4)];
+    /// `pin_digest` of `contact(0.5)` with `dob` on, on c8626ef (task 4's head). Like `PIN`, it
+    /// is checked on every architecture (aarch64 and x86_64 CI).
+    const PIN_DOB: u64 = 0x004477863f471ee4;
 
     #[test]
     fn with_dob_off_the_compensation_reads_zero() {
