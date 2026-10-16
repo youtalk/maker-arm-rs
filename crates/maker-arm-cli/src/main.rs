@@ -40,6 +40,22 @@ enum Command {
     },
     /// Connect, enable, and hold the current pose until a typed RELEASE
     Hold,
+    /// Ask a running serve daemon to disable the motors, after a typed RELEASE
+    Release {
+        #[arg(long)]
+        interface: String,
+        /// Default: $XDG_RUNTIME_DIR/maker-arm-<interface>.sock
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+    /// Print one STATUS line from a running serve daemon
+    Status {
+        #[arg(long)]
+        interface: String,
+        /// Default: $XDG_RUNTIME_DIR/maker-arm-<interface>.sock
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
     /// Own the arm as a daemon for ROS 2: track a client's targets over a Unix socket, and
     /// hold when the client stops
     Serve {
@@ -131,6 +147,15 @@ fn main() -> Result<(), String> {
             persist,
         };
         return serve::run(&o, check);
+    }
+    match &cli.command {
+        Command::Release { interface, socket } => {
+            return serve::release(interface, socket.as_deref());
+        }
+        Command::Status { interface, socket } => {
+            return serve::status(interface, socket.as_deref());
+        }
+        _ => {}
     }
     let config = ArmConfig::maker_arm_v1();
     let mut backend = open_backend(&cli, &config)?;
@@ -270,7 +295,9 @@ fn main() -> Result<(), String> {
             res.map_err(|e| e.to_string())?;
             let _ = writeln!(std::io::stdout(), "torque released.");
         }
-        Command::Serve { .. } => unreachable!("handled above"),
+        Command::Serve { .. } | Command::Release { .. } | Command::Status { .. } => {
+            unreachable!("handled above")
+        }
     }
     Ok(())
 }

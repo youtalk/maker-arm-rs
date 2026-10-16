@@ -275,3 +275,100 @@ fn a_second_daemon_on_a_held_bus_exits_1_before_it_opens_the_bus() {
     assert!(err.contains(&name) && !err.contains("open "), "{err}");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Runs `maker-arm-cli <sub>` against `socket` with `stdin` typed in.
+fn client_cli(sub: &str, socket: &std::path::Path, stdin: &str) -> (Option<i32>, String, String) {
+    use std::io::Write;
+    let mut c = std::process::Command::new(common::BIN);
+    c.args([sub, "--interface", "sim", "--socket"])
+        .arg(socket)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = c.spawn().unwrap();
+    let mut pipe = child.stdin.take().unwrap();
+    pipe.write_all(stdin.as_bytes()).unwrap();
+    // Keep the pipe open: EOF would make confirm_release retry, which is not under test.
+    let out = child.wait_with_output().unwrap();
+    drop(pipe);
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn release_needs_the_typed_word_and_then_disables_and_exits() {
+    let mut d = Daemon::start(&["--persist"]);
+    let (mut c, _) = activated(&d);
+    let (code, out, err) = client_cli("release", &d.socket, "no\nRELEASE\n");
+    assert_eq!(code, Some(0), "{out}{err}");
+    assert!(out.contains("torque remains enabled"), "{out}");
+    assert!(out.contains("torque released."), "{out}");
+    let status = d.exit_within(Duration::from_secs(2)).expect("exits");
+    assert_eq!(status.code(), Some(0));
+    assert!(d
+        .line("SERVE_EXIT released", Duration::from_secs(1))
+        .is_some());
+    assert!(!d.socket.exists());
+    assert!(c.control(Op::Poll).is_err(), "the Command client reads EOF");
+}
+
+#[test]
+fn release_without_the_word_leaves_the_arm_holding() {
+    // Without the typed word, nothing is sent: stdin ends after a wrong line, the process
+    // is killed by the harness timeout, and the daemon still holds.
+    let d = Daemon::start(&["--persist"]);
+    let mut c = std::process::Command::new(common::BIN);
+    c.args(["release", "--interface", "sim", "--socket"])
+        .arg(&d.socket)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut child = c.spawn().unwrap();
+    {
+        use std::io::Write;
+        let mut p = child.stdin.take().unwrap();
+        p.write_all(b"no\n").unwrap();
+        sleep_ms(300);
+        child.kill().unwrap();
+    }
+    let _ = child.wait();
+    assert_eq!(d.connect(Role::Monitor).poll().mode, Mode::Holding);
+}
+
+#[test]
+fn release_without_a_daemon_names_the_socket() {
+    let dir = scratch_dir();
+    let socket = dir.join("none.sock");
+    let (code, _, err) = client_cli("release", &socket, "RELEASE\n");
+    assert_eq!(code, Some(1));
+    assert!(err.contains(&socket.display().to_string()), "{err}");
+    let (code, _, err) = client_cli("status", &socket, "");
+    assert_eq!(code, Some(1));
+    assert!(err.contains(&socket.display().to_string()), "{err}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn status_prints_one_status_line() {
+    let d = Daemon::start(&[]);
+    let (code, out, err) = client_cli("status", &d.socket, "");
+    assert_eq!(code, Some(0), "{err}");
+    let line = out.trim_end();
+    assert_eq!(line.lines().count(), 1, "{out}");
+    let json = line.strip_prefix("STATUS ").expect("STATUS prefix");
+    let v: serde_json::Value = serde_json::from_str(json).unwrap();
+    assert_eq!(v["mode"], "holding");
+    assert_eq!(v["q"].as_array().unwrap().len(), 7);
+    assert_eq!(
+        (v["clamped"].as_u64(), v["refused"].as_u64()),
+        (Some(0), Some(0))
+    );
+    assert_eq!(v["fault"].as_u64(), Some(0));
+    assert!(v["t"].as_f64().is_some());
+    assert_eq!(v["digest"].as_str().unwrap().len(), 16);
+    // A status poll is a Monitor: the daemon still runs.
+    d.connect(Role::Monitor).poll();
+}

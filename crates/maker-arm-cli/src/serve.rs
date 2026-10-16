@@ -89,6 +89,7 @@ struct Daemon {
     digest: u64,
     /// A virtual interface without `--persist`.
     exit_with_client: bool,
+    socket: PathBuf,
 }
 
 /// Holds the command slot. Its drop, also on a panic, frees the slot and holds the arm.
@@ -270,6 +271,23 @@ impl Daemon {
         s
     }
 
+    /// The one way to drop torque on a real interface. Holds the lock to the exit, so no
+    /// other client sees the arm gone. The reply goes out only after the motors are disabled.
+    fn release(&self, stream: &mut UnixStream, seq: u32) -> ! {
+        let mut st = self.lock();
+        st.mode = Mode::Released;
+        let frame = self.state_frame(&st, seq);
+        if let Some(arm) = st.arm.take() {
+            if let (_, Err(e)) = arm.stop_and_disable() {
+                log(&format!("disable: {e}"));
+            }
+        }
+        let _ = stream.write_all(&wire::encode_state(&frame));
+        let _ = std::fs::remove_file(&self.socket);
+        say("SERVE_EXIT released");
+        std::process::exit(0);
+    }
+
     fn serve(&self, mut stream: UnixStream) {
         let role = match wire::read_client(&mut stream) {
             Ok(ClientFrame::Hello(role)) => role,
@@ -293,10 +311,7 @@ impl Daemon {
                 }
             },
             Role::Monitor => None,
-            Role::Release => {
-                log("closed a release client: this daemon cannot release yet");
-                return;
-            }
+            Role::Release => None,
         };
         loop {
             let f = match wire::read_client(&mut stream) {
@@ -307,6 +322,16 @@ impl Daemon {
                     return;
                 }
             };
+            if let (
+                Role::Release,
+                ClientFrame::Control {
+                    seq,
+                    op: Op::Release,
+                },
+            ) = (role, f)
+            {
+                self.release(&mut stream, seq);
+            }
             let Some(state) = self.handle(role, f) else {
                 log(&format!("closed a {role:?} client that sent {f:?}"));
                 return;
@@ -332,12 +357,14 @@ fn open(interface: &str, config: &ArmConfig) -> Result<Box<dyn CanBackend>, Stri
     Err(format!("{interface}: built without the socketcan feature"))
 }
 
-fn socket_path(o: &ServeOptions) -> PathBuf {
-    if let Some(s) = &o.socket {
-        return s.clone();
+/// `--socket`, else `$XDG_RUNTIME_DIR/maker-arm-<interface>.sock`. Shared by the daemon,
+/// `release` and `status`.
+pub fn socket_path(interface: &str, socket: Option<&Path>) -> PathBuf {
+    if let Some(s) = socket {
+        return s.to_path_buf();
     }
     match std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty()) {
-        Some(d) => PathBuf::from(d).join(format!("maker-arm-{}.sock", o.interface)),
+        Some(d) => PathBuf::from(d).join(format!("maker-arm-{interface}.sock")),
         None => {
             log("serve: XDG_RUNTIME_DIR is not set; pass --socket PATH");
             std::process::exit(2);
@@ -410,6 +437,70 @@ fn finish(d: &Daemon, socket: &Path, why: &str) -> ! {
     std::process::exit(0);
 }
 
+fn mode_name(m: Mode) -> &'static str {
+    match m {
+        Mode::Holding => "holding",
+        Mode::Following => "following",
+        Mode::Refused => "refused",
+        Mode::Fault => "fault",
+        Mode::Released => "released",
+    }
+}
+
+/// Connects as `role` and sends the Hello. Without a daemon the error names the socket.
+fn connect(socket: &Path, role: Role) -> Result<UnixStream, String> {
+    let mut s = UnixStream::connect(socket)
+        .map_err(|e| format!("no daemon on {}: {e}", socket.display()))?;
+    s.set_read_timeout(Some(Duration::from_secs(10)))
+        .map_err(|e| e.to_string())?;
+    s.write_all(&wire::encode_client(&ClientFrame::Hello(role)))
+        .map_err(|e| e.to_string())?;
+    Ok(s)
+}
+
+fn ask(s: &mut UnixStream, op: Op) -> Result<StateFrame, String> {
+    let f = ClientFrame::Control { seq: 1, op };
+    s.write_all(&wire::encode_client(&f))
+        .map_err(|e| e.to_string())?;
+    wire::read_state(s).map_err(|e| format!("the daemon's reply: {e}"))
+}
+
+/// `maker-arm-cli status`: one Monitor Poll as one token line.
+pub fn status(interface: &str, socket: Option<&Path>) -> Result<(), String> {
+    let mut s = connect(&socket_path(interface, socket), Role::Monitor)?;
+    let f = ask(&mut s, Op::Poll)?;
+    say(&format!(
+        "STATUS {{\"mode\": \"{}\", \"t\": {}, \"q\": {}, \"clamped\": {}, \"refused\": {}, \
+         \"fault\": {}, \"digest\": \"{:016x}\"}}",
+        mode_name(f.mode),
+        f.t,
+        serde_json::json!(f.q),
+        f.clamped,
+        f.refused,
+        f.fault,
+        f.digest
+    ));
+    Ok(())
+}
+
+/// `maker-arm-cli release`: sends Op Release only after the typed word. Until then the daemon
+/// holds, also if this process dies.
+pub fn release(interface: &str, socket: Option<&Path>) -> Result<(), String> {
+    let mut s = connect(&socket_path(interface, socket), Role::Release)?;
+    let f = ask(&mut s, Op::Poll)?;
+    say(&format!("daemon mode: {}", mode_name(f.mode)));
+    maker_arm_cli::confirm_release(&mut std::io::stdin().lock(), &mut std::io::stdout());
+    let f = ask(&mut s, Op::Release)?;
+    if f.mode != Mode::Released {
+        return Err(format!(
+            "the daemon answered {}, not released",
+            mode_name(f.mode)
+        ));
+    }
+    say("torque released.");
+    Ok(())
+}
+
 pub fn run(o: &ServeOptions, check: bool) -> Result<(), String> {
     let Loaded {
         config,
@@ -423,7 +514,7 @@ pub fn run(o: &ServeOptions, check: bool) -> Result<(), String> {
         say(&format!("SERVE_CHECK_OK {{\"digest\": \"{digest:016x}\"}}"));
         return Ok(());
     }
-    let socket = socket_path(o);
+    let socket = socket_path(&o.interface, o.socket.as_deref());
     // Before the socket file and the bus: a refused daemon touches neither. Held to exit.
     let _bus = bus_lock(&o.interface)?;
     if UnixStream::connect(&socket).is_ok() {
@@ -491,6 +582,7 @@ pub fn run(o: &ServeOptions, check: bool) -> Result<(), String> {
         grip_window,
         digest,
         exit_with_client: files::is_virtual(&o.interface) && !o.persist,
+        socket: socket.clone(),
     });
     say(&format!(
         "SERVE_READY {{\"socket\": {}, \"digest\": \"{digest:016x}\"}}",
