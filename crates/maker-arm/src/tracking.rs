@@ -1464,11 +1464,10 @@ mod tests {
     }
 
     /// The digests of `pin_digest` on main (d816104, which gives fadf948's commands), with
-    /// `contact(0.5)` and with rung F, per architecture: libm may round a last bit
-    /// differently elsewhere. An architecture without an entry prints its digests, and fails
-    /// under CI so a missing entry cannot persist silently.
-    // TODO: add the x86_64 (ubuntu-latest) digests from the first CI log of this test.
-    const PIN: &[(&str, u64, u64)] = &[("aarch64", 0x943a1b511aea7702, 0xe33d60f953c86b5a)];
+    /// `contact(0.5)` and with rung F. They were checked equal on aarch64 (Jetson Thor, GitHub
+    /// ubuntu-24.04-arm) and x86_64 (GitHub ubuntu-latest), so one pin serves every
+    /// architecture.
+    const PIN: (u64, u64) = (0x943a1b511aea7702, 0xe33d60f953c86b5a);
 
     #[test]
     fn with_dob_off_the_commands_are_mains() {
@@ -1478,20 +1477,8 @@ mod tests {
         // dob_f does nothing while dob is off.
         assert_eq!(pin_digest(off(0.7, contact(0.5))), on);
         assert_eq!(pin_digest(off(40.0, free())), free_d);
-        match PIN.iter().find(|p| p.0 == std::env::consts::ARCH) {
-            Some(&(_, want_on, want_free)) => {
-                assert_eq!(on, want_on, "contact: {on:#018x}");
-                assert_eq!(free_d, want_free, "rung F: {free_d:#018x}");
-            }
-            None => {
-                let msg = format!(
-                    "no pin for {}: contact {on:#018x} free {free_d:#018x}",
-                    std::env::consts::ARCH
-                );
-                assert!(std::env::var_os("CI").is_none(), "{msg}");
-                println!("{msg}");
-            }
-        }
+        assert_eq!(on, PIN.0, "contact: {on:#018x}");
+        assert_eq!(free_d, PIN.1, "rung F: {free_d:#018x}");
     }
 
     /// The tests' plant (the model itself, under gravity) held at mid-range by the controller
