@@ -520,13 +520,14 @@ impl TrackingController {
     }
 
     /// Observer compensation: `r_f` follows `r` through a first-order low-pass at `dob_f`,
-    /// exact over the tick for an `r` held over it; on a gap tick it restarts at 0 as `r`
-    /// does. Returns `-clamp(r_f, -tau_th, tau_th)` per joint, so the compensation never
-    /// grows past the deadband, where the admittance takes over.
+    /// exact over the tick for an `r` held over it; on a gap tick it holds, and the following
+    /// ticks low-pass it toward the restarted `r`. Returns `-clamp(r_f, -tau_th, tau_th)` per
+    /// joint, so the compensation never grows past the deadband, where the admittance takes
+    /// over.
     fn compensate(&mut self, h: f64, gap: bool) -> Joints {
-        if gap {
-            self.r_f = [0.0; ARM_DOF];
-        } else if h > 0.0 {
+        // On a gap tick r_f holds: resetting it would step the command torque by up to tau_th
+        // just as communication was lost (the admittance holds its state there too).
+        if h > 0.0 && !gap {
             let a = 1.0 - (-2.0 * PI * self.params.dob_f * h).exp();
             for j in 0..ARM_DOF {
                 self.r_f[j] += a * (self.r[j] - self.r_f[j]);
@@ -1464,7 +1465,9 @@ mod tests {
 
     /// The digests of `pin_digest` on main (d816104, which gives fadf948's commands), with
     /// `contact(0.5)` and with rung F, per architecture: libm may round a last bit
-    /// differently elsewhere. An architecture without an entry prints its digests.
+    /// differently elsewhere. An architecture without an entry prints its digests, and fails
+    /// under CI so a missing entry cannot persist silently.
+    // TODO: add the x86_64 (ubuntu-latest) digests from the first CI log of this test.
     const PIN: &[(&str, u64, u64)] = &[("aarch64", 0x943a1b511aea7702, 0xe33d60f953c86b5a)];
 
     #[test]
@@ -1480,10 +1483,14 @@ mod tests {
                 assert_eq!(on, want_on, "contact: {on:#018x}");
                 assert_eq!(free_d, want_free, "rung F: {free_d:#018x}");
             }
-            None => println!(
-                "no pin for {}: contact {on:#018x} free {free_d:#018x}",
-                std::env::consts::ARCH
-            ),
+            None => {
+                let msg = format!(
+                    "no pin for {}: contact {on:#018x} free {free_d:#018x}",
+                    std::env::consts::ARCH
+                );
+                assert!(std::env::var_os("CI").is_none(), "{msg}");
+                println!("{msg}");
+            }
         }
     }
 
@@ -1559,7 +1566,7 @@ mod tests {
     }
 
     #[test]
-    fn a_gap_tick_restarts_the_compensation_at_zero() {
+    fn a_gap_tick_holds_the_compensation_and_then_follows_the_restarted_observer() {
         let mut p = contact(0.5);
         p.dob = true;
         let mut c = ctrl(p);
@@ -1570,24 +1577,31 @@ mod tests {
             c.update(&st(t, [0.0; 6], [0.0; 6], tau), H);
             t += H;
         }
-        let tel = c.shared().telemetry().unwrap();
-        assert!((tel.tau_dob[0] + 0.3).abs() < 1e-3, "{}", tel.tau_dob[0]);
+        let before = c.shared().telemetry().unwrap().tau_dob;
+        assert!((before[0] + 0.3).abs() < 1e-3, "{}", before[0]);
         t += 0.025; // this tick lands 30 ms after the last
         let out = c.update(&st(t, [0.0; 6], [0.0; 6], tau), H);
         let tel = c.shared().telemetry().unwrap();
-        assert_eq!(tel.tau_dob, [0.0; 6]);
-        assert_eq!(out[0].tau, tel.tau_ff[0]);
-        // One tick later it follows r again from zero, not from before the gap.
-        t += H;
-        c.update(&st(t, [0.0; 6], [0.0; 6], tau), H);
-        let a = (1.0 - (-2.0 * PI * 5.0 * H).exp()) * c.r[0];
-        let tel = c.shared().telemetry().unwrap();
-        assert!(
-            (tel.tau_dob[0] + a).abs() < 1e-12,
-            "{} vs {}",
-            tel.tau_dob[0],
-            -a
-        );
+        assert_eq!(c.r[0], 0.0, "the observer restarted");
+        assert_eq!(tel.tau_dob, before, "no torque step on the gap tick");
+        assert_eq!(out[0].tau, tel.tau_ff[0] + before[0]);
+        // Then r_f low-pass follows the restarted r: each tick moves it by exactly
+        // a (r - r_f), with no jump, and it settles back on the push.
+        let a = 1.0 - (-2.0 * PI * 5.0 * H).exp();
+        let mut prev = before[0];
+        for _ in 0..100 {
+            t += H;
+            c.update(&st(t, [0.0; 6], [0.0; 6], tau), H);
+            let now = c.shared().telemetry().unwrap().tau_dob[0];
+            let step = a * (c.r[0] + prev); // r_f before this tick is -prev
+            assert!((now - prev + step).abs() < 1e-12, "{now} from {prev}");
+            assert!(
+                (now - prev).abs() <= a * 0.3 + 1e-12,
+                "a jump: {prev} to {now}"
+            );
+            prev = now;
+        }
+        assert!((prev + 0.3).abs() < 1e-3, "settles back on -0.3: {prev}");
     }
 
     #[test]
