@@ -500,11 +500,13 @@ def _residual(history=2, bias=(0.0,) * 6, out_max=1.0, seed=7):
     n = 12 * history + 6
     w0, b0 = rng.normal(0.0, 0.3, (8, n)), rng.normal(0.0, 0.1, 8)
     w1, b1 = rng.normal(0.0, 0.3, (6, 8)), np.asarray(bias, dtype=float)
+    x_mean, x_std = rng.normal(0.0, 0.1, n), rng.uniform(0.5, 2.0, n)
+    x_mean[-6:], x_std[-6:] = 33.0, 5.0  # the temperatures, inside X_BOUND = 10 std
     return {
         "history": history,
         "layers": [[w0.tolist(), b0.tolist()], [w1.tolist(), b1.tolist()]],
-        "x_mean": rng.normal(0.0, 0.1, n).tolist(),
-        "x_std": rng.uniform(0.5, 2.0, n).tolist(),
+        "x_mean": x_mean.tolist(),
+        "x_std": x_std.tolist(),
         "y_scale": [0.5] * 6,
         "out_max": [out_max] * 6,
     }
@@ -553,6 +555,11 @@ def test_tracking_residual_enters_the_feed_forward_and_the_telemetry():
     dr = tr.drain()
     assert dr["residual_skips"] == [1, 1, 1] and dr["tau_res"][0] == [0.0] * 6
     assert plain.telemetry()["tau_res"] == [0.0] * 6
+    # A glitched temperature (a raw 0xFFFF / 10) is outside the trained range: a skip.
+    out = tr.update(3 * 0.005, q, [0.0] * 7, [0.0] * 7, temperature=[6553.5] * 7)
+    tel = tr.telemetry()
+    assert tel["tau_res"] == [0.0] * 6 and tel["residual_skips"] == 2
+    assert all(math.isfinite(v) for row in out for v in row)
 
 
 def test_tracking_refuses_a_bad_residual():

@@ -577,8 +577,8 @@ impl TrackingController {
     /// `history` ticks of motion, but `tau_res` holds its last value while the history
     /// refills, as the observer compensation holds through a gap: dropping it would step the
     /// command torque by up to `out_max` just as communication was lost. Those held ticks are
-    /// not skips. A skip gives zero and is counted: no history yet after a start, or a
-    /// non-finite input or output (which also ends a hold).
+    /// not skips. A skip gives zero and is counted: no history yet after a start, a
+    /// non-finite input or output, or an input past `X_BOUND` (both of which also end a hold).
     fn residual_step(&mut self, q: &Joints, dq: &Joints, temps: &Joints, h: f64, gap: bool) {
         let Some(res) = &mut self.residual else {
             return;
@@ -593,8 +593,8 @@ impl TrackingController {
             res.reset();
         }
         res.record(q, dq);
-        let finite = q.iter().chain(dq).chain(temps).all(|v| v.is_finite());
-        if self.res_refill && finite && !res.is_full() {
+        // A non-finite or out-of-range reading ends a hold: evaluate gives zero and a skip.
+        if self.res_refill && res.reading_ok(q, dq, temps) && !res.is_full() {
             return; // hold through the refill
         }
         self.res_refill = false;
@@ -1891,6 +1891,94 @@ mod tests {
     }
 
     #[test]
+    fn a_glitched_temperature_is_a_skip_not_a_saturated_torque() {
+        let mut c = TrackingController::new(
+            vertical([0.0, 0.0, -9.81]),
+            free(),
+            &ArmConfig::maker_arm_v1(),
+            Some(newest_q0()),
+        )
+        .unwrap();
+        let at = |t: f64, temp: f64| {
+            let mut q = [0.0; 6];
+            q[0] = 0.1;
+            let mut s = st(t, q, [0.0; 6], [0.0; 6]);
+            for m in &mut s.motors {
+                m.temperature = temp;
+            }
+            s
+        };
+        let mut t = 0.0;
+        for _ in 0..5 {
+            c.update(&at(t, 0.5), H);
+            t += H;
+        }
+        assert_eq!(c.shared().telemetry().unwrap().residual_skips, 2);
+        // 6553.5 degC (a raw 0xFFFF / 10) normalizes to 6553.5 with x_std 1, past X_BOUND.
+        let out = c.update(&at(t, 6553.5), H);
+        let tel = c.shared().telemetry().unwrap();
+        assert_eq!((tel.tau_res, tel.residual_skips), ([0.0; 6], 3));
+        assert!(out.iter().all(|j| j.tau.is_finite() && j.pos.is_finite()));
+        t += H;
+        c.update(&at(t, 0.5), H);
+        assert_eq!(
+            c.shared().telemetry().unwrap().tau_res[0],
+            0.1,
+            "back on a good reading"
+        );
+        // During a gap hold it ends the hold, as a non-finite reading does.
+        t += 0.030;
+        c.update(&at(t, 0.5), H);
+        assert_eq!(c.shared().telemetry().unwrap().tau_res[0], 0.1, "held");
+        t += H;
+        c.update(&at(t, 6553.5), H);
+        let tel = c.shared().telemetry().unwrap();
+        assert_eq!((tel.tau_res, tel.residual_skips), ([0.0; 6], 4));
+        t += H;
+        c.update(&at(t, 0.5), H);
+        // The hold ended on the glitch, so with the history of 3 full this is the model again.
+        let tel = c.shared().telemetry().unwrap();
+        assert_eq!((tel.tau_res[0], tel.residual_skips), (0.1, 4));
+    }
+
+    #[test]
+    fn an_overflow_inside_the_net_is_a_skip_and_the_command_stays_finite() {
+        use crate::residual::{Layer, Mlp};
+        // Layer 0 overflows to inf before its tanh (which gives 1), and the last layer then
+        // sums eight 1e308 terms to inf: a non-finite output from in-range inputs.
+        let n = 12 + 6;
+        let mut w0 = vec![0.0; 8 * n];
+        for i in 0..8 {
+            w0[i * n] = 1e308;
+        }
+        let mlp = Mlp::new(vec![
+            Layer {
+                w: w0,
+                b: vec![1e308; 8],
+            },
+            Layer {
+                w: vec![1e308; 6 * 8],
+                b: vec![0.0; 6],
+            },
+        ])
+        .unwrap();
+        let r = ResidualModel::new(mlp, 1, vec![0.0; n], vec![1.0; n], [1.0; 6], [1.0; 6]).unwrap();
+        let mut c = TrackingController::new(
+            vertical([0.0; 3]),
+            free(),
+            &ArmConfig::maker_arm_v1(),
+            Some(r),
+        )
+        .unwrap();
+        let mut q = [0.0; 6];
+        q[0] = 1.0;
+        let out = c.update(&st(0.0, q, [0.0; 6], [0.0; 6]), H);
+        let tel = c.shared().telemetry().unwrap();
+        assert_eq!((tel.tau_res, tel.residual_skips), ([0.0; 6], 1));
+        assert!(out.iter().all(|j| j.tau.is_finite() && j.pos.is_finite()));
+    }
+
+    #[test]
     fn without_a_residual_the_commands_are_task_4s() {
         // pin_digest passes no residual; these are the PIN digests and c8626ef's digest of the
         // dob-on sequence.
@@ -1904,10 +1992,18 @@ mod tests {
                 assert_eq!(on, want_on, "contact: {on:#018x}");
                 assert_eq!(free_d, want_free, "rung F: {free_d:#018x}");
             }
-            None => println!("no pin for {}", std::env::consts::ARCH),
+            None => {
+                // with_dob_off_the_commands_are_mains fails under CI for a missing entry.
+                println!("no pin for {}", std::env::consts::ARCH)
+            }
         }
-        if let Some(&(_, want)) = PIN_DOB.iter().find(|p| p.0 == std::env::consts::ARCH) {
-            assert_eq!(dob, want, "dob on: {dob:#018x}");
+        match PIN_DOB.iter().find(|p| p.0 == std::env::consts::ARCH) {
+            Some(&(_, want)) => assert_eq!(dob, want, "dob on: {dob:#018x}"),
+            None => {
+                let msg = format!("no dob pin for {}: {dob:#018x}", std::env::consts::ARCH);
+                assert!(std::env::var_os("CI").is_none(), "{msg}");
+                println!("{msg}");
+            }
         }
         // A residual changes them, so the digest does see it.
         let r = crate::residual::tests::constant(2, [0.01; 6], 1.0);

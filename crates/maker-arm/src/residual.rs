@@ -141,6 +141,11 @@ pub struct ResidualModel {
 /// One tick's block in the history: q then dq.
 const BLOCK: usize = 2 * ARM_DOF;
 
+/// A normalized input past this many training standard deviations is a skip: a glitched
+/// reading (a 6553.5 degC temperature, a q far outside the training range) must not drive the
+/// net into a saturated output that `out_max` would then pass as torque.
+pub const X_BOUND: f64 = 10.0; // INITIAL: session 8 checks it against the real data
+
 impl ResidualModel {
     pub fn new(
         mlp: Mlp,
@@ -233,8 +238,22 @@ impl ResidualModel {
         self.filled = (self.filled + 1).min(self.history);
     }
 
+    /// True if this tick's reading is finite and, normalized as the newest tick, within
+    /// `X_BOUND`: the reading `evaluate` would accept. For a hold, which evaluates nothing.
+    pub fn reading_ok(&self, q: &Joints, dq: &Joints, temps: &Joints) -> bool {
+        let base = (self.history - 1) * BLOCK;
+        let t0 = self.history * BLOCK;
+        let ok = |v: f64, i: usize| {
+            let x = (v - self.x_mean[i]) / self.x_std[i];
+            x.is_finite() && x.abs() <= X_BOUND
+        };
+        (0..ARM_DOF)
+            .all(|j| ok(q[j], base + j) && ok(dq[j], base + ARM_DOF + j) && ok(temps[j], t0 + j))
+    }
+
     /// `tau_res` from the recorded history and `temps`, or None (a skip) until `history` ticks
-    /// exist and on a non-finite input or output. Allocates nothing.
+    /// exist, on a non-finite input or output, and on a normalized input past `X_BOUND`.
+    /// Allocates nothing.
     pub fn evaluate(&mut self, temps: &Joints) -> Option<Joints> {
         if self.filled < self.history || temps.iter().any(|v| !v.is_finite()) {
             return None;
@@ -248,6 +267,9 @@ impl ResidualModel {
         self.x[h * BLOCK..].copy_from_slice(temps);
         for ((x, m), s) in self.x.iter_mut().zip(&self.x_mean).zip(&self.x_std) {
             *x = (*x - m) / s;
+            if x.is_nan() || x.abs() > X_BOUND {
+                return None;
+            }
         }
         let mut y = [0.0; ARM_DOF];
         self.mlp.forward(&self.x, &mut y);
@@ -316,7 +338,7 @@ pub(crate) mod tests {
             w[i] = 1.0;
             let mlp = Mlp::new(vec![Layer { w, b: vec![0.0; 6] }]).unwrap();
             let mean: Vec<f64> = (0..n).map(|k| k as f64 * 0.01).collect();
-            let std: Vec<f64> = (0..n).map(|k| 1.0 + k as f64 * 0.1).collect();
+            let std: Vec<f64> = (0..n).map(|k| 10.0 + k as f64 * 0.1).collect();
             ResidualModel::new(mlp, 2, mean, std, [2.0; 6], [100.0; 6]).unwrap()
         };
         let tick = |k: f64| -> (Joints, Joints) {
@@ -338,7 +360,7 @@ pub(crate) mod tests {
                 r.record(&q, &dq);
             }
             let y = r.evaluate(&temps).unwrap();
-            let want = 2.0 * (raw - i as f64 * 0.01) / (1.0 + i as f64 * 0.1);
+            let want = 2.0 * (raw - i as f64 * 0.01) / (10.0 + i as f64 * 0.1);
             assert!((y[0] - want).abs() < 1e-12, "input {i}: {} vs {want}", y[0]);
         }
     }
@@ -349,22 +371,22 @@ pub(crate) mod tests {
         let q = [0.0; 6];
         for _ in 0..2 {
             r.record(&q, &q);
-            assert_eq!(r.evaluate(&[30.0; 6]), None, "the history is not full");
+            assert_eq!(r.evaluate(&[3.0; 6]), None, "the history is not full");
         }
         r.record(&q, &q);
-        assert_eq!(r.evaluate(&[30.0; 6]), Some([0.1; 6]));
-        let mut temps = [30.0; 6];
+        assert_eq!(r.evaluate(&[3.0; 6]), Some([0.1; 6]));
+        let mut temps = [3.0; 6];
         temps[4] = f64::NAN;
         assert_eq!(r.evaluate(&temps), None);
         // q and dq were fine, so the history is: the next good temperature evaluates.
         r.record(&q, &q);
-        assert_eq!(r.evaluate(&[30.0; 6]), Some([0.1; 6]));
+        assert_eq!(r.evaluate(&[3.0; 6]), Some([0.1; 6]));
         // A NaN reading restarts the history.
         let mut bad = q;
         bad[0] = f64::NAN;
         r.record(&bad, &q);
         r.record(&q, &q);
-        assert_eq!(r.evaluate(&[30.0; 6]), None);
+        assert_eq!(r.evaluate(&[3.0; 6]), None);
     }
 
     #[test]
@@ -380,6 +402,25 @@ pub(crate) mod tests {
         huge.y_scale = [1e300; 6];
         huge.record(&[0.0; 6], &[0.0; 6]);
         assert_eq!(huge.evaluate(&[0.0; 6]), None);
+    }
+
+    #[test]
+    fn a_normalized_input_past_x_bound_is_a_skip() {
+        let mut r = constant(1, [0.1; 6], 1.0);
+        r.record(&[0.0; 6], &[0.0; 6]);
+        assert_eq!(
+            r.evaluate(&[X_BOUND; 6]),
+            Some([0.1; 6]),
+            "the bound itself is in range"
+        );
+        assert_eq!(
+            r.evaluate(&[0.0, 0.0, -X_BOUND - 1e-9, 0.0, 0.0, 0.0]),
+            None
+        );
+        r.record(&[0.0, 11.0, 0.0, 0.0, 0.0, 0.0], &[0.0; 6]);
+        assert_eq!(r.evaluate(&[0.0; 6]), None, "a q past the bound");
+        assert!(!r.reading_ok(&[0.0; 6], &[0.0; 6], &[6553.5; 6]));
+        assert!(r.reading_ok(&[0.0; 6], &[0.0; 6], &[1.0; 6]));
     }
 
     #[test]
