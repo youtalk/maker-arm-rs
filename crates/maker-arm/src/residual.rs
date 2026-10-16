@@ -208,7 +208,12 @@ impl ResidualModel {
         self.history
     }
 
-    /// Forgets the history: the next `history` ticks are skips.
+    /// True once `history` ticks are recorded since the last reset.
+    pub fn is_full(&self) -> bool {
+        self.filled == self.history
+    }
+
+    /// Forgets the history: until `history` ticks are recorded again, `evaluate` gives None.
     pub fn reset(&mut self) {
         self.head = 0;
         self.filled = 0;

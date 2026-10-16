@@ -368,6 +368,8 @@ pub struct TrackingController {
     tau_res: Joints,
     /// The first tick since `begin`, which records its reading although its h is 0.
     res_fresh: bool,
+    /// A gap restarted the history and it is refilling: `tau_res` holds its last value.
+    res_refill: bool,
     telemetry: Telemetry,
     ring: RingWriter<Telemetry>,
 }
@@ -425,6 +427,7 @@ impl TrackingController {
             residual,
             tau_res: zero,
             res_fresh: true,
+            res_refill: false,
             telemetry: Telemetry::default(),
             ring: RingWriter::default(),
         })
@@ -485,6 +488,7 @@ impl TrackingController {
         self.quiet = 0.0;
         self.tau_res = [0.0; ARM_DOF];
         self.res_fresh = true;
+        self.res_refill = false;
         if let Some(res) = &mut self.residual {
             res.reset();
         }
@@ -566,10 +570,15 @@ impl TrackingController {
     }
 
     /// The learned residual for this tick from the measured q, dq and arm temperatures. A tick
-    /// that integrates something adds its reading to the history; a gap restarts the history
-    /// first, because the ticks before it are no longer the last `history` ticks of motion. A
-    /// repeated or backward stamp (h = 0 after the first tick) adds nothing and holds the last
-    /// value. A skip gives zero and is counted.
+    /// that integrates something adds its reading to the history. A repeated or backward stamp
+    /// (h = 0 after the first tick) adds nothing and holds the last value.
+    ///
+    /// A gap restarts the history, because the ticks before it are no longer the last
+    /// `history` ticks of motion, but `tau_res` holds its last value while the history
+    /// refills, as the observer compensation holds through a gap: dropping it would step the
+    /// command torque by up to `out_max` just as communication was lost. Those held ticks are
+    /// not skips. A skip gives zero and is counted: no history yet after a start, or a
+    /// non-finite input or output (which also ends a hold).
     fn residual_step(&mut self, q: &Joints, dq: &Joints, temps: &Joints, h: f64, gap: bool) {
         let Some(res) = &mut self.residual else {
             return;
@@ -579,9 +588,16 @@ impl TrackingController {
         }
         self.res_fresh = false;
         if gap {
+            // Only a model value is held: a gap during the start fill keeps skipping.
+            self.res_refill |= res.is_full();
             res.reset();
         }
         res.record(q, dq);
+        let finite = q.iter().chain(dq).chain(temps).all(|v| v.is_finite());
+        if self.res_refill && finite && !res.is_full() {
+            return; // hold through the refill
+        }
+        self.res_refill = false;
         match res.evaluate(temps) {
             Some(v) => self.tau_res = v,
             None => {
@@ -1782,17 +1798,96 @@ mod tests {
             c.update(&at_rest(t), H);
             t += H;
             let tel = c.shared().telemetry().unwrap();
-            let want = if n < 2 { [0.0; 6] } else { [0.1; 6] };
-            assert_eq!(tel.tau_res, want, "tick {n} after the gap");
+            assert_eq!(tel.tau_res, [0.1; 6], "tick {n} after the gap");
         }
-        assert_eq!(c.shared().telemetry().unwrap().residual_skips, 4);
+        // The refill holds the last value: those ticks are not skips.
+        assert_eq!(c.shared().telemetry().unwrap().residual_skips, 2);
         // A NaN temperature is a skip, and the commands stay finite.
         let mut s = at_rest(t);
         s.motors[3].temperature = f64::NAN;
         let out = c.update(&s, H);
         assert!(out.iter().all(|j| j.tau.is_finite()));
         let tel = c.shared().telemetry().unwrap();
-        assert_eq!((tel.tau_res, tel.residual_skips), ([0.0; 6], 5));
+        assert_eq!((tel.tau_res, tel.residual_skips), ([0.0; 6], 3));
+    }
+
+    /// A residual with a history of 3 whose output 0 is the newest tick's q[0].
+    fn newest_q0() -> ResidualModel {
+        use crate::residual::{Layer, Mlp};
+        let n = 12 * 3 + 6;
+        let mut w = vec![0.0; 6 * n];
+        w[12 * 2] = 1.0;
+        let mlp = Mlp::new(vec![Layer { w, b: vec![0.0; 6] }]).unwrap();
+        ResidualModel::new(mlp, 3, vec![0.0; n], vec![1.0; n], [1.0; 6], [1.0; 6]).unwrap()
+    }
+
+    #[test]
+    fn a_gap_tick_holds_the_residual_through_the_refill_and_then_follows_the_model() {
+        let mut c = TrackingController::new(
+            vertical([0.0, 0.0, -9.81]),
+            free(),
+            &ArmConfig::maker_arm_v1(),
+            Some(newest_q0()),
+        )
+        .unwrap();
+        let at = |t: f64, q0: f64| {
+            let mut q = [0.0; 6];
+            q[0] = q0;
+            st(t, q, [0.0; 6], [0.0; 6])
+        };
+        let mut t = 0.0;
+        for _ in 0..10 {
+            c.update(&at(t, 0.1), H);
+            t += H;
+        }
+        let settled = c.shared().telemetry().unwrap();
+        assert_eq!((settled.tau_res[0], settled.residual_skips), (0.1, 2));
+        t += 0.025; // a gap; the arm reads q[0] = 0.3 from here on
+        for n in 0..3 {
+            let out = c.update(&at(t, 0.3), H);
+            t += H;
+            let tel = c.shared().telemetry().unwrap();
+            let want = if n < 2 {
+                settled.tau_res
+            } else {
+                [0.3, 0.0, 0.0, 0.0, 0.0, 0.0]
+            };
+            assert_eq!(tel.tau_res, want, "tick {n} after the gap");
+            assert_eq!(out[0].tau, tel.tau_ff[0]);
+        }
+        assert_eq!(
+            c.shared().telemetry().unwrap().residual_skips,
+            2,
+            "no skip in the refill"
+        );
+        // A gap then a NaN reading during the refill: zero and a skip, not the held value, and
+        // zero until the history is full again.
+        t += 0.025;
+        c.update(&at(t, 0.3), H);
+        t += H;
+        c.update(&at(t, f64::NAN), H);
+        let tel = c.shared().telemetry().unwrap();
+        assert_eq!((tel.tau_res, tel.residual_skips), ([0.0; 6], 3));
+        for n in 0..3 {
+            t += H;
+            c.update(&at(t, 0.2), H);
+            let tel = c.shared().telemetry().unwrap();
+            let want = if n < 2 { 0.0 } else { 0.2 };
+            assert_eq!(tel.tau_res[0], want, "tick {n} after the NaN");
+        }
+        assert_eq!(c.shared().telemetry().unwrap().residual_skips, 5);
+        // A gap during the start fill holds nothing: those ticks stay zero skips.
+        let mut c = TrackingController::new(
+            vertical([0.0, 0.0, -9.81]),
+            free(),
+            &ArmConfig::maker_arm_v1(),
+            Some(newest_q0()),
+        )
+        .unwrap();
+        c.update(&at(0.0, 0.1), H);
+        c.update(&at(0.030, 0.1), H);
+        let tel = c.shared().telemetry().unwrap();
+        assert_eq!((tel.tau_res, tel.residual_skips), ([0.0; 6], 2));
     }
 
     #[test]
