@@ -275,15 +275,23 @@ impl Daemon {
     /// other client sees the arm gone. The reply goes out only after the motors are disabled.
     fn release(&self, stream: &mut UnixStream, seq: u32) -> ! {
         let mut st = self.lock();
-        st.mode = Mode::Released;
-        let frame = self.state_frame(&st, seq);
-        if let Some(arm) = st.arm.take() {
-            if let (_, Err(e)) = arm.stop_and_disable() {
-                log(&format!("disable: {e}"));
-            }
+        let mut frame = self.state_frame(&st, seq);
+        frame.mode = Mode::Released;
+        let failed = st.arm.take().and_then(|arm| arm.stop_and_disable().1.err());
+        if failed.is_some() {
+            // Never claim a release that did not happen.
+            frame.mode = Mode::Fault;
         }
         let _ = stream.write_all(&wire::encode_state(&frame));
         let _ = std::fs::remove_file(&self.socket);
+        if let Some(e) = failed {
+            log(&format!(
+                "release failed: disable: {e}. The motors may keep their last command until \
+                 their CAN timeout. Support the arm."
+            ));
+            say("SERVE_EXIT release failed");
+            std::process::exit(1);
+        }
         say("SERVE_EXIT released");
         std::process::exit(0);
     }
@@ -491,14 +499,21 @@ pub fn release(interface: &str, socket: Option<&Path>) -> Result<(), String> {
     say(&format!("daemon mode: {}", mode_name(f.mode)));
     maker_arm_cli::confirm_release(&mut std::io::stdin().lock(), &mut std::io::stdout());
     let f = ask(&mut s, Op::Release)?;
-    if f.mode != Mode::Released {
-        return Err(format!(
-            "the daemon answered {}, not released",
-            mode_name(f.mode)
-        ));
-    }
+    released(f.mode)?;
     say("torque released.");
     Ok(())
+}
+
+/// Only `Released` is success: any other reply means the motors may still hold torque.
+fn released(mode: Mode) -> Result<(), String> {
+    if mode == Mode::Released {
+        return Ok(());
+    }
+    Err(format!(
+        "release failed: the daemon answered {}, not released. The motors may still hold \
+         torque. Support the arm.",
+        mode_name(mode)
+    ))
 }
 
 pub fn run(o: &ServeOptions, check: bool) -> Result<(), String> {
@@ -664,6 +679,18 @@ mod tests {
         let ctrl = TrackingController::new(model, TrackingParams::default(), &c, None).unwrap();
         let shared = ctrl.shared();
         (s.start(Box::new(ctrl), None).unwrap(), shared)
+    }
+
+    #[test]
+    fn only_a_released_reply_counts_as_released() {
+        assert!(released(Mode::Released).is_ok());
+        for m in [Mode::Fault, Mode::Holding, Mode::Following, Mode::Refused] {
+            let e = released(m).unwrap_err();
+            assert!(
+                e.contains("release failed") && e.contains("Support the arm"),
+                "{e}"
+            );
+        }
     }
 
     #[test]
