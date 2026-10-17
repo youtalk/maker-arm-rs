@@ -1,8 +1,12 @@
 use std::io::Write;
+use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{error::ErrorKind, CommandFactory, Parser, Subcommand};
 use maker_arm::{ArmConfig, HoldController, Session, SimArm};
-use maker_arm_transport::CanBackend;
+use maker_arm_cli::files::ServeOptions;
+use maker_arm_transport::{BusLock, CanBackend};
+
+mod serve;
 
 #[derive(Parser)]
 #[command(
@@ -36,16 +40,73 @@ enum Command {
     },
     /// Connect, enable, and hold the current pose until a typed RELEASE
     Hold,
+    /// Ask a running serve daemon to disable the motors, after a typed RELEASE
+    Release {
+        #[arg(long)]
+        interface: String,
+        /// Default: $XDG_RUNTIME_DIR/maker-arm-<interface>.sock
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+    /// Print one STATUS line from a running serve daemon
+    Status {
+        #[arg(long)]
+        interface: String,
+        /// Default: $XDG_RUNTIME_DIR/maker-arm-<interface>.sock
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+    /// Own the arm as a daemon for ROS 2: track a client's targets over a Unix socket, and
+    /// hold when the client stops
+    Serve {
+        /// can0, vcan0 or sim
+        #[arg(long)]
+        interface: String,
+        /// A profile JSON that only narrows maker_arm_v1
+        #[arg(long)]
+        profile: Option<PathBuf>,
+        /// The dynamics model JSON
+        #[arg(long)]
+        dynamics: PathBuf,
+        /// The tracking parameters JSON
+        #[arg(long)]
+        params: Option<PathBuf>,
+        /// The learned residual JSON
+        #[arg(long)]
+        residual: Option<PathBuf>,
+        /// The measured gripper map: jaw gap (m) = a * angle + b
+        #[arg(long = "gripper_map", value_name = "A,B")]
+        gripper_map: Option<String>,
+        /// Run the loop at SCHED_FIFO priority 80 on CPU 5
+        #[arg(long)]
+        rt: bool,
+        /// Default: $XDG_RUNTIME_DIR/maker-arm-<interface>.sock
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        /// On sim or vcan, keep running after the command client leaves
+        #[arg(long)]
+        persist: bool,
+        /// Load and check the files, print their digest and exit; opens no bus
+        #[arg(long)]
+        check: bool,
+    },
 }
 
-fn open_backend(cli: &Cli, config: &ArmConfig) -> Result<Box<dyn CanBackend>, String> {
+/// A real bus comes with its lock, which the caller holds for the whole command: the probes of
+/// scan, doctor and zero and the connect of hold send disable frames, which would drop an arm
+/// that a serve daemon holds.
+fn open_backend(
+    cli: &Cli,
+    config: &ArmConfig,
+) -> Result<(Option<BusLock>, Box<dyn CanBackend>), String> {
     match (&cli.can, cli.sim) {
         (Some(iface), false) => {
             #[cfg(feature = "socketcan")]
             {
+                let lock = maker_arm_transport::bus_lock(iface).map_err(|e| e.to_string())?;
                 let b = maker_arm_transport::SocketCanBackend::open(iface)
                     .map_err(|e| format!("open {iface}: {e}"))?;
-                Ok(Box::new(b))
+                Ok((Some(lock), Box::new(b)))
             }
             #[cfg(not(feature = "socketcan"))]
             {
@@ -53,15 +114,59 @@ fn open_backend(cli: &Cli, config: &ArmConfig) -> Result<Box<dyn CanBackend>, St
                 Err("built without the socketcan feature".into())
             }
         }
-        (None, true) => Ok(Box::new(SimArm::new(config))),
+        (None, true) => Ok((None, Box::new(SimArm::new(config)))),
         _ => Err("pass exactly one of --can <iface> or --sim".into()),
     }
 }
 
 fn main() -> Result<(), String> {
     let cli = Cli::parse();
+    if let Command::Serve {
+        interface,
+        profile,
+        dynamics,
+        params,
+        residual,
+        gripper_map,
+        rt,
+        socket,
+        persist,
+        check,
+    } = cli.command
+    {
+        if cli.can.is_some() || cli.sim {
+            Cli::command()
+                .error(
+                    ErrorKind::ArgumentConflict,
+                    "serve takes --interface, not --can or --sim",
+                )
+                .exit();
+        }
+        let o = ServeOptions {
+            interface,
+            profile,
+            dynamics,
+            params,
+            residual,
+            gripper_map,
+            rt,
+            socket,
+            persist,
+        };
+        return serve::run(&o, check);
+    }
+    match &cli.command {
+        Command::Release { interface, socket } => {
+            return serve::release(interface, socket.as_deref());
+        }
+        Command::Status { interface, socket } => {
+            return serve::status(interface, socket.as_deref());
+        }
+        _ => {}
+    }
     let config = ArmConfig::maker_arm_v1();
-    let mut backend = open_backend(&cli, &config)?;
+    // Declared before anything that can hold the arm, so it drops last.
+    let (_bus, mut backend) = open_backend(&cli, &config)?;
     match cli.command {
         Command::Scan => {
             let rows = maker_arm_cli::scan(backend.as_mut(), &config).map_err(|e| e.to_string())?;
@@ -197,6 +302,9 @@ fn main() -> Result<(), String> {
             let (_session, res) = running.stop_and_disable();
             res.map_err(|e| e.to_string())?;
             let _ = writeln!(std::io::stdout(), "torque released.");
+        }
+        Command::Serve { .. } | Command::Release { .. } | Command::Status { .. } => {
+            unreachable!("handled above")
         }
     }
     Ok(())

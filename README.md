@@ -62,6 +62,44 @@ python3 -m venv .venv && . .venv/bin/activate && pip install maturin pytest
 maturin develop && python -m pytest tests/ -v
 ```
 
+## ROS 2 daemon
+
+`maker-arm-cli serve` is a resident daemon for ROS 2. It owns the CAN bus and the tracking loop. One command client sends targets over a Unix socket. The daemon holds the arm when that client stops.
+
+Install it on Ubuntu 24.04. The apt Rust 1.85 is enough.
+
+```sh
+sudo apt install rustc-1.85 cargo-1.85 git
+git clone https://github.com/youtalk/maker-arm-rs
+PATH=/usr/lib/rust-1.85/bin:$PATH cargo install --locked --path maker-arm-rs/crates/maker-arm-cli
+```
+
+The apt cargo cannot install from a git URL, so clone the repository first.
+
+The daemon is not yet verified on a real arm. Support the arm before you start `serve` on a real interface.
+
+Three commands. For `PROFILE` and `MODEL`, use the profile and model files that ship with your arm's ROS package. Do not write them by hand.
+
+```sh
+maker-arm-cli serve --interface can0 --profile PROFILE --dynamics MODEL   # start the daemon
+maker-arm-cli status --interface can0                                    # print one STATUS line
+maker-arm-cli release --interface can0                                   # disable the motors
+```
+
+The socket is `--socket PATH`. If you omit it, the path is `$XDG_RUNTIME_DIR/maker-arm-<interface>.sock`. If that variable is not set, pass `--socket`. `status` and `release` use the same rule. They never open the bus.
+
+`status` prints `STATUS {"mode": ..., "t": ..., "q": [7 values], "clamped": ..., "refused": ..., "fault": ..., "digest": ...}` and exits 0. It exits 1 if no daemon runs on the socket.
+
+Hold rules:
+
+- On a real interface, after `SERVE_READY`, the daemon does not disable the motors by itself. It holds the arm when the client leaves, on SIGINT and SIGTERM, and on a fault.
+- Before `SERVE_READY`, a start-up failure can disable the motors that the daemon just enabled. The arm can then drop.
+- If the control loop stops, or the daemon process is killed, nothing commands the motors. Each motor then falls back to its own CAN timeout watchdog, and the arm can drop.
+- After `SERVE_READY`, only `release` disables the motors. It asks you to type `RELEASE`. Until you do, the arm holds. Release the torque only when the arm is supported.
+- While the daemon runs, `scan`, `doctor`, `zero`, `hold` and the Python binding refuse to open the same interface. Each one names the bus lock `maker-arm-bus-<interface>`.
+- On `sim` or `vcan`, the daemon ends with its command client. Pass `--persist` to keep it running.
+- A command more than 0.05 rad from the last target is refused. The daemon holds until the client sends Deactivate and then Activate.
+
 ## Quick start
 
 ```python
@@ -82,6 +120,8 @@ single command clamp. The supported way to command a motor is through
 `maker-arm`'s session and control loop (the `Arm` class below, or
 `Session::start`), which passes every command through `clamp_command` before
 it reaches a motor.
+
+Before you open a real bus in Rust, take `maker_arm_transport::bus_lock("can0")` and keep it while you use the bus. It fails if a `serve` daemon holds the arm.
 
 Orchestration mode: Python selects and steers controllers that run inside the
 Rust control loop; it never commands torque itself, so every command still

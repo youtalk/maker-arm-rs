@@ -5,17 +5,26 @@
 //! Contact side: a momentum observer estimates the external torque `r`; past a per-joint
 //! deadband an admittance moves the reference along the push; a contact gate `g` removes
 //! the inertial, Coriolis, friction and velocity feed-forward while the arm is blocked; an
-//! error clamp caps the spring torque at `kp e_max`. Everything integrates over the MEASURED
-//! tick interval, so a late tick on a non-RT kernel does not corrupt the state. The output
-//! is a desire like any controller's: the loop's `clamp_command` decides what is sent.
+//! error clamp caps the spring torque at `kp e_max`. Behind `dob` (off by default), a
+//! low-pass copy of `r` clamped to the deadband is subtracted from the command torque, so a
+//! push below the deadband is cancelled and one above it is left to the admittance. With a
+//! learned residual (`ResidualModel`, MS5 revision section 8.2), its torque `tau_res` joins
+//! the model next to friction, in the observer and in the gated feed-forward.
+//! Everything integrates over the MEASURED tick interval, so a late tick on a non-RT kernel
+//! does not corrupt the state. The output is a desire like any controller's: the loop's
+//! `clamp_command` decides what is sent.
 
 use crate::config::ArmConfig;
+pub use crate::control_loop::RING_TICKS;
+use crate::control_loop::{RingWriter, TickRing};
 use crate::controller::Controller;
 use crate::dynamics::{Dynamics, JointMatrix};
 use crate::kinematics::{Joints, ARM_DOF};
+use crate::residual::ResidualModel;
 use crate::state::{ArmCommand, ArmState, JointCommand};
 use std::f64::consts::PI;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -47,6 +56,11 @@ pub struct TrackingParams {
     pub gate_quiet: f64,
     /// False is rung F: no observer, admittance, gate or error clamp.
     pub contact: bool,
+    /// Observer compensation (MS5 revision section 8.1): below the deadband, a low-pass
+    /// copy of `r` is subtracted from the command torque, clamped per joint to `tau_th`.
+    pub dob: bool,
+    /// Corner of the compensation's low-pass (Hz).
+    pub dob_f: f64,
 }
 
 impl Default for TrackingParams {
@@ -64,6 +78,8 @@ impl Default for TrackingParams {
             gate_rise: 0.100,       // INITIAL
             gate_quiet: 0.050,      // INITIAL
             contact: true,
+            dob: false,
+            dob_f: 5.0, // INITIAL: session 6 picks it from the bench sweep
         }
     }
 }
@@ -122,6 +138,22 @@ impl TrackingParams {
                 return Err(TrackingError::Param {
                     name: "tau_th",
                     detail: format!("{v} is not positive"),
+                });
+            }
+        }
+        positive("dob_f", self.dob_f)?;
+        if self.dob {
+            if !self.contact {
+                return Err(TrackingError::Param {
+                    name: "dob",
+                    detail: "contact=False (rung F) has no observer to compensate with".into(),
+                });
+            }
+            // The compensation is clamped to the deadband: an infinite one leaves it unbounded.
+            if let Some(v) = self.tau_th.iter().find(|v| v.is_infinite()) {
+                return Err(TrackingError::Param {
+                    name: "dob",
+                    detail: format!("needs a finite tau_th on every joint, one is {v}"),
                 });
             }
         }
@@ -235,6 +267,14 @@ pub struct Telemetry {
     pub offset: Joints,
     pub q_r: Joints,
     pub tau_ff: Joints,
+    /// The observer compensation added to `tau_ff` in the command (N m), zero with dob off.
+    pub tau_dob: Joints,
+    /// The learned residual torque in the observer's model and the feed-forward (N m), zero
+    /// without a residual and on a skip.
+    pub tau_res: Joints,
+    /// Ticks whose residual was skipped (zero): the history not yet full, after a start or a
+    /// gap, or a non-finite input or output. Cumulative.
+    pub residual_skips: u64,
     pub late_ticks: u64,
     pub gaps: u64,
     pub max_interval: f64,
@@ -250,6 +290,9 @@ pub struct TrackingShared {
     pending: Mutex<Vec<Push>>,
     telemetry: Mutex<Option<Telemetry>>,
     clock: Mutex<Option<(f64, Instant)>>,
+    ring: Mutex<TickRing<Telemetry>>,
+    /// Rows a dropped controller still held, counted into the next drain's `dropped`.
+    lost: AtomicU64,
 }
 
 impl TrackingShared {
@@ -263,6 +306,15 @@ impl TrackingShared {
     /// The last tick's telemetry, or None before the first tick.
     pub fn telemetry(&self) -> Option<Telemetry> {
         *self.telemetry.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The telemetry of every `update` call since the last drain, oldest first, and the number
+    /// dropped since then because the ring (`RING_TICKS`) was full. A nonzero count marks a
+    /// gap in the records. Join with the loop's records on `tick_t` (their `t`), not on the
+    /// index: a tick that faulted the arm has a loop record and no row here, or the reverse.
+    pub fn drain(&self) -> (Vec<Telemetry>, u64) {
+        let (rows, dropped) = self.ring.lock().unwrap_or_else(|e| e.into_inner()).take();
+        (rows, dropped + self.lost.swap(0, Ordering::Relaxed))
     }
 
     /// `(now, age)`: the loop clock now, which is the tick clock (the latest good
@@ -305,11 +357,21 @@ pub struct TrackingController {
     offset: Joints,
     offset_rate: Joints,
     r: Joints,
+    /// `r` through the compensation's low-pass at `dob_f`.
+    r_f: Joints,
     p_prev: Joints,
     m_prev: JointMatrix,
     gate: f64,
     quiet: f64,
+    residual: Option<ResidualModel>,
+    /// This tick's residual torque, held over a repeated stamp.
+    tau_res: Joints,
+    /// The first tick since `begin`, which records its reading although its h is 0.
+    res_fresh: bool,
+    /// A gap restarted the history and it is refilling: `tau_res` holds its last value.
+    res_refill: bool,
     telemetry: Telemetry,
+    ring: RingWriter<Telemetry>,
 }
 
 impl TrackingController {
@@ -317,6 +379,7 @@ impl TrackingController {
         dynamics: Dynamics,
         params: TrackingParams,
         config: &ArmConfig,
+        residual: Option<ResidualModel>,
     ) -> Result<TrackingController, TrackingError> {
         params.validate()?;
         if config.joints.len() != ROW {
@@ -356,11 +419,17 @@ impl TrackingController {
             offset: zero,
             offset_rate: zero,
             r: zero,
+            r_f: zero,
             p_prev: zero,
             m_prev: [[0.0; ARM_DOF]; ARM_DOF],
             gate: 1.0,
             quiet: 0.0,
+            residual,
+            tau_res: zero,
+            res_fresh: true,
+            res_refill: false,
             telemetry: Telemetry::default(),
+            ring: RingWriter::default(),
         })
     }
 
@@ -391,6 +460,10 @@ impl TrackingController {
         }
         self.started = false;
         self.telemetry = Telemetry::default();
+        // Bench rows from before the loop must not reach the first drain. The loop does not
+        // hold the ring yet, so the blocking lock is safe.
+        self.ring.clear();
+        let _ = self.shared.drain();
         *self
             .shared
             .telemetry
@@ -410,8 +483,15 @@ impl TrackingController {
         self.offset = [0.0; ARM_DOF];
         self.offset_rate = [0.0; ARM_DOF];
         self.r = [0.0; ARM_DOF];
+        self.r_f = [0.0; ARM_DOF];
         self.gate = 1.0;
         self.quiet = 0.0;
+        self.tau_res = [0.0; ARM_DOF];
+        self.res_fresh = true;
+        self.res_refill = false;
+        if let Some(res) = &mut self.residual {
+            res.reset();
+        }
         self.m_prev = self.dynamics.mass_matrix(q);
         self.p_prev = mat6_vec(&self.m_prev, dq);
         self.t_prev = t;
@@ -457,13 +537,74 @@ impl TrackingController {
             let decay = (-self.params.k_o * h).exp();
             for j in 0..ARM_DOF {
                 // C^T dq = Mdot dq - C dq.
-                let beta = mdot_dq[j] - c_dq[j] - g[j] - f[j];
+                let mut beta = mdot_dq[j] - c_dq[j] - g[j] - f[j];
+                // The residual is model torque like friction. Without one, beta is untouched,
+                // so not even a -0.0 changes.
+                if self.residual.is_some() {
+                    beta -= self.tau_res[j];
+                }
                 let ext = (p[j] - self.p_prev[j]) / h - tau_m[j] - beta;
                 self.r[j] = decay * self.r[j] + (1.0 - decay) * ext;
             }
         }
         self.p_prev = p;
         self.m_prev = m;
+    }
+
+    /// Observer compensation: `r_f` follows `r` through a first-order low-pass at `dob_f`,
+    /// exact over the tick for an `r` held over it; on a gap tick it holds, and the following
+    /// ticks low-pass it toward the restarted `r`. Returns `-clamp(r_f, -tau_th, tau_th)` per
+    /// joint, so the compensation never grows past the deadband, where the admittance takes
+    /// over.
+    fn compensate(&mut self, h: f64, gap: bool) -> Joints {
+        // On a gap tick r_f holds: resetting it would step the command torque by up to tau_th
+        // just as communication was lost (the admittance holds its state there too).
+        if h > 0.0 && !gap {
+            let a = 1.0 - (-2.0 * PI * self.params.dob_f * h).exp();
+            for j in 0..ARM_DOF {
+                self.r_f[j] += a * (self.r[j] - self.r_f[j]);
+            }
+        }
+        let th = &self.params.tau_th;
+        std::array::from_fn(|j| -self.r_f[j].clamp(-th[j], th[j]))
+    }
+
+    /// The learned residual for this tick from the measured q, dq and arm temperatures. A tick
+    /// that integrates something adds its reading to the history. A repeated or backward stamp
+    /// (h = 0 after the first tick) adds nothing and holds the last value.
+    ///
+    /// A gap restarts the history, because the ticks before it are no longer the last
+    /// `history` ticks of motion, but `tau_res` holds its last value while the history
+    /// refills, as the observer compensation holds through a gap: dropping it would step the
+    /// command torque by up to `out_max` just as communication was lost. Those held ticks are
+    /// not skips. A skip gives zero and is counted: no history yet after a start, a
+    /// non-finite input or output, or an input past `X_BOUND` (both of which also end a hold).
+    fn residual_step(&mut self, q: &Joints, dq: &Joints, temps: &Joints, h: f64, gap: bool) {
+        let Some(res) = &mut self.residual else {
+            return;
+        };
+        if h <= 0.0 && !self.res_fresh {
+            return;
+        }
+        self.res_fresh = false;
+        if gap {
+            // Only a model value is held: a gap during the start fill keeps skipping.
+            self.res_refill |= res.is_full();
+            res.reset();
+        }
+        res.record(q, dq);
+        // A non-finite or out-of-range reading ends a hold: evaluate gives zero and a skip.
+        if self.res_refill && res.reading_ok(q, dq, temps) && !res.is_full() {
+            return; // hold through the refill
+        }
+        self.res_refill = false;
+        match res.evaluate(temps) {
+            Some(v) => self.tau_res = v,
+            None => {
+                self.tau_res = [0.0; ARM_DOF];
+                self.telemetry.residual_skips += 1;
+            }
+        }
     }
 
     /// Deadband admittance `D_a d(offset)/dt + K_a offset = dz(r)` by backward Euler (stable
@@ -505,6 +646,16 @@ impl TrackingController {
     }
 }
 
+impl Drop for TrackingController {
+    /// Rows still queued (their `try_lock` failed) are counted as lost, so the next drain
+    /// reports them. No blocking lock: the loop drops the controller on a `hold_now` swap.
+    fn drop(&mut self) {
+        self.ring.try_flush(&self.shared.ring);
+        let n = self.ring.abandon();
+        self.shared.lost.fetch_add(n, Ordering::Relaxed);
+    }
+}
+
 impl Controller for TrackingController {
     /// `_dt` is the nominal period; the controller integrates over the measured interval
     /// between `ArmState::t` stamps instead (design section 10).
@@ -523,11 +674,13 @@ impl Controller for TrackingController {
         }
         let t = state.t;
         let (mut q, mut dq, mut tau_m) = ([0.0; ARM_DOF], [0.0; ARM_DOF], [0.0; ARM_DOF]);
+        let mut temps = [0.0; ARM_DOF];
         for j in 0..ARM_DOF {
             let m = &state.motors[j];
             q[j] = m.position;
             dq[j] = m.velocity;
             tau_m[j] = m.torque;
+            temps[j] = m.temperature;
         }
         if !self.started {
             self.begin(t, &q, &dq, state.motors[ARM_DOF].position);
@@ -579,8 +732,13 @@ impl Controller for TrackingController {
             self.ddq_d[j] = w * w * (u[j] - self.q_d[j]) - 2.0 * w * self.dq_d[j];
         }
 
+        self.residual_step(&q, &dq, &temps, h, gap);
+        let mut tau_dob = [0.0; ARM_DOF];
         if self.params.contact {
             self.observe(&q, &dq, &tau_m, h, gap);
+            if self.params.dob {
+                tau_dob = self.compensate(h, gap);
+            }
             self.yield_and_gate(h, gap);
         }
 
@@ -595,7 +753,13 @@ impl Controller for TrackingController {
         let mut tau_ff = [0.0; ARM_DOF];
         let mut cmd = Vec::with_capacity(ROW);
         for j in 0..ARM_DOF {
-            tau_ff[j] = g_r[j] + self.gate * (full[j] - g_r[j] + fr[j]);
+            // The residual is gated like friction; without one the sum is main's, bit for bit.
+            let model = if self.residual.is_some() {
+                full[j] - g_r[j] + fr[j] + self.tau_res[j]
+            } else {
+                full[j] - g_r[j] + fr[j]
+            };
+            tau_ff[j] = g_r[j] + self.gate * model;
             let pos = if self.params.contact {
                 let e = self.params.e_max[j];
                 q[j] + (q_r[j] - q[j]).clamp(-e, e)
@@ -607,7 +771,12 @@ impl Controller for TrackingController {
                 vel: self.gate * dq_r[j],
                 kp: self.kp[j],
                 kd: self.kd[j],
-                tau: tau_ff[j],
+                // With dob off the command is tau_ff itself, so not even a -0.0 changes.
+                tau: if self.params.dob {
+                    tau_ff[j] + tau_dob[j]
+                } else {
+                    tau_ff[j]
+                },
             });
         }
         cmd.push(JointCommand {
@@ -623,10 +792,13 @@ impl Controller for TrackingController {
         self.telemetry.offset = self.offset;
         self.telemetry.q_r = q_r;
         self.telemetry.tau_ff = tau_ff;
+        self.telemetry.tau_dob = tau_dob;
+        self.telemetry.tau_res = self.tau_res;
         self.telemetry.tick_t = t;
         if let Ok(mut out) = self.shared.telemetry.try_lock() {
             *out = Some(self.telemetry);
         }
+        self.ring.record(self.telemetry, &self.shared.ring);
         cmd
     }
 }
@@ -634,8 +806,10 @@ impl Controller for TrackingController {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clamp::clamp_command;
     use crate::dynamics::{Body, Friction};
     use crate::kinematics::{Link, Vec3};
+    use crate::residual::ResidualModel;
     use crate::state::MotorState;
 
     const H: f64 = 0.005;
@@ -643,6 +817,10 @@ mod tests {
     /// Six vertical axes, gravity along them: G = 0 and, at rest, C dq = 0, so a static
     /// arm's observer sees tau_ext = -tau_m exactly.
     fn vertical(gravity: Vec3) -> Dynamics {
+        vertical_with(gravity, [0.0; 6])
+    }
+
+    fn vertical_with(gravity: Vec3, armature: [f64; 6]) -> Dynamics {
         let z = Some([0.0, 0.0, 1.0]);
         let body = Body {
             mass: 0.5,
@@ -658,6 +836,7 @@ mod tests {
             [body; 6],
             [Friction::default(); 6],
             gravity,
+            armature,
         )
         .unwrap()
     }
@@ -667,6 +846,7 @@ mod tests {
             vertical([0.0, 0.0, -9.81]),
             params,
             &ArmConfig::maker_arm_v1(),
+            None,
         )
         .unwrap()
     }
@@ -837,7 +1017,8 @@ mod tests {
     #[test]
     fn feed_forward_is_gravity_at_rest_and_full_rnea_in_motion() {
         let d = vertical([0.0, -9.81, 0.0]);
-        let mut c = TrackingController::new(d.clone(), free(), &ArmConfig::maker_arm_v1()).unwrap();
+        let mut c =
+            TrackingController::new(d.clone(), free(), &ArmConfig::maker_arm_v1(), None).unwrap();
         let q0 = [0.2, -0.3, 0.4, 0.1, -0.2, 0.3];
         let out = c.update(&st(0.0, q0, [0.0; 6], [0.0; 6]), H);
         let g = d.gravity(&q0);
@@ -905,22 +1086,19 @@ mod tests {
         x
     }
 
-    #[test]
-    fn observer_recovers_a_constant_push_on_a_moving_arm() {
-        // A six-link planar arm under gravity swings every joint 0.5 rad at 0.5 Hz (up to
-        // 1.57 rad/s) under computed torque, while a constant external torque acts on it. RK4
-        // at 1 ms integrates the true dynamics, with the motor torque held over each 5 ms
-        // tick as the MIT loop holds its command, and the observer sees the true q, dq and
-        // that torque.
-        let d = vertical([0.0, -9.81, 0.0]);
+    /// A six-link planar arm under gravity swings every joint `amp` rad at `w_ref` rad/s
+    /// under computed torque from `d` (the controller's model), while `ext` acts on it. RK4
+    /// at 1 ms integrates the true dynamics of `plant`, with the motor torque held over each
+    /// 5 ms tick as the MIT loop holds its command, and the observer sees the true q, dq and
+    /// that torque. Returns the worst `|r - ext|` after 0.5 s and the top joint speed.
+    fn swing(plant: &Dynamics, d: &Dynamics, ext: Joints, amp: f64, w_ref: f64) -> (f64, f64) {
         let mut c = TrackingController::new(
             d.clone(),
             contact(f64::INFINITY),
             &ArmConfig::maker_arm_v1(),
+            None,
         )
         .unwrap();
-        let ext = [0.3, -0.2, 0.15, -0.1, 0.05, 0.08];
-        let (amp, w_ref) = (0.5, PI);
         let reference = |t: f64| -> (Joints, Joints, Joints) {
             let phase = |j: usize| w_ref * t + j as f64;
             (
@@ -929,16 +1107,6 @@ mod tests {
                 std::array::from_fn(|j| -amp * w_ref * w_ref * phase(j).sin()),
             )
         };
-        let accel = |q: &Joints, dq: &Joints, tau: &Joints| -> Joints {
-            let bias = d.inverse(q, dq, &[0.0; ARM_DOF]);
-            solve(
-                d.mass_matrix(q),
-                std::array::from_fn(|j| tau[j] + ext[j] - bias[j]),
-            )
-        };
-        let axpy =
-            |a: &Joints, s: f64, b: &Joints| -> Joints { std::array::from_fn(|j| a[j] + s * b[j]) };
-        let step = 0.001;
         let (mut q, mut dq, _) = reference(0.0);
         let (mut tau, mut worst, mut fastest) = ([0.0; ARM_DOF], 0.0_f64, 0.0_f64);
         for k in 0..=800 {
@@ -956,22 +1124,55 @@ mod tests {
                 ddq_ref[j] + 100.0 * (q_ref[j] - q[j]) + 20.0 * (dq_ref[j] - dq[j])
             });
             tau = d.inverse(&q, &dq, &ddq);
-            for _ in 0..5 {
-                let a1 = accel(&q, &dq, &tau);
-                let (q2, v2) = (axpy(&q, step / 2.0, &dq), axpy(&dq, step / 2.0, &a1));
-                let a2 = accel(&q2, &v2, &tau);
-                let (q3, v3) = (axpy(&q, step / 2.0, &v2), axpy(&dq, step / 2.0, &a2));
-                let a3 = accel(&q3, &v3, &tau);
-                let (q4, v4) = (axpy(&q, step, &v3), axpy(&dq, step, &a3));
-                let a4 = accel(&q4, &v4, &tau);
-                q = std::array::from_fn(|j| {
-                    q[j] + step / 6.0 * (dq[j] + 2.0 * v2[j] + 2.0 * v3[j] + v4[j])
-                });
-                dq = std::array::from_fn(|j| {
-                    dq[j] + step / 6.0 * (a1[j] + 2.0 * a2[j] + 2.0 * a3[j] + a4[j])
-                });
-            }
+            (q, dq) = rk4_tick(plant, ext, q, dq, 0.001, |_, _| tau);
         }
+        (worst, fastest)
+    }
+
+    /// One 5 ms tick of the true dynamics of `plant` under the motor torque `motor(q, dq)`
+    /// and `ext`, by RK4 at `step`.
+    fn rk4_tick(
+        plant: &Dynamics,
+        ext: Joints,
+        mut q: Joints,
+        mut dq: Joints,
+        step: f64,
+        motor: impl Fn(&Joints, &Joints) -> Joints,
+    ) -> (Joints, Joints) {
+        let accel = |q: &Joints, dq: &Joints| -> Joints {
+            let tau = motor(q, dq);
+            let bias = plant.inverse(q, dq, &[0.0; ARM_DOF]);
+            solve(
+                plant.mass_matrix(q),
+                std::array::from_fn(|j| tau[j] + ext[j] - bias[j]),
+            )
+        };
+        let axpy =
+            |a: &Joints, s: f64, b: &Joints| -> Joints { std::array::from_fn(|j| a[j] + s * b[j]) };
+        for _ in 0..(H / step).round() as usize {
+            let a1 = accel(&q, &dq);
+            let (q2, v2) = (axpy(&q, step / 2.0, &dq), axpy(&dq, step / 2.0, &a1));
+            let a2 = accel(&q2, &v2);
+            let (q3, v3) = (axpy(&q, step / 2.0, &v2), axpy(&dq, step / 2.0, &a2));
+            let a3 = accel(&q3, &v3);
+            let (q4, v4) = (axpy(&q, step, &v3), axpy(&dq, step, &a3));
+            let a4 = accel(&q4, &v4);
+            q = std::array::from_fn(|j| {
+                q[j] + step / 6.0 * (dq[j] + 2.0 * v2[j] + 2.0 * v3[j] + v4[j])
+            });
+            dq = std::array::from_fn(|j| {
+                dq[j] + step / 6.0 * (a1[j] + 2.0 * a2[j] + 2.0 * a3[j] + a4[j])
+            });
+        }
+        (q, dq)
+    }
+
+    #[test]
+    fn observer_recovers_a_constant_push_on_a_moving_arm() {
+        // Every joint swings 0.5 rad at 0.5 Hz (up to 1.57 rad/s).
+        let d = vertical([0.0, -9.81, 0.0]);
+        let ext = [0.3, -0.2, 0.15, -0.1, 0.05, 0.08];
+        let (worst, fastest) = swing(&d, &d, ext, 0.5, PI);
         assert!(fastest > 1.4, "the arm must move: {fastest} rad/s");
         // RK4 is converged here (half the step moves `worst` by 1e-11 N m). What is left is
         // the observer's own discretization: it takes C^T dq - G at the tick's end for the
@@ -980,6 +1181,25 @@ mod tests {
         // it. Dropping either term of `Mdot dq - C dq`, or flipping a sign, gives 0.13 to
         // 0.42 N m.
         assert!(worst < 0.03, "r misses the push by {worst} N m");
+    }
+
+    #[test]
+    fn the_observer_reads_zero_in_free_motion_when_the_model_has_the_armature() {
+        // The plant has rotor inertia; the model is given the same armature.
+        let arm = [0.02, 0.015, 0.01, 0.008, 0.005, 0.003];
+        let plant = vertical_with([0.0, -9.81, 0.0], arm);
+        let (worst, fastest) = swing(&plant, &plant, [0.0; 6], 0.5, PI);
+        assert!(fastest > 1.4, "the arm must move: {fastest} rad/s");
+        // The same discretization floor as the push test (13 mN m); with no push r is
+        // that floor alone.
+        assert!(worst < 0.03, "r reads {worst} N m in free motion");
+        // A model that lacks the armature misreads the rotor inertia as a push.
+        let bare = vertical([0.0, -9.81, 0.0]);
+        let (blind, _) = swing(&plant, &bare, [0.0; 6], 0.5, PI);
+        assert!(
+            blind > 0.1,
+            "a model without the armature reads only {blind} N m"
+        );
     }
 
     #[test]
@@ -1109,6 +1329,39 @@ mod tests {
     }
 
     #[test]
+    fn a_dropped_controller_reports_the_rows_it_still_held() {
+        let mut c = ctrl(contact(f64::INFINITY));
+        let shared = c.shared();
+        c.update(&at_rest(0.0), H);
+        {
+            let _reader = shared.ring.lock().unwrap();
+            c.update(&at_rest(0.005), H);
+            c.update(&at_rest(0.010), H);
+            drop(c); // the ring is locked: both rows stay queued
+        }
+        let (rows, dropped) = shared.drain();
+        assert_eq!((rows.len(), dropped), (1, 2));
+        assert_eq!(shared.drain().1, 0);
+    }
+
+    #[test]
+    fn restart_for_loop_clears_the_bench_rows() {
+        let mut c = ctrl(contact(f64::INFINITY));
+        let shared = c.shared();
+        c.update(&at_rest(0.0), H);
+        {
+            let _reader = shared.ring.lock().unwrap();
+            c.update(&at_rest(0.005), H); // queued, not in the ring
+        }
+        c.restart_for_loop().unwrap();
+        assert_eq!(shared.drain(), (vec![], 0));
+        c.update(&at_rest(7.0), H);
+        let (rows, dropped) = shared.drain();
+        assert_eq!((rows.len(), dropped), (1, 0));
+        assert_eq!(rows[0].tick_t, 7.0);
+    }
+
+    #[test]
     fn one_10_ms_tick_equals_two_5_ms_ticks() {
         let mut a = ctrl(contact(f64::INFINITY));
         let mut b = ctrl(contact(f64::INFINITY));
@@ -1233,7 +1486,564 @@ mod tests {
         assert!(TrackingController::new(
             vertical([0.0, 0.0, -9.81]),
             TrackingParams::default(),
-            &short
+            &short,
+            None
+        )
+        .is_err());
+    }
+
+    /// A recorded 200-tick state sequence with a plan on every joint, a push past the
+    /// deadband on joint 2, noise on every reading, a repeated stamp and a 30 ms gap. The
+    /// readings come from integer arithmetic alone, so they are the same on every platform.
+    /// Returns the FNV-1a digest of the bits of every command field, in tick order.
+    fn pin_digest(params: TrackingParams) -> u64 {
+        pin_digest_with(params, None)
+    }
+
+    fn pin_digest_with(params: TrackingParams, residual: Option<ResidualModel>) -> u64 {
+        let mut c = TrackingController::new(
+            vertical([0.0, -9.81, 0.0]),
+            params,
+            &ArmConfig::maker_arm_v1(),
+            residual,
+        )
+        .unwrap();
+        let mut seed: u64 = 20261016;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0
+        };
+        let rows: Vec<Row> = (0..=120)
+            .map(|k| {
+                let mut r = [0.0; ROW];
+                for (j, v) in r.iter_mut().take(ARM_DOF).enumerate() {
+                    *v = 0.002 * k as f64 * (j as f64 - 2.5) / 2.5;
+                }
+                r[ARM_DOF] = -1.0;
+                r
+            })
+            .collect();
+        c.shared().push(Push::new(0.0, 0.01, rows).unwrap());
+        let mut digest: u64 = 0xcbf29ce484222325;
+        let mut t = 0.0;
+        for k in 0..200 {
+            if k == 150 {
+                t += 0.025; // this tick lands 30 ms after the last
+            }
+            let q: Joints = std::array::from_fn(|j| 0.1 * j as f64 + 0.01 * next());
+            let dq: Joints = std::array::from_fn(|_| 0.2 * next());
+            let mut tau: Joints = std::array::from_fn(|_| 0.3 * next());
+            if (40..90).contains(&k) {
+                tau[1] -= 1.5;
+            }
+            let out = c.update(&st(t, q, dq, tau), H);
+            for jc in &out {
+                for v in [jc.pos, jc.vel, jc.kp, jc.kd, jc.tau] {
+                    for b in v.to_bits().to_le_bytes() {
+                        digest = (digest ^ u64::from(b)).wrapping_mul(0x100000001b3);
+                    }
+                }
+            }
+            if k != 100 {
+                t += H; // tick 101 repeats tick 100's stamp
+            }
+        }
+        digest
+    }
+
+    /// The digests of `pin_digest` on main (d816104, which gives fadf948's commands), with
+    /// `contact(0.5)` and with rung F. They were checked equal on aarch64 (Jetson Thor, GitHub
+    /// ubuntu-24.04-arm) and x86_64 (GitHub ubuntu-latest), so one pin serves every
+    /// architecture.
+    const PIN: (u64, u64) = (0x943a1b511aea7702, 0xe33d60f953c86b5a);
+
+    #[test]
+    fn with_dob_off_the_commands_are_mains() {
+        let off = |dob_f: f64, base: TrackingParams| TrackingParams { dob_f, ..base };
+        let on = pin_digest(contact(0.5));
+        let free_d = pin_digest(free());
+        // dob_f does nothing while dob is off.
+        assert_eq!(pin_digest(off(0.7, contact(0.5))), on);
+        assert_eq!(pin_digest(off(40.0, free())), free_d);
+        assert_eq!(on, PIN.0, "contact: {on:#018x}");
+        assert_eq!(free_d, PIN.1, "rung F: {free_d:#018x}");
+    }
+
+    /// The tests' plant (the model itself, under gravity) held at mid-range by the controller
+    /// with `ext` acting on it: the motor runs the MIT law on the clamped command, held over
+    /// each tick, and reports its torque. Returns the controller, the final pose, the start
+    /// pose and the joint 2 offset at 0.5 s.
+    fn hold_against(ext: Joints, dob: bool) -> (TrackingController, Joints, Joints, f64) {
+        hold_against_with(ext, dob, None, |_| {})
+    }
+
+    /// `hold_against` with a residual, calling `each` on the controller after every tick.
+    fn hold_against_with(
+        ext: Joints,
+        dob: bool,
+        residual: Option<ResidualModel>,
+        mut each: impl FnMut(&TrackingController),
+    ) -> (TrackingController, Joints, Joints, f64) {
+        let config = ArmConfig::maker_arm_v1();
+        let plant = vertical([0.0, -9.81, 0.0]);
+        let mut p = contact(0.5);
+        p.dob = dob;
+        let mut c = TrackingController::new(plant.clone(), p, &config, residual).unwrap();
+        let q0: Joints =
+            std::array::from_fn(|j| (config.joints[j].q_lo + config.joints[j].q_hi) / 2.0);
+        let (mut q, mut dq) = (q0, [0.0; ARM_DOF]);
+        let mit = |cmd: &ArmCommand, q: &Joints, dq: &Joints| -> Joints {
+            std::array::from_fn(|j| {
+                let m = &cmd[j];
+                m.kp * (m.pos - q[j]) + m.kd * (m.vel - dq[j]) + m.tau
+            })
+        };
+        let mut tau = [0.0; ARM_DOF];
+        let mut half = 0.0;
+        for k in 0..=200 {
+            let out = c.update(&st(k as f64 * H, q, dq, tau), H);
+            let (cmd, _) = clamp_command(&out, &config).unwrap();
+            if k == 100 {
+                half = c.offset[1];
+            }
+            each(&c);
+            (q, dq) = rk4_tick(&plant, ext, q, dq, 0.0005, |q, dq| mit(&cmd, q, dq));
+            tau = mit(&cmd, &q, &dq);
+        }
+        (c, q, q0, half)
+    }
+
+    #[test]
+    fn a_held_external_torque_is_cancelled_up_to_the_deadband() {
+        let mut ext = [0.0; ARM_DOF];
+        ext[1] = 0.3;
+        let (c, q, q0, _) = hold_against(ext, true);
+        let tel = c.shared().telemetry().unwrap();
+        assert!(
+            (tel.tau_dob[1] + 0.3).abs() < 0.02,
+            "tau_dob {}",
+            tel.tau_dob[1]
+        );
+        assert_eq!(tel.offset[1], 0.0, "below the deadband the reference stays");
+        // The compensation takes the push off the spring: the pose error shrinks.
+        let (_, q_off, _, _) = hold_against(ext, false);
+        let (with, without) = ((q[1] - q0[1]).abs(), (q_off[1] - q0[1]).abs());
+        assert!(without > 1e-3, "the push must bend the arm: {without} rad");
+        assert!(
+            with < 0.1 * without,
+            "error {with} rad with dob, {without} without"
+        );
+
+        ext[1] = 0.8;
+        let (c, _, _, half) = hold_against(ext, true);
+        let tel = c.shared().telemetry().unwrap();
+        assert_eq!(
+            tel.tau_dob[1], -0.5,
+            "the compensation stops at the deadband"
+        );
+        // The admittance yields along the push towards (0.8 - 0.5) / K_a.
+        let ka = 0.25 * ArmConfig::maker_arm_v1().joints[1].kp;
+        assert!(
+            tel.offset[1] > half && half > 0.0,
+            "{half} then {}",
+            tel.offset[1]
+        );
+        assert!(tel.offset[1] > 0.6 * 0.3 / ka, "offset {}", tel.offset[1]);
+    }
+
+    #[test]
+    fn a_gap_tick_holds_the_compensation_and_then_follows_the_restarted_observer() {
+        let mut p = contact(0.5);
+        p.dob = true;
+        let mut c = ctrl(p);
+        let mut tau = [0.0; 6];
+        tau[0] = -0.3; // a static arm reads tau_ext = -tau_m
+        let mut t = 0.0;
+        for _ in 0..=100 {
+            c.update(&st(t, [0.0; 6], [0.0; 6], tau), H);
+            t += H;
+        }
+        let before = c.shared().telemetry().unwrap().tau_dob;
+        assert!((before[0] + 0.3).abs() < 1e-3, "{}", before[0]);
+        t += 0.025; // this tick lands 30 ms after the last
+        let out = c.update(&st(t, [0.0; 6], [0.0; 6], tau), H);
+        let tel = c.shared().telemetry().unwrap();
+        assert_eq!(c.r[0], 0.0, "the observer restarted");
+        assert_eq!(tel.tau_dob, before, "no torque step on the gap tick");
+        assert_eq!(out[0].tau, tel.tau_ff[0] + before[0]);
+        // Then r_f low-pass follows the restarted r: each tick moves it by exactly
+        // a (r - r_f), with no jump, and it settles back on the push.
+        let a = 1.0 - (-2.0 * PI * 5.0 * H).exp();
+        let mut prev = before[0];
+        for _ in 0..100 {
+            t += H;
+            c.update(&st(t, [0.0; 6], [0.0; 6], tau), H);
+            let now = c.shared().telemetry().unwrap().tau_dob[0];
+            let step = a * (c.r[0] + prev); // r_f before this tick is -prev
+            assert!((now - prev + step).abs() < 1e-12, "{now} from {prev}");
+            assert!(
+                (now - prev).abs() <= a * 0.3 + 1e-12,
+                "a jump: {prev} to {now}"
+            );
+            prev = now;
+        }
+        assert!((prev + 0.3).abs() < 1e-3, "settles back on -0.3: {prev}");
+    }
+
+    #[test]
+    fn a_known_residual_keeps_the_observer_at_zero() {
+        // The plant carries an extra 0.2 N m load on joint 3 (index 2) that the identified
+        // model misses: without a residual the observer reads it as a push.
+        let mut ext = [0.0; ARM_DOF];
+        ext[2] = -0.2;
+        let mut blind = 0.0_f64;
+        hold_against_with(ext, false, None, |c| blind = c.r[2]);
+        assert!(
+            (blind + 0.2).abs() < 0.01,
+            "r reads {blind} N m without the residual"
+        );
+        // A residual that gives exactly that load (the motor torque it takes) keeps r at
+        // zero once its history of 4 ticks is full and the observer has settled, and the
+        // feed-forward carries the load.
+        let mut bias = [0.0; ARM_DOF];
+        bias[2] = 0.2;
+        let (mut worst, mut k) = (0.0_f64, 0);
+        let (c, q, q0, _) = hold_against_with(
+            ext,
+            false,
+            Some(crate::residual::tests::constant(4, bias, 1.0)),
+            |c| {
+                // The skipped ticks let r start toward the load; it decays with the
+                // observer's 1/k_o = 20 ms, so the check starts 5 of those (20 ticks) later.
+                if k >= 4 + 20 {
+                    worst = worst.max(c.r[2].abs());
+                }
+                k += 1;
+            },
+        );
+        assert!(worst < 0.01, "r reads {worst} N m with the residual");
+        let tel = c.shared().telemetry().unwrap();
+        assert_eq!(tel.tau_res, bias);
+        assert_eq!(tel.residual_skips, 3, "the 4th tick fills the history");
+        assert!(
+            (q[2] - q0[2]).abs() < 1e-4,
+            "the load bends joint 3 by {}",
+            q[2] - q0[2]
+        );
+    }
+
+    #[test]
+    fn the_residual_enters_the_feed_forward_gated_like_friction() {
+        let mut bias = [0.0; ARM_DOF];
+        bias[1] = 0.25;
+        let mk = |r| {
+            TrackingController::new(vertical([0.0; 3]), free(), &ArmConfig::maker_arm_v1(), r)
+                .unwrap()
+        };
+        let (mut a, mut b) = (
+            mk(None),
+            mk(Some(crate::residual::tests::constant(2, bias, 1.0))),
+        );
+        for k in 0..4 {
+            let (x, y) = (
+                a.update(&at_rest(k as f64 * H), H),
+                b.update(&at_rest(k as f64 * H), H),
+            );
+            let want = if k >= 1 { 0.25 } else { 0.0 }; // the second tick fills the history
+            assert_eq!(y[1].tau - x[1].tau, want, "tick {k}");
+            assert_eq!(y[0].tau, x[0].tau);
+        }
+        // Blocked: the gate removes it with friction and the inertial terms.
+        let mut c = TrackingController::new(
+            vertical([0.0; 3]),
+            contact(0.5),
+            &ArmConfig::maker_arm_v1(),
+            Some(crate::residual::tests::constant(2, bias, 1.0)),
+        )
+        .unwrap();
+        let mut tau = [0.0; 6];
+        tau[0] = -3.0;
+        let mut out = Vec::new();
+        for k in 0..=40 {
+            out = c.update(&st(k as f64 * H, [0.0; 6], [0.0; 6], tau), H);
+        }
+        assert_eq!(c.gate, 0.0);
+        assert_eq!(out[1].tau, 0.0, "gravity is zero on this arm");
+        assert_eq!(c.shared().telemetry().unwrap().tau_res, bias);
+    }
+
+    #[test]
+    fn a_gap_restarts_the_residual_history_and_a_repeated_stamp_holds_it() {
+        let mut c = TrackingController::new(
+            vertical([0.0, 0.0, -9.81]),
+            free(),
+            &ArmConfig::maker_arm_v1(),
+            Some(crate::residual::tests::constant(3, [0.1; 6], 1.0)),
+        )
+        .unwrap();
+        let mut t = 0.0;
+        for _ in 0..3 {
+            c.update(&at_rest(t), H);
+            t += H;
+        }
+        let tel = c.shared().telemetry().unwrap();
+        assert_eq!((tel.tau_res, tel.residual_skips), ([0.1; 6], 2));
+        c.update(&at_rest(t - H), H); // the same stamp again
+        let tel = c.shared().telemetry().unwrap();
+        assert_eq!((tel.tau_res, tel.residual_skips), ([0.1; 6], 2));
+        t += 0.025; // this tick lands 30 ms after the last: stale history
+        for n in 0..3 {
+            c.update(&at_rest(t), H);
+            t += H;
+            let tel = c.shared().telemetry().unwrap();
+            assert_eq!(tel.tau_res, [0.1; 6], "tick {n} after the gap");
+        }
+        // The refill holds the last value: those ticks are not skips.
+        assert_eq!(c.shared().telemetry().unwrap().residual_skips, 2);
+        // A NaN temperature is a skip, and the commands stay finite.
+        let mut s = at_rest(t);
+        s.motors[3].temperature = f64::NAN;
+        let out = c.update(&s, H);
+        assert!(out.iter().all(|j| j.tau.is_finite()));
+        let tel = c.shared().telemetry().unwrap();
+        assert_eq!((tel.tau_res, tel.residual_skips), ([0.0; 6], 3));
+    }
+
+    /// A residual with a history of 3 whose output 0 is the newest tick's q[0].
+    fn newest_q0() -> ResidualModel {
+        use crate::residual::{Layer, Mlp};
+        let n = 12 * 3 + 6;
+        let mut w = vec![0.0; 6 * n];
+        w[12 * 2] = 1.0;
+        let mlp = Mlp::new(vec![Layer { w, b: vec![0.0; 6] }]).unwrap();
+        ResidualModel::new(mlp, 3, vec![0.0; n], vec![1.0; n], [1.0; 6], [1.0; 6]).unwrap()
+    }
+
+    #[test]
+    fn a_gap_tick_holds_the_residual_through_the_refill_and_then_follows_the_model() {
+        let mut c = TrackingController::new(
+            vertical([0.0, 0.0, -9.81]),
+            free(),
+            &ArmConfig::maker_arm_v1(),
+            Some(newest_q0()),
+        )
+        .unwrap();
+        let at = |t: f64, q0: f64| {
+            let mut q = [0.0; 6];
+            q[0] = q0;
+            st(t, q, [0.0; 6], [0.0; 6])
+        };
+        let mut t = 0.0;
+        for _ in 0..10 {
+            c.update(&at(t, 0.1), H);
+            t += H;
+        }
+        let settled = c.shared().telemetry().unwrap();
+        assert_eq!((settled.tau_res[0], settled.residual_skips), (0.1, 2));
+        t += 0.025; // a gap; the arm reads q[0] = 0.3 from here on
+        for n in 0..3 {
+            let out = c.update(&at(t, 0.3), H);
+            t += H;
+            let tel = c.shared().telemetry().unwrap();
+            let want = if n < 2 {
+                settled.tau_res
+            } else {
+                [0.3, 0.0, 0.0, 0.0, 0.0, 0.0]
+            };
+            assert_eq!(tel.tau_res, want, "tick {n} after the gap");
+            assert_eq!(out[0].tau, tel.tau_ff[0]);
+        }
+        assert_eq!(
+            c.shared().telemetry().unwrap().residual_skips,
+            2,
+            "no skip in the refill"
+        );
+        // A gap then a NaN reading during the refill: zero and a skip, not the held value, and
+        // zero until the history is full again.
+        t += 0.025;
+        c.update(&at(t, 0.3), H);
+        t += H;
+        c.update(&at(t, f64::NAN), H);
+        let tel = c.shared().telemetry().unwrap();
+        assert_eq!((tel.tau_res, tel.residual_skips), ([0.0; 6], 3));
+        for n in 0..3 {
+            t += H;
+            c.update(&at(t, 0.2), H);
+            let tel = c.shared().telemetry().unwrap();
+            let want = if n < 2 { 0.0 } else { 0.2 };
+            assert_eq!(tel.tau_res[0], want, "tick {n} after the NaN");
+        }
+        assert_eq!(c.shared().telemetry().unwrap().residual_skips, 5);
+        // A gap during the start fill holds nothing: those ticks stay zero skips.
+        let mut c = TrackingController::new(
+            vertical([0.0, 0.0, -9.81]),
+            free(),
+            &ArmConfig::maker_arm_v1(),
+            Some(newest_q0()),
+        )
+        .unwrap();
+        c.update(&at(0.0, 0.1), H);
+        c.update(&at(0.030, 0.1), H);
+        let tel = c.shared().telemetry().unwrap();
+        assert_eq!((tel.tau_res, tel.residual_skips), ([0.0; 6], 2));
+    }
+
+    #[test]
+    fn a_glitched_temperature_is_a_skip_not_a_saturated_torque() {
+        let mut c = TrackingController::new(
+            vertical([0.0, 0.0, -9.81]),
+            free(),
+            &ArmConfig::maker_arm_v1(),
+            Some(newest_q0()),
+        )
+        .unwrap();
+        let at = |t: f64, temp: f64| {
+            let mut q = [0.0; 6];
+            q[0] = 0.1;
+            let mut s = st(t, q, [0.0; 6], [0.0; 6]);
+            for m in &mut s.motors {
+                m.temperature = temp;
+            }
+            s
+        };
+        let mut t = 0.0;
+        for _ in 0..5 {
+            c.update(&at(t, 0.5), H);
+            t += H;
+        }
+        assert_eq!(c.shared().telemetry().unwrap().residual_skips, 2);
+        // 6553.5 degC (a raw 0xFFFF / 10) normalizes to 6553.5 with x_std 1, past X_BOUND.
+        let out = c.update(&at(t, 6553.5), H);
+        let tel = c.shared().telemetry().unwrap();
+        assert_eq!((tel.tau_res, tel.residual_skips), ([0.0; 6], 3));
+        assert!(out.iter().all(|j| j.tau.is_finite() && j.pos.is_finite()));
+        t += H;
+        c.update(&at(t, 0.5), H);
+        assert_eq!(
+            c.shared().telemetry().unwrap().tau_res[0],
+            0.1,
+            "back on a good reading"
+        );
+        // During a gap hold it ends the hold, as a non-finite reading does.
+        t += 0.030;
+        c.update(&at(t, 0.5), H);
+        assert_eq!(c.shared().telemetry().unwrap().tau_res[0], 0.1, "held");
+        t += H;
+        c.update(&at(t, 6553.5), H);
+        let tel = c.shared().telemetry().unwrap();
+        assert_eq!((tel.tau_res, tel.residual_skips), ([0.0; 6], 4));
+        t += H;
+        c.update(&at(t, 0.5), H);
+        // The hold ended on the glitch, so with the history of 3 full this is the model again.
+        let tel = c.shared().telemetry().unwrap();
+        assert_eq!((tel.tau_res[0], tel.residual_skips), (0.1, 4));
+    }
+
+    #[test]
+    fn an_overflow_inside_the_net_is_a_skip_and_the_command_stays_finite() {
+        use crate::residual::{Layer, Mlp};
+        // Layer 0 overflows to inf before its tanh (which gives 1), and the last layer then
+        // sums eight 1e308 terms to inf: a non-finite output from in-range inputs.
+        let n = 12 + 6;
+        let mut w0 = vec![0.0; 8 * n];
+        for i in 0..8 {
+            w0[i * n] = 1e308;
+        }
+        let mlp = Mlp::new(vec![
+            Layer {
+                w: w0,
+                b: vec![1e308; 8],
+            },
+            Layer {
+                w: vec![1e308; 6 * 8],
+                b: vec![0.0; 6],
+            },
+        ])
+        .unwrap();
+        let r = ResidualModel::new(mlp, 1, vec![0.0; n], vec![1.0; n], [1.0; 6], [1.0; 6]).unwrap();
+        let mut c = TrackingController::new(
+            vertical([0.0; 3]),
+            free(),
+            &ArmConfig::maker_arm_v1(),
+            Some(r),
+        )
+        .unwrap();
+        let mut q = [0.0; 6];
+        q[0] = 1.0;
+        let out = c.update(&st(0.0, q, [0.0; 6], [0.0; 6]), H);
+        let tel = c.shared().telemetry().unwrap();
+        assert_eq!((tel.tau_res, tel.residual_skips), ([0.0; 6], 1));
+        assert!(out.iter().all(|j| j.tau.is_finite() && j.pos.is_finite()));
+    }
+
+    #[test]
+    fn without_a_residual_the_commands_are_task_4s() {
+        // pin_digest passes no residual; these are the PIN digests and c8626ef's digest of the
+        // dob-on sequence.
+        let mut p = contact(0.5);
+        p.dob = true;
+        let on = pin_digest(contact(0.5));
+        let free_d = pin_digest(free());
+        let dob = pin_digest_with(p, None);
+        assert_eq!(on, PIN.0, "contact: {on:#018x}");
+        assert_eq!(free_d, PIN.1, "rung F: {free_d:#018x}");
+        assert_eq!(dob, PIN_DOB, "dob on: {dob:#018x}");
+        // A residual changes them, so the digest does see it.
+        let r = crate::residual::tests::constant(2, [0.01; 6], 1.0);
+        assert_ne!(pin_digest_with(contact(0.5), Some(r)), on);
+    }
+
+    /// `pin_digest` of `contact(0.5)` with `dob` on, on c8626ef (task 4's head). Like `PIN`, it
+    /// is checked on every architecture (aarch64 and x86_64 CI).
+    const PIN_DOB: u64 = 0x004477863f471ee4;
+
+    #[test]
+    fn with_dob_off_the_compensation_reads_zero() {
+        let mut c = ctrl(contact(0.5));
+        let mut tau = [0.0; 6];
+        tau[0] = -0.3;
+        for k in 0..=100 {
+            c.update(&st(k as f64 * H, [0.0; 6], [0.0; 6], tau), H);
+        }
+        assert_eq!(c.shared().telemetry().unwrap().tau_dob, [0.0; 6]);
+    }
+
+    #[test]
+    fn dob_needs_a_finite_deadband() {
+        let check = |f: fn(&mut TrackingParams)| {
+            let mut p = contact(0.5);
+            p.dob = true;
+            f(&mut p);
+            p.validate()
+        };
+        assert!(check(|_| {}).is_ok());
+        assert!(check(|p| p.tau_th = [f64::INFINITY; ARM_DOF]).is_err());
+        assert!(check(|p| p.tau_th[4] = f64::INFINITY).is_err());
+        assert!(check(|p| p.dob_f = 0.0).is_err());
+        assert!(check(|p| p.dob_f = -5.0).is_err());
+        assert!(check(|p| p.dob_f = f64::NAN).is_err());
+        assert!(check(|p| p.dob_f = f64::INFINITY).is_err());
+        assert!(
+            check(|p| p.contact = false).is_err(),
+            "rung F has no observer"
+        );
+        // The default stays valid, and dob_f is checked with dob off too.
+        assert!(TrackingParams::default().validate().is_ok());
+        let p = TrackingParams {
+            dob_f: 0.0,
+            ..TrackingParams::default()
+        };
+        assert!(p.validate().is_err());
+        assert!(TrackingController::new(
+            vertical([0.0, 0.0, -9.81]),
+            TrackingParams {
+                dob: true,
+                ..TrackingParams::default()
+            },
+            &ArmConfig::maker_arm_v1(),
+            None
         )
         .is_err());
     }

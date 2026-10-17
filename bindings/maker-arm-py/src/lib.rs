@@ -147,6 +147,8 @@ pub(crate) fn config_from_dict(profile: &Bound<'_, PyDict>) -> PyResult<ArmConfi
             override_f64(d, "kp", &mut j.kp)?;
             override_f64(d, "kd", &mut j.kd)?;
             override_f64(d, "tau_max", &mut j.tau_max)?;
+            override_f64(d, "direction", &mut j.direction)?;
+            override_f64(d, "offset", &mut j.offset)?;
         }
     }
     override_f64(profile, "max_velocity", &mut c.max_velocity)?;
@@ -154,6 +156,221 @@ pub(crate) fn config_from_dict(profile: &Bound<'_, PyDict>) -> PyResult<ArmConfi
     override_f64(profile, "kd_max", &mut c.kd_max)?;
     override_f64(profile, "limit_margin", &mut c.limit_margin)?;
     Ok(c)
+}
+
+/// The config an arm session runs with: the v1 profile with the numeric overrides in
+/// `profile`, after checking that no override loosens a v1 limit. A session may only be
+/// stricter than `maker_arm_v1`: per joint `kp`, `kd` and `tau_max` at most the v1 value and
+/// `[q_lo, q_hi]` inside the v1 range, `max_velocity` at most v1, `direction` exactly -1 or
+/// +1 and `|offset| <= pi`. Every number must be finite. The error is a ValueError that names
+/// the field (for example `joints[1].tau_max`); callers run this before any connection opens.
+pub(crate) fn reduced_config(profile: &Bound<'_, PyDict>) -> PyResult<ArmConfig> {
+    check_known_keys(profile)?;
+    let c = config_from_dict(profile)?;
+    let v1 = ArmConfig::maker_arm_v1();
+    let bad = |field: String, why: String| PyValueError::new_err(format!("{field}: {why}"));
+    let finite = |field: String, x: f64| {
+        if x.is_finite() {
+            Ok(())
+        } else {
+            Err(bad(field, format!("{x} is not finite")))
+        }
+    };
+    let at_most = |field: String, x: f64, cap: f64| {
+        if x <= cap {
+            Ok(())
+        } else {
+            Err(bad(
+                field,
+                format!("{x} exceeds the maker_arm_v1 value {cap}"),
+            ))
+        }
+    };
+    for (i, (j, b)) in c.joints.iter().zip(v1.joints.iter()).enumerate() {
+        for (name, x) in [
+            ("kp", j.kp),
+            ("kd", j.kd),
+            ("tau_max", j.tau_max),
+            ("q_lo", j.q_lo),
+            ("q_hi", j.q_hi),
+            ("direction", j.direction),
+            ("offset", j.offset),
+        ] {
+            finite(format!("joints[{i}].{name}"), x)?;
+        }
+        at_most(format!("joints[{i}].kp"), j.kp, b.kp)?;
+        at_most(format!("joints[{i}].kd"), j.kd, b.kd)?;
+        at_most(format!("joints[{i}].tau_max"), j.tau_max, b.tau_max)?;
+        for (name, x) in [("kp", j.kp), ("kd", j.kd), ("tau_max", j.tau_max)] {
+            if x < 0.0 {
+                return Err(bad(
+                    format!("joints[{i}].{name}"),
+                    format!("{x} is negative"),
+                ));
+            }
+        }
+        if j.q_lo < b.q_lo {
+            return Err(bad(
+                format!("joints[{i}].q_lo"),
+                format!("{} is below the maker_arm_v1 value {}", j.q_lo, b.q_lo),
+            ));
+        }
+        if j.q_hi > b.q_hi {
+            return Err(bad(
+                format!("joints[{i}].q_hi"),
+                format!("{} is above the maker_arm_v1 value {}", j.q_hi, b.q_hi),
+            ));
+        }
+        if j.q_lo >= j.q_hi {
+            return Err(bad(
+                format!("joints[{i}].q_lo"),
+                format!("range [{}, {}] is empty", j.q_lo, j.q_hi),
+            ));
+        }
+        if j.direction != 1.0 && j.direction != -1.0 {
+            return Err(bad(
+                format!("joints[{i}].direction"),
+                format!("{} is not -1.0 or 1.0", j.direction),
+            ));
+        }
+        if j.offset.abs() > std::f64::consts::PI {
+            return Err(bad(
+                format!("joints[{i}].offset"),
+                format!("|{}| exceeds pi", j.offset),
+            ));
+        }
+    }
+    finite("max_velocity".into(), c.max_velocity)?;
+    at_most("max_velocity".into(), c.max_velocity, v1.max_velocity)?;
+    if c.max_velocity <= 0.0 {
+        return Err(bad("max_velocity".into(), "must be positive".into()));
+    }
+    // Not loosenable from a session profile: these stay the v1 values.
+    for (name, x, v) in [
+        ("kp_max", c.kp_max, v1.kp_max),
+        ("kd_max", c.kd_max, v1.kd_max),
+        ("limit_margin", c.limit_margin, v1.limit_margin),
+    ] {
+        finite(name.into(), x)?;
+        if name != "limit_margin" && x < 0.0 {
+            // f64::clamp(0.0, kp_max) panics in the control thread when the bound is negative.
+            return Err(bad(name.into(), format!("{x} is negative")));
+        }
+        if name == "limit_margin" {
+            if x < v {
+                return Err(bad(
+                    name.into(),
+                    format!("{x} is below the maker_arm_v1 value {v}"),
+                ));
+            }
+        } else {
+            at_most(name.into(), x, v)?;
+        }
+    }
+    // The clamp narrows each joint to [q_lo + m, q_hi - m]; an empty band would panic it.
+    for (i, j) in c.joints.iter().enumerate() {
+        if j.q_hi - j.q_lo <= 2.0 * c.limit_margin {
+            return Err(bad(
+                "limit_margin".into(),
+                format!(
+                    "{} leaves no range on joints[{i}] ([{}, {}])",
+                    c.limit_margin, j.q_lo, j.q_hi
+                ),
+            ));
+        }
+    }
+    Ok(c)
+}
+
+/// Session path only: refuse a key `profile()` does not emit (a typo would otherwise be a
+/// silent no-op) and a key that cannot be overridden (motor_id, name, model, control_rate_hz,
+/// feedback_timeout, temp_hold_c) unless it still carries the v1 value.
+fn check_known_keys(profile: &Bound<'_, PyDict>) -> PyResult<()> {
+    const TOP: [&str; 7] = [
+        "max_velocity",
+        "kp_max",
+        "kd_max",
+        "limit_margin",
+        "control_rate_hz",
+        "feedback_timeout",
+        "temp_hold_c",
+    ];
+    const JOINT: [&str; 9] = [
+        "kp",
+        "kd",
+        "tau_max",
+        "q_lo",
+        "q_hi",
+        "direction",
+        "offset",
+        "motor_id",
+        "name",
+    ];
+    // "model" is a passthrough as well.
+    let py = profile.py();
+    let v1 = config_to_dict(py, &ArmConfig::maker_arm_v1())?;
+    let v1 = v1.bind(py);
+    let overridable = [
+        "max_velocity",
+        "kp_max",
+        "kd_max",
+        "limit_margin",
+        "kp",
+        "kd",
+        "tau_max",
+        "q_lo",
+        "q_hi",
+        "direction",
+        "offset",
+    ];
+    let check = |field: String, key: &str, value: Bound<'_, PyAny>, base: &Bound<'_, PyDict>| {
+        if overridable.contains(&key) {
+            return Ok(());
+        }
+        let same = match base.get_item(key)? {
+            Some(b) => value.eq(b)?,
+            None => false,
+        };
+        if same {
+            Ok(())
+        } else {
+            Err(PyValueError::new_err(format!(
+                "{field}: cannot be changed from the maker_arm_v1 value"
+            )))
+        }
+    };
+    for (k, v) in profile.iter() {
+        let key: String = k
+            .extract()
+            .map_err(|_| PyValueError::new_err("profile keys must be strings"))?;
+        if key == "joints" {
+            let joints = v.downcast::<pyo3::types::PyList>()?;
+            let v1_joints = v1
+                .get_item("joints")?
+                .ok_or_else(|| PyValueError::new_err("v1 profile has no joints"))?;
+            let v1_joints = v1_joints.downcast::<pyo3::types::PyList>()?;
+            for (i, (item, base)) in joints.iter().zip(v1_joints.iter()).enumerate() {
+                let d = item.downcast::<PyDict>()?;
+                let base = base.downcast::<PyDict>()?;
+                for (jk, jv) in d.iter() {
+                    let jkey: String = jk.extract().map_err(|_| {
+                        PyValueError::new_err(format!("joints[{i}]: keys must be strings"))
+                    })?;
+                    if !JOINT.contains(&jkey.as_str()) && jkey != "model" {
+                        return Err(PyValueError::new_err(format!(
+                            "joints[{i}].{jkey}: unknown field"
+                        )));
+                    }
+                    check(format!("joints[{i}].{jkey}"), &jkey, jv, base)?;
+                }
+            }
+        } else if TOP.contains(&key.as_str()) {
+            check(key.clone(), &key, v, v1)?;
+        } else {
+            return Err(PyValueError::new_err(format!("{key}: unknown field")));
+        }
+    }
+    Ok(())
 }
 
 /// The single-point command clamp, as a pure function. `cmds` is a list of
@@ -202,6 +419,7 @@ fn maker_arm_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<kinematics::Kinematics>()?;
     m.add_class::<dynamics::Dynamics>()?;
     m.add_class::<tracking::Tracking>()?;
+    m.add_class::<tracking::Mlp>()?;
     Ok(())
 }
 
@@ -225,6 +443,17 @@ enum ArmHandle {
 struct Arm {
     handle: ArmHandle,
     config: ArmConfig,
+    /// The bus lock of a SocketCAN arm, held while the arm lives so that no other opener
+    /// probes the bus. Fields drop in order: the lock goes after the handle, whose drop
+    /// disables the motors.
+    _bus: Option<maker_arm_transport::BusLock>,
+}
+
+fn session_config(profile: Option<&Bound<'_, PyDict>>) -> PyResult<ArmConfig> {
+    match profile {
+        Some(p) => reduced_config(p),
+        None => Ok(ArmConfig::maker_arm_v1()),
+    }
 }
 
 fn err<E: std::fmt::Display>(e: E) -> PyErr {
@@ -299,26 +528,41 @@ impl Arm {
 #[pymethods]
 impl Arm {
     /// Connect to the built-in 7-motor simulator.
+    ///
+    /// `profile` (optional) is `maker_arm_rs.profile()` with numeric edits that may only
+    /// tighten it: lower `kp`, `kd`, `tau_max`, a narrower `q_lo`/`q_hi`, a lower
+    /// `max_velocity`, and per joint `direction` (-1.0 or 1.0) and `offset` (|offset| <= pi).
+    /// Anything else raises ValueError naming the field, before the session connects.
     #[staticmethod]
-    fn sim() -> PyResult<Arm> {
-        let config = ArmConfig::maker_arm_v1();
+    #[pyo3(signature = (profile = None))]
+    fn sim(profile: Option<&Bound<'_, PyDict>>) -> PyResult<Arm> {
+        let config = session_config(profile)?;
         let session =
             Session::connect(Box::new(SimArm::new(&config)), config.clone()).map_err(err)?;
         Ok(Arm {
             handle: ArmHandle::Idle(session),
             config,
+            _bus: None,
         })
     }
 
     /// Connect over SocketCAN, e.g. Arm.socketcan("can0").
+    /// `profile` as for `sim`; it is checked before the socket opens.
+    ///
+    /// Takes the bus lock of `interface` before the socket opens and holds it while the arm
+    /// lives. Raises RuntimeError, before any frame is sent, if another process holds it,
+    /// for example a `maker-arm-cli serve` daemon.
     #[staticmethod]
-    fn socketcan(interface: &str) -> PyResult<Arm> {
-        let config = ArmConfig::maker_arm_v1();
+    #[pyo3(signature = (interface, profile = None))]
+    fn socketcan(interface: &str, profile: Option<&Bound<'_, PyDict>>) -> PyResult<Arm> {
+        let config = session_config(profile)?;
+        let bus = maker_arm_transport::bus_lock(interface).map_err(err)?;
         let backend = maker_arm_transport::SocketCanBackend::open(interface).map_err(err)?;
         let session = Session::connect(Box::new(backend), config.clone()).map_err(err)?;
         Ok(Arm {
             handle: ArmHandle::Idle(session),
             config,
+            _bus: Some(bus),
         })
     }
 
@@ -439,6 +683,60 @@ impl Arm {
                 .map(|m| m.fault_bits as u16)
                 .collect::<Vec<_>>(),
         )?;
+        Ok(Some(d.into()))
+    }
+
+    /// The ticks since the last drain as columns, oldest first, or None if no loop is running.
+    ///
+    /// `t`, `tick` and `clamped` hold one entry per tick. `q`, `dq`, `tau`, `temp`,
+    /// `fault_bits` and `feedback_age` are what the controller read, and `cmd_pos`, `cmd_vel`,
+    /// `cmd_kp`, `cmd_kd` and `cmd_tau` are the command that went out after the clamp; each of
+    /// those holds one list per tick, seven wide. `dropped` counts the ticks lost since the
+    /// last drain because the ring held only 4000: a nonzero value marks a gap, never a
+    /// silent one. Join with `Tracking.drain` on `t`, not on the index. Works after the loop died, so the last ticks before a fault stay readable.
+    fn drain(&self, py: Python<'_>) -> PyResult<Option<Py<PyDict>>> {
+        let ArmHandle::Running(r) = &self.handle else {
+            return Ok(None);
+        };
+        let (records, dropped) = r.drain();
+        let d = PyDict::new(py);
+        d.set_item("t", records.iter().map(|r| r.t).collect::<Vec<_>>())?;
+        d.set_item("tick", records.iter().map(|r| r.tick).collect::<Vec<_>>())?;
+        d.set_item(
+            "clamped",
+            records.iter().map(|r| r.clamped).collect::<Vec<_>>(),
+        )?;
+        let motor = |f: &dyn Fn(&maker_arm::MotorState) -> f64| -> Vec<Vec<f64>> {
+            records
+                .iter()
+                .map(|r| r.motors.iter().map(f).collect())
+                .collect()
+        };
+        d.set_item("q", motor(&|m| m.position))?;
+        d.set_item("dq", motor(&|m| m.velocity))?;
+        d.set_item("tau", motor(&|m| m.torque))?;
+        d.set_item("temp", motor(&|m| m.temperature))?;
+        d.set_item(
+            "fault_bits",
+            // as u16: a Vec<u8> would convert to Python bytes, not a list
+            records
+                .iter()
+                .map(|r| r.motors.iter().map(|m| m.fault_bits as u16).collect())
+                .collect::<Vec<Vec<u16>>>(),
+        )?;
+        d.set_item("feedback_age", motor(&|m| m.feedback_age))?;
+        let sent = |f: &dyn Fn(&maker_arm::JointCommand) -> f64| -> Vec<Vec<f64>> {
+            records
+                .iter()
+                .map(|r| r.sent.iter().map(f).collect())
+                .collect()
+        };
+        d.set_item("cmd_pos", sent(&|c| c.pos))?;
+        d.set_item("cmd_vel", sent(&|c| c.vel))?;
+        d.set_item("cmd_kp", sent(&|c| c.kp))?;
+        d.set_item("cmd_kd", sent(&|c| c.kd))?;
+        d.set_item("cmd_tau", sent(&|c| c.tau))?;
+        d.set_item("dropped", dropped)?;
         Ok(Some(d.into()))
     }
 

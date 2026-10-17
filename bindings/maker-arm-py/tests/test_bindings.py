@@ -1,6 +1,7 @@
 """Golden parity with the protocol vectors — the same numbers as the Rust
 tests and the official SDK, asserted through the Python surface."""
 
+import random
 import threading
 import time
 
@@ -405,6 +406,49 @@ def test_dynamics_refuses_bad_models():
         m.Dynamics((0.0, 0.0, 0.0), CHAIN, [BODY] * 6, friction=[(0.1, 0.0, 0.0)] * 6)
 
 
+
+def test_dynamics_armature_adds_to_the_diagonal_and_to_inverse():
+    arm = [0.01, 0.02, 0.03, 0.04, 0.05, 0.06]
+    plain = _planar_dynamics()
+    heavy = m.Dynamics((0.0, 0.0, 0.0), CHAIN, [BODY] * 6, gravity=(0.0, -9.81, 0.0), armature=arm)
+    q = [0.1, -0.4, 0.7, 0.2, -0.3, 0.5]
+    ddq = [1.0, -2.0, 0.5, 3.0, -1.0, 0.25]
+    a, b = plain.inverse(q, [0.0] * 6, ddq), heavy.inverse(q, [0.0] * 6, ddq)
+    assert all(abs(b[j] - a[j] - arm[j] * ddq[j]) < 1e-12 for j in range(6))
+    m0, m1 = plain.mass_matrix(q), heavy.mass_matrix(q)
+    for i in range(6):
+        for j in range(6):
+            assert abs(m1[i][j] - m0[i][j] - (arm[i] if i == j else 0.0)) < 1e-12
+
+
+def test_dynamics_friction_takes_three_or_five_entries():
+    three = m.Dynamics((0, 0, 0), CHAIN, [BODY] * 6, friction=[(0.2, 0.05, 0.01)] * 6)
+    five_off = m.Dynamics((0, 0, 0), CHAIN, [BODY] * 6, friction=[(0.2, 0.05, 0.01, 0.2, 1.0)] * 6)
+    dq = [0.05] * 6
+    assert three.friction(dq) == five_off.friction(dq)
+    stribeck = m.Dynamics((0, 0, 0), CHAIN, [BODY] * 6, friction=[(0.2, 0.05, 0.01, 0.3, 0.1)] * 6)
+    assert stribeck.friction(dq)[0] > three.friction(dq)[0] + 0.01
+    mixed = [(0.2, 0.05, 0.01)] * 3 + [(0.2, 0.05, 0.01, 0.3, 0.1)] * 3
+    out = m.Dynamics((0, 0, 0), CHAIN, [BODY] * 6, friction=mixed).friction(dq)
+    assert out[0] == three.friction(dq)[0] and out[5] == stribeck.friction(dq)[5]
+
+
+def test_dynamics_refuses_a_bad_stribeck_or_armature():
+    kw = dict(mount_rpy=(0, 0, 0), links=CHAIN, bodies=[BODY] * 6)
+    with pytest.raises(ValueError, match="static_"):
+        m.Dynamics(**kw, friction=[(0.2, 0.0, 0.01, 0.1, 1.0)] * 6)
+    with pytest.raises(ValueError, match="stribeck_v"):
+        m.Dynamics(**kw, friction=[(0.2, 0.0, 0.01, 0.2, 0.0)] * 6)
+    with pytest.raises(ValueError, match="friction"):
+        m.Dynamics(**kw, friction=[(0.2, 0.0, 0.01, 0.2)] * 6)
+    with pytest.raises(ValueError, match="armature"):
+        m.Dynamics(**kw, armature=[0.0, 0.0, -0.1, 0.0, 0.0, 0.0])
+    with pytest.raises(ValueError, match="armature"):
+        m.Dynamics(**kw, armature=[float("nan")] + [0.0] * 5)
+    with pytest.raises(ValueError, match="6 armature"):
+        m.Dynamics(**kw, armature=[0.0] * 5)
+
+
 # --- Tracking: the compliant tracking controller behind a thread-safe handle --------
 
 def test_tracking_holds_the_start_pose_with_gravity_feed_forward():
@@ -419,8 +463,120 @@ def test_tracking_holds_the_start_pose_with_gravity_feed_forward():
         assert pos == q[j] and vel == 0.0 and abs(tau - g[j]) < 1e-12
     assert out[6][0] == -1.0 and out[6][4] == 0.0
     tel = tr.telemetry()
-    assert set(tel) == {"r", "gate", "offset", "q_r", "tau_ff", "late_ticks", "gaps", "max_interval", "tick_t"}
+    assert set(tel) == {
+        "r", "gate", "offset", "q_r", "tau_ff", "tau_dob", "tau_res", "residual_skips",
+        "late_ticks", "gaps", "max_interval", "tick_t",
+    }
+    assert tel["tau_res"] == [0.0] * 6 and tel["residual_skips"] == 0
     assert tel["tick_t"] == 0.0
+
+
+def test_tracking_observer_compensation_cancels_a_held_push_below_the_deadband():
+    d = _planar_dynamics()
+    q = [0.1, -0.2, 0.3, 0.0, 0.2, -0.1, -1.0]
+    tau = [0.0, -0.3, 0.0, 0.0, 0.0, 0.0, 0.0]  # a static arm reads tau_ext = -tau_m
+    g = d.gravity(q[:6])
+    tau = [tau[j] + (g[j] if j < 6 else 0.0) for j in range(7)]
+    off = m.Tracking(d, params={"tau_th": [0.5] * 6, "dob_f": 7.0})
+    on = m.Tracking(d, params={"tau_th": [0.5] * 6, "dob": True, "dob_f": 7.0})
+    for k in range(201):
+        a = off.update(k * 0.005, q, [0.0] * 7, tau)
+        b = on.update(k * 0.005, q, [0.0] * 7, tau)
+    assert off.telemetry()["tau_dob"] == [0.0] * 6
+    tel = on.telemetry()
+    assert abs(tel["tau_dob"][1] + 0.3) < 1e-3
+    assert abs(b[1][4] - (a[1][4] - 0.3)) < 1e-3
+    assert on.drain()["tau_dob"][-1] == tel["tau_dob"]
+    with pytest.raises(ValueError, match="dob"):
+        m.Tracking(d, params={"dob": True})  # the default tau_th is infinite
+    with pytest.raises(ValueError, match="dob_f"):
+        m.Tracking(d, params={"tau_th": [0.5] * 6, "dob": True, "dob_f": 0.0})
+
+
+def _residual(history=2, bias=(0.0,) * 6, out_max=1.0, seed=7):
+    """The dict the lab's export writes: 12 * history + 6 -> 8 -> 6, torch's weight.tolist()."""
+    rng = random.Random(seed)
+    n = 12 * history + 6
+    w0 = [[rng.gauss(0.0, 0.3) for _ in range(n)] for _ in range(8)]
+    b0 = [rng.gauss(0.0, 0.1) for _ in range(8)]
+    w1 = [[rng.gauss(0.0, 0.3) for _ in range(8)] for _ in range(6)]
+    x_mean = [rng.gauss(0.0, 0.1) for _ in range(n)]
+    x_std = [rng.uniform(0.5, 2.0) for _ in range(n)]
+    x_mean[-6:], x_std[-6:] = [33.0] * 6, [5.0] * 6  # the temperatures, inside X_BOUND = 10 std
+    return {
+        "history": history,
+        "layers": [[w0, b0], [w1, [float(v) for v in bias]]],
+        "x_mean": x_mean,
+        "x_std": x_std,
+        "y_scale": [0.5] * 6,
+        "out_max": [out_max] * 6,
+    }
+
+
+def _forward(layers, x):
+    """w1 @ tanh(w0 @ x + b0) + b1 in plain Python."""
+    (w0, b0), (w1, b1) = layers
+    h = [math.tanh(sum(w * v for w, v in zip(row, x)) + b) for row, b in zip(w0, b0)]
+    return [sum(w * v for w, v in zip(row, h)) + b for row, b in zip(w1, b1)]
+
+
+def test_mlp_matches_numpy_on_the_export_format():
+    r = _residual()
+    x = [-1.0 + 2.0 * i / 29 for i in range(30)]
+    want = _forward(r["layers"], x)
+    got = m.Mlp(r["layers"]).forward(x)
+    assert len(got) == 6
+    assert max(abs(g - w) for g, w in zip(got, want)) < 1e-12
+    with pytest.raises(ValueError, match="layer 1"):
+        m.Mlp([r["layers"][0], [[[0.0] * 7] * 6, [0.0] * 6]])
+    with pytest.raises(ValueError, match="layer 0"):
+        m.Mlp([[[[0.0] * 3, [0.0] * 2], [0.0, 0.0]]])  # ragged rows
+    with pytest.raises(ValueError):
+        m.Mlp(r["layers"]).forward([0.0] * 29)
+
+
+def test_tracking_residual_enters_the_feed_forward_and_the_telemetry():
+    d = _planar_dynamics()
+    r = _residual(history=2)
+    q = [0.1, -0.2, 0.3, 0.0, 0.2, -0.1, -1.0]
+    temps = [31.0, 32.0, 33.0, 34.0, 35.0, 36.0, 30.0]
+    plain = m.Tracking(d, params={"contact": False})
+    tr = m.Tracking(d, params={"contact": False}, residual=r)
+    for k in range(3):
+        a = plain.update(k * 0.005, q, [0.0] * 7, [0.0] * 7)
+        b = tr.update(k * 0.005, q, [0.0] * 7, [0.0] * 7, temperature=temps)
+    # The reference by hand: two ticks of [q, dq], oldest first, then the temperatures.
+    x = (q[:6] + [0.0] * 6) * 2 + temps[:6]
+    x = [(v - mu) / sd for v, mu, sd in zip(x, r["x_mean"], r["x_std"])]
+    want = [max(-1.0, min(1.0, v * 0.5)) for v in _forward(r["layers"], x)]
+    tel = tr.telemetry()
+    assert max(abs(g - w) for g, w in zip(tel["tau_res"], want)) < 1e-12
+    assert tel["residual_skips"] == 1  # the first tick
+    for j in range(6):
+        assert abs(b[j][4] - (a[j][4] + want[j])) < 1e-12
+    dr = tr.drain()
+    assert dr["residual_skips"] == [1, 1, 1] and dr["tau_res"][0] == [0.0] * 6
+    assert plain.telemetry()["tau_res"] == [0.0] * 6
+    # A glitched temperature (a raw 0xFFFF / 10) is outside the trained range: a skip.
+    out = tr.update(3 * 0.005, q, [0.0] * 7, [0.0] * 7, temperature=[6553.5] * 7)
+    tel = tr.telemetry()
+    assert tel["tau_res"] == [0.0] * 6 and tel["residual_skips"] == 2
+    assert all(math.isfinite(v) for row in out for v in row)
+
+
+def test_tracking_refuses_a_bad_residual():
+    d = _planar_dynamics()
+    r = _residual(history=2)
+    with pytest.raises(ValueError, match="layer 0"):
+        m.Tracking(d, residual=dict(r, history=3))
+    with pytest.raises(ValueError, match="x_std"):
+        m.Tracking(d, residual=dict(r, x_std=[0.0] * 30))
+    with pytest.raises(ValueError, match="out_max"):
+        m.Tracking(d, residual=dict(r, out_max=[-1.0] * 6))
+    with pytest.raises(ValueError, match="unknown residual field"):
+        m.Tracking(d, residual=dict(r, y_mean=[0.0] * 6))
+    with pytest.raises(ValueError, match="missing"):
+        m.Tracking(d, residual={k: v for k, v in r.items() if k != "x_mean"})
 
 
 def test_tracking_rejects_bad_input():
@@ -558,3 +714,187 @@ def test_start_tracking_refuses_rung_f():
     assert a.state() == "enabled" and a.snapshot() is None
     assert len(tr.update(0.0, [0.0] * 7, [0.0] * 7, [0.0] * 7)) == 7  # still usable
     a.stop()
+
+
+# --- The telemetry ring: every tick's state and sent command, drained from Python ------
+
+
+def test_drain_returns_the_ticks_since_the_last_drain():
+    arm = m.Arm.sim()
+    arm.enable()
+    arm.start_hold()
+    time.sleep(0.25)
+    d = arm.drain()
+    assert 40 <= len(d["t"]) <= 60 and len(d["q"][0]) == 7 and d["dropped"] == 0
+    for col in ("q", "dq", "tau", "temp", "fault_bits", "feedback_age"):
+        assert len(d[col]) == len(d["t"]) and len(d[col][0]) == 7
+    for col in ("cmd_pos", "cmd_vel", "cmd_kp", "cmd_kd", "cmd_tau"):
+        assert len(d[col]) == len(d["t"]) and len(d[col][0]) == 7
+    assert len(d["tick"]) == len(d["clamped"]) == len(d["t"])
+    assert d["tick"] == list(range(d["tick"][0], d["tick"][0] + len(d["tick"])))
+    time.sleep(0.05)
+    assert arm.drain()["t"][0] > d["t"][-1]
+    arm.stop()
+
+
+def test_drain_is_none_without_a_loop():
+    arm = m.Arm.sim()
+    arm.enable()
+    assert arm.drain() is None
+
+
+def test_tracking_drain_gives_one_row_per_tick_and_counts_the_drops():
+    a = m.Arm.sim()
+    a.enable()
+    tr = m.Tracking(_planar_dynamics())
+    a.start_tracking(tr)
+    time.sleep(0.25)
+    loop = a.drain()
+    d = tr.drain()
+    a.stop()
+    assert d["dropped"] == 0 and len(d["tick_t"]) >= len(loop["t"]) > 20
+    assert d["tick_t"][: len(loop["t"])] == loop["t"]
+    for col in ("r", "offset", "q_r", "tau_ff", "tau_dob", "tau_res"):
+        assert len(d[col]) == len(d["tick_t"]) and len(d[col][0]) == 6
+    assert len(d["gate"]) == len(d["tick_t"])
+    assert tr.drain()["tick_t"] == []
+
+
+# --- Reduced caps and joint calibration for an arm session ------------------------------
+
+
+def _clamped_joint2_tau(profile):
+    a = m.Arm.sim(profile=profile) if profile is not None else m.Arm.sim()
+    a.enable()
+    heavy = (100.0, BODY[1], BODY[2])  # gravity on joint 2 then asks for several N m
+    a.start_tracking(m.Tracking(m.Dynamics((0.0, 0.0, 0.0), CHAIN, [heavy] * 6, gravity=(0.0, -9.81, 0.0))))
+    time.sleep(0.3)
+    d = a.drain()
+    a.stop()
+    return [row[1] for row in d["cmd_tau"]]
+
+
+def test_a_reduced_cap_reaches_the_clamp():
+    free = _clamped_joint2_tau(None)
+    assert max(abs(t) for t in free) > 3.0  # the test bites: gravity asks for more than 3 N m
+    p = m.profile()
+    p["joints"][1]["tau_max"] = 3.0
+    capped = _clamped_joint2_tau(p)
+    assert capped and max(abs(t) for t in capped) <= 3.0 + 1e-9
+    assert max(abs(t) for t in capped) > 2.9
+
+
+def test_clamp_command_applies_a_reduced_tau_max_override():
+    p = m.profile()
+    p["joints"][1]["tau_max"] = 3.0
+    out, clamped = m.clamp_command([(0.0, 0.0, 0.0, 0.0, 9.0)] * 7, p)
+    assert clamped and out[1][4] == 3.0
+
+
+@pytest.mark.parametrize(
+    "edit, field",
+    [
+        (lambda p: p["joints"][1].update(tau_max=p["joints"][1]["tau_max"] * 1.5), "joints[1].tau_max"),
+        (lambda p: p["joints"][2].update(kp=p["joints"][2]["kp"] * 2), "joints[2].kp"),
+        (lambda p: p["joints"][3].update(kd=p["joints"][3]["kd"] + 1.0), "joints[3].kd"),
+        (lambda p: p["joints"][0].update(q_lo=p["joints"][0]["q_lo"] - 0.1), "joints[0].q_lo"),
+        (lambda p: p["joints"][4].update(q_hi=p["joints"][4]["q_hi"] + 0.1), "joints[4].q_hi"),
+        (lambda p: p.update(max_velocity=p["max_velocity"] * 2), "max_velocity"),
+        (lambda p: p["joints"][5].update(direction=0.5), "joints[5].direction"),
+        (lambda p: p["joints"][5].update(direction=0.0), "joints[5].direction"),
+        (lambda p: p["joints"][2].update(offset=3.2), "joints[2].offset"),
+        (lambda p: p["joints"][2].update(offset=float("nan")), "joints[2].offset"),
+        (lambda p: p["joints"][1].update(tau_max=float("inf")), "joints[1].tau_max"),
+        (lambda p: p["joints"][1].update(kp=float("nan")), "joints[1].kp"),
+        (lambda p: p.update(max_velocity=float("nan")), "max_velocity"),
+        (lambda p: p.update(kp_max=-1.0), "kp_max"),
+        (lambda p: p.update(kd_max=-1.0), "kd_max"),
+        (lambda p: p.update(limit_margin=5.0), "limit_margin"),
+        (lambda p: p["joints"][1].update(tau_mx=3.0), "tau_mx"),
+        (lambda p: p.update(max_velcity=1.0), "max_velcity"),
+        (lambda p: p.update(control_rate_hz=100.0), "control_rate_hz"),
+        (lambda p: p.update(feedback_timeout=p["feedback_timeout"] * 2), "feedback_timeout"),
+        (lambda p: p["joints"][0].update(motor_id=9), r"joints\[0\].motor_id"),
+        (lambda p: p["joints"][0].update(model="RS02"), "model"),
+    ],
+)
+def test_a_raised_or_non_finite_value_is_refused_before_connect(edit, field):
+    p = m.profile()
+    edit(p)
+    with pytest.raises(ValueError, match=field if "\\" in field else field.replace("[", r"\[").replace("]", r"\]")):
+        m.Arm.sim(profile=p)
+
+
+def test_a_raised_cap_is_refused_before_connect():
+    p = m.profile()
+    p["joints"][1]["tau_max"] *= 1.5
+    with pytest.raises(ValueError, match="tau_max"):
+        m.Arm.sim(profile=p)
+
+
+def test_socketcan_refuses_a_bad_profile_before_the_socket_opens():
+    p = m.profile()
+    p["joints"][1]["tau_max"] *= 1.5
+    # An interface that does not exist: opening it would raise RuntimeError, so a ValueError
+    # proves the profile was checked first.
+    with pytest.raises(ValueError, match="tau_max"):
+        m.Arm.socketcan("nocan99", profile=p)
+
+
+def test_socketcan_refuses_a_held_bus_lock_before_the_socket_opens():
+    import os
+    import socket
+
+    # No interface of this name exists: an opener that skipped the lock would fail with
+    # "open CAN interface" instead of naming the lock.
+    iface = f"vcan{os.getpid()}"
+    held = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    held.bind(f"\0maker-arm-bus-{iface}")
+    try:
+        with pytest.raises(RuntimeError) as e:
+            m.Arm.socketcan(iface)
+        assert f"maker-arm-bus-{iface}" in str(e.value)
+        assert "open CAN interface" not in str(e.value)
+    finally:
+        held.close()
+
+
+def test_a_lowered_range_and_gains_are_accepted():
+    p = m.profile()
+    p["joints"][0]["q_lo"] += 0.1
+    p["joints"][0]["q_hi"] -= 0.1
+    p["joints"][0]["kp"] *= 0.5
+    p["max_velocity"] *= 0.5
+    a = m.Arm.sim(profile=p)
+    a.enable()
+    a.stop()
+
+
+def test_a_flipped_direction_maps_motor_to_joint():
+    v1 = m.profile()
+    p = m.profile()
+    for i, (d, o) in {0: (-1.0, 0.4), 2: (-1.0, -0.7), 4: (1.0, 0.3)}.items():
+        p["joints"][i]["direction"] = d
+        p["joints"][i]["offset"] = o
+    a = m.Arm.sim(profile=p)
+    a.enable()
+    a.start_hold()
+    time.sleep(0.2)
+    snap = a.snapshot()
+    d = a.drain()
+    a.stop()
+    # The sim parks every motor at the joint-range midpoint through the same map the session
+    # reads back with, so joint coordinates come out as the midpoints for any direction/offset.
+    for i, j in enumerate(v1["joints"][:6]):
+        mid = (j["q_lo"] + j["q_hi"]) / 2.0
+        assert abs(snap["positions"][i] - mid) < 1e-3, i
+        assert abs(d["cmd_pos"][-1][i] - mid) < 1e-3, i
+
+
+def test_clamp_command_reads_direction_and_offset_without_changing_clamping():
+    p = m.profile()
+    p["joints"][0]["direction"] = -1.0
+    p["joints"][0]["offset"] = 0.4
+    mids = [(j["q_lo"] + j["q_hi"]) / 2.0 for j in p["joints"]]
+    out, clamped = m.clamp_command([(q, 0.0, 0.0, 0.0, 0.0) for q in mids], p)
+    assert not clamped

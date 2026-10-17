@@ -1,6 +1,9 @@
 //! Command cores for the maker-arm CLI, kept terminal-free so they run
 //! against SimArm in tests. Rendering lives in main.rs.
 
+pub mod files;
+pub mod wire;
+
 use maker_arm::{ArmConfig, JointConfig};
 use maker_arm_protocol as p;
 use maker_arm_transport::{CanBackend, TransportError};

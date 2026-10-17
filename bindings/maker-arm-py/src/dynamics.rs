@@ -8,7 +8,8 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 type BodyArg = (f64, Vec3, Mat3);
-type FrictionArg = (f64, f64, f64);
+/// `(coulomb, viscous, eps)` or `(coulomb, viscous, eps, static_, stribeck_v)`.
+type FrictionArg = Vec<f64>;
 
 fn six<T>(items: Vec<T>, what: &str) -> PyResult<[T; ARM_DOF]> {
     let n = items.len();
@@ -25,15 +26,18 @@ pub struct Dynamics {
 #[pymethods]
 impl Dynamics {
     /// `links` as for `Kinematics`; `bodies` six `(mass, com, inertia)` tuples in the frame
-    /// after each revolute joint; `friction` six `(coulomb, viscous, eps)` tuples or None.
+    /// after each revolute joint; `friction` six `(coulomb, viscous, eps)` or
+    /// `(coulomb, viscous, eps, static_, stribeck_v)` tuples or None (a 3-tuple has
+    /// `static_ = coulomb`, `stribeck_v = 1`); `armature` six rotor inertias (kg m^2) or None.
     #[new]
-    #[pyo3(signature = (mount_rpy, links, bodies, friction = None, gravity = [0.0, 0.0, -9.81]))]
+    #[pyo3(signature = (mount_rpy, links, bodies, friction = None, gravity = [0.0, 0.0, -9.81], armature = None))]
     fn new(
         mount_rpy: Vec3,
         links: Vec<(Vec3, Vec3, Option<Vec3>)>,
         bodies: Vec<BodyArg>,
         friction: Option<Vec<FrictionArg>>,
         gravity: Vec3,
+        armature: Option<Vec<f64>>,
     ) -> PyResult<Self> {
         let links: Vec<Link> = links
             .into_iter()
@@ -50,16 +54,29 @@ impl Dynamics {
             None => [Friction::default(); ARM_DOF],
             Some(f) => six(
                 f.into_iter()
-                    .map(|(coulomb, viscous, eps)| Friction {
-                        coulomb,
-                        viscous,
-                        eps,
+                    .map(|t| match t[..] {
+                        [coulomb, viscous, eps] => Ok(Friction::new(coulomb, viscous, eps)),
+                        [coulomb, viscous, eps, static_, stribeck_v] => Ok(Friction {
+                            coulomb,
+                            viscous,
+                            eps,
+                            static_,
+                            stribeck_v,
+                        }),
+                        _ => Err(PyValueError::new_err(format!(
+                            "a friction tuple has 3 or 5 entries, got {}",
+                            t.len()
+                        ))),
                     })
-                    .collect(),
+                    .collect::<PyResult<Vec<_>>>()?,
                 "friction tuples",
             )?,
         };
-        Inner::new(mount_rpy, &links, bodies, friction, gravity)
+        let armature = match armature {
+            None => [0.0; ARM_DOF],
+            Some(a) => six(a, "armature values")?,
+        };
+        Inner::new(mount_rpy, &links, bodies, friction, gravity, armature)
             .map(|inner| Dynamics { inner })
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
