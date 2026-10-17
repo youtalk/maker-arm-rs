@@ -644,7 +644,13 @@ mod tests {
     }
 
     fn scratch(name: &str, body: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("maker-arm-files-{}", std::process::id()));
+        // One directory per test thread: tests share file names and run in parallel.
+        let t = std::thread::current();
+        let dir = std::env::temp_dir().join(format!(
+            "maker-arm-files-{}-{}",
+            std::process::id(),
+            t.name().unwrap_or("t").replace("::", "-")
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join(name);
         std::fs::write(&p, body).unwrap();
