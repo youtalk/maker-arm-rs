@@ -3,7 +3,7 @@
 //! the daemon's own loaders before the first byte is written, so a refusal writes nothing.
 //! maker-arm-rs holds no robot data: the URDF is always an input.
 
-use crate::files::{dynamics_from_json, profile_from_json};
+use crate::files::{self, dynamics_from_json, profile_from_json};
 use maker_arm::kinematics::ARM_DOF;
 use maker_arm::ArmConfig;
 use roxmltree::{Document, Node};
@@ -59,32 +59,75 @@ pub fn run(o: &ExportOptions) -> Result<Vec<PathBuf>, String> {
     let need = |p: &Option<PathBuf>, flag: &str, mode: &str| {
         p.clone().ok_or_else(|| format!("{mode} needs {flag}"))
     };
+    // A flag that does not belong to the mode is an error, never silently ignored.
+    let only = |mode: &str, stray: &[(&str, bool)]| match stray.iter().find(|s| s.1) {
+        Some((flag, _)) => Err(format!("{mode} does not take {flag}")),
+        None => Ok(()),
+    };
     let files = match (o.sim, &o.calibration, &o.ident) {
         (true, None, None) => {
+            only(
+                "--sim",
+                &[("--caps", o.caps.is_some()), ("--out", o.out.is_some())],
+            )?;
             let dir = need(&o.out_dir, "--out_dir", "--sim")?;
             let urdf = need(&o.urdf, "--urdf", "--sim")?;
             sim_files(&urdf, &dir)?
         }
         (false, Some(cal), None) => {
+            only(
+                "--calibration",
+                &[
+                    ("--urdf", o.urdf.is_some()),
+                    ("--out_dir", o.out_dir.is_some()),
+                ],
+            )?;
             let caps = o.caps.ok_or("--calibration needs --caps")?;
             let out = need(&o.out, "--out", "--calibration")?;
-            vec![(out, rig_profile(cal, caps)?)]
+            vec![rig_profile(cal, caps, out)?]
         }
         (false, None, Some(ident)) => {
+            only(
+                "--ident",
+                &[
+                    ("--caps", o.caps.is_some()),
+                    ("--out_dir", o.out_dir.is_some()),
+                ],
+            )?;
             let out = need(&o.out, "--out", "--ident")?;
             let urdf = need(&o.urdf, "--urdf", "--ident")?;
-            vec![(out, ident_dynamics(ident, &urdf)?)]
+            vec![ident_dynamics(ident, &urdf, out)?]
         }
         _ => return Err("pass exactly one of --sim, --calibration or --ident".into()),
     };
-    for (path, v) in &files {
+    for (path, text) in &files {
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         }
-        let text = serde_json::to_string_pretty(v).map_err(|e| e.to_string())? + "\n";
         std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))?;
     }
     Ok(files.into_iter().map(|(p, _)| p).collect())
+}
+
+/// The exact text to write for `v`, after `check` accepted what a reader of that text gets.
+/// Checking the reparsed text means the guarantee does not rest on how floats round-trip.
+fn seal(
+    path: PathBuf,
+    v: &Value,
+    check: impl Fn(&Value) -> Result<(), String>,
+) -> Result<(PathBuf, String), String> {
+    let text = serde_json::to_string_pretty(v).map_err(|e| e.to_string())? + "\n";
+    let read: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    check(&read).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok((path, text))
+}
+
+fn check_profile(v: &Value, interface: &str) -> Result<(), String> {
+    files::check_tracking(&profile_from_json(v, interface)?)
+}
+
+fn check_dynamics(v: &Value) -> Result<(), String> {
+    dynamics_from_json(v).map(|_| ())
 }
 
 fn read_text(path: &Path) -> Result<String, String> {
@@ -95,10 +138,11 @@ fn read_json(path: &Path) -> Result<Value, String> {
     serde_json::from_str(&read_text(path)?).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-fn sim_files(urdf: &Path, dir: &Path) -> Result<Vec<(PathBuf, Value)>, String> {
+fn sim_files(urdf: &Path, dir: &Path) -> Result<Vec<(PathBuf, String)>, String> {
     let text = read_text(urdf)?;
     let at = |e: String| format!("{}: {e}", urdf.display());
     let doc = Document::parse(&text).map_err(|e| at(e.to_string()))?;
+    check_chain(&doc).map_err(at)?;
     let mut profile = profile_json(&ArmConfig::maker_arm_v1());
     let joints = profile["joints"].as_array_mut().expect("joints is a list");
     for (j, name) in joints.iter_mut().zip(ARM_JOINT_NAMES) {
@@ -106,21 +150,21 @@ fn sim_files(urdf: &Path, dir: &Path) -> Result<Vec<(PathBuf, Value)>, String> {
         j["q_lo"] = json!(attr_f64(limit, "lower").map_err(at)?);
         j["q_hi"] = json!(attr_f64(limit, "upper").map_err(at)?);
     }
-    profile_from_json(&profile, "sim").map_err(|e| format!("sim_profile.json: {e}"))?;
     let provenance =
         json!({"source": "urdf", "urdf_sha256": hex(&Sha256::digest(text.as_bytes()))});
     let bodies = urdf_bodies(&doc).map_err(at)?;
     let bodies: Vec<Value> = bodies.iter().map(|b| json!([b.0, b.1, b.2])).collect();
     let dynamics =
         dynamics_spec(&doc, json!(bodies), Value::Null, Value::Null, provenance).map_err(at)?;
-    dynamics_from_json(&dynamics).map_err(|e| format!("dynamics_urdf.json: {e}"))?;
     Ok(vec![
-        (dir.join("sim_profile.json"), profile),
-        (dir.join("dynamics_urdf.json"), dynamics),
+        seal(dir.join("sim_profile.json"), &profile, |v| {
+            check_profile(v, "sim")
+        })?,
+        seal(dir.join("dynamics_urdf.json"), &dynamics, check_dynamics)?,
     ])
 }
 
-fn ident_dynamics(ident: &Path, urdf: &Path) -> Result<Value, String> {
+fn ident_dynamics(ident: &Path, urdf: &Path, out: PathBuf) -> Result<(PathBuf, String), String> {
     let at = |e: String| format!("{}: {e}", ident.display());
     let data = read_json(ident)?;
     let data = data
@@ -142,14 +186,13 @@ fn ident_dynamics(ident: &Path, urdf: &Path) -> Result<Value, String> {
         provenance,
     )
     .map_err(|e| format!("{}: {e}", urdf.display()))?;
-    dynamics_from_json(&v).map_err(at)?;
-    Ok(v)
+    seal(out, &v, check_dynamics)
 }
 
 /// Port of the lab's `export_rig`. The v1 profile, with `kp`, `kd` and `tau_max` times `caps`
 /// and each joint's limits in the joint frame: `sorted(direction * (v - offset))`, which
 /// `JointConfig::to_motor` maps back to the v1 motor limits.
-fn rig_profile(calibration: &Path, caps: f64) -> Result<Value, String> {
+fn rig_profile(calibration: &Path, caps: f64, out: PathBuf) -> Result<(PathBuf, String), String> {
     if !(caps > 0.0 && caps <= 1.0) {
         return Err(format!("--caps must be in (0, 1], got {caps}"));
     }
@@ -204,8 +247,7 @@ fn rig_profile(calibration: &Path, caps: f64) -> Result<Value, String> {
         (j.q_lo, j.q_hi) = (nudge(lo, hi), nudge(hi, lo));
     }
     let v = profile_json(&config);
-    profile_from_json(&v, "can0").map_err(at)?;
-    Ok(v)
+    seal(out, &v, |v| check_profile(v, "can0"))
 }
 
 /// The profile in the file format `profile_from_json` reads.
@@ -260,6 +302,36 @@ fn dynamics_spec(
     m.insert("armature".into(), armature);
     m.insert("provenance".into(), provenance);
     Ok(Value::Object(m))
+}
+
+/// The arm joints must chain link_002 to link_007 and both jaws must hang on link_007, or the
+/// bodies below would sit in the wrong frames.
+fn check_chain(doc: &Document) -> Result<(), String> {
+    let link_of = |name: &str, tag: &str| -> Result<String, String> {
+        let l = child(joint(doc, name)?, tag)?;
+        Ok(l.attribute("link").unwrap_or("").to_string())
+    };
+    let wrong = |name: &str, tag: &str, got: &str, want: &str| {
+        Err(format!(
+            "joint {name}: {tag} link is {got:?}, expected {want:?}"
+        ))
+    };
+    for (name, link) in ARM_JOINT_NAMES.iter().zip(ARM_LINKS) {
+        let got = link_of(name, "child")?;
+        if got != link {
+            return wrong(name, "child", &got, link);
+        }
+    }
+    for (name, link) in GRIPPER_JOINT_NAMES.iter().zip(JAW_LINKS) {
+        let (parent, kid) = (link_of(name, "parent")?, link_of(name, "child")?);
+        if parent != ARM_LINKS[ARM_DOF - 1] {
+            return wrong(name, "parent", &parent, ARM_LINKS[ARM_DOF - 1]);
+        }
+        if kid != link {
+            return wrong(name, "child", &kid, link);
+        }
+    }
+    Ok(())
 }
 
 fn hex(bytes: &[u8]) -> String {

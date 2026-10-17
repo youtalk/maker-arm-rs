@@ -165,6 +165,21 @@ pub fn load(o: &ServeOptions) -> Result<Loaded, String> {
     })
 }
 
+/// The part of the controller build that depends on the profile only: the default tracking
+/// parameters under R33, then the checks `TrackingController::new` makes on them and on the
+/// gains. `export` runs it so that it never writes a profile that `serve` refuses.
+pub fn check_tracking(config: &ArmConfig) -> Result<(), String> {
+    let mut p = TrackingParams::default();
+    apply_e_max_cap(&mut p, false, config)?;
+    p.validate().map_err(|e| e.to_string())?;
+    for (i, j) in config.joints.iter().take(ARM_DOF).enumerate() {
+        if j.kp <= 0.0 {
+            return Err(format!("joints[{i}].kp: {} is not positive", j.kp));
+        }
+    }
+    Ok(())
+}
+
 /// Ruling R33: `e_max_j = default / kp_scale_j`, so the spring ceiling `kp e_max` stays at the
 /// v1 value when the profile cuts kp. A params `e_max` is kept only where it is within that cap.
 fn apply_e_max_cap(p: &mut TrackingParams, given: bool, c: &ArmConfig) -> Result<(), String> {

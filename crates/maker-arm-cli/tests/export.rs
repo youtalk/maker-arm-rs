@@ -106,6 +106,19 @@ fn serve_options(interface: &str, profile: &Path, dynamics: &Path) -> ServeOptio
     }
 }
 
+/// `serve --check --interface can0` on the profile: the daemon's whole file check, which
+/// builds the controller. It opens no bus and no socket.
+fn serve_check_ok(profile: &Path) -> bool {
+    let o = Command::new(BIN)
+        .args(["serve", "--check", "--interface", "can0", "--profile"])
+        .arg(profile)
+        .arg("--dynamics")
+        .arg(fixture("dynamics_urdf.json"))
+        .output()
+        .unwrap();
+    o.status.success() && String::from_utf8_lossy(&o.stdout).starts_with("SERVE_CHECK_OK")
+}
+
 #[test]
 fn sim_matches_the_reference_files() {
     let dir = scratch_dir();
@@ -153,7 +166,10 @@ fn rig_profile_loads_for_can0_and_inverts_to_motor() {
     );
     let out = dir.join("sub").join("rig.json");
     export::run(&rig_options(&cal, 0.5, &out)).unwrap();
-    // The same code path as `serve --check --interface can0`.
+    assert!(
+        serve_check_ok(&out),
+        "serve --check refused the exported profile"
+    );
     let l = load(&serve_options("can0", &out, &fixture("dynamics_urdf.json"))).unwrap();
     let v1 = ArmConfig::maker_arm_v1();
     for (j, b) in l.config.joints.iter().zip(&v1.joints) {
@@ -182,17 +198,9 @@ fn rig_limits_survive_any_offset() {
         let o = -3.0 + 0.03 * f64::from(k);
         let d = if k % 2 == 0 { 1.0 } else { -1.0 };
         let cal = write_cal(&dir, &json!({"direction": rep(d, 7), "offset": rep(o, 7)}));
-        match export::run(&rig_options(&cal, 1.0, &out)) {
-            Ok(_) => {
-                let l = load(&serve_options("can0", &out, &fixture("dynamics_urdf.json")));
-                assert!(l.is_ok(), "offset {o}: {:?}", l.err());
-            }
-            // Only a joint range that cannot fit may refuse, never a rounding slip.
-            Err(e) => assert!(
-                !e.contains("outside the maker_arm_v1 range") || false,
-                "{o}: {e}"
-            ),
-        }
+        export::run(&rig_options(&cal, 1.0, &out)).unwrap();
+        let l = load(&serve_options("can0", &out, &fixture("dynamics_urdf.json")));
+        assert!(l.is_ok(), "offset {o}: {:?}", l.err());
     }
 }
 
@@ -319,4 +327,75 @@ fn the_command_prints_each_path_and_fails_with_one_line() {
     let err = String::from_utf8(o.stderr).unwrap();
     assert_eq!(err.trim().lines().count(), 1, "{err}");
     assert!(err.contains("direction"), "{err}");
+}
+
+#[test]
+fn a_cap_that_serve_would_refuse_is_refused_by_export() {
+    // 1e-310 makes the R33 error clamp infinite, which the controller build refuses.
+    let dir = scratch_dir();
+    let cal = write_cal(
+        &dir,
+        &json!({"direction": rep(1.0, 7), "offset": rep(0.0, 7)}),
+    );
+    let out = dir.join("tiny.json");
+    let e = export::run(&rig_options(&cal, 1e-310, &out)).unwrap_err();
+    assert!(e.contains("e_max"), "{e}");
+    assert!(!out.exists());
+    // The daemon accepts what export writes at a sane cap.
+    export::run(&rig_options(&cal, 0.3, &out)).unwrap();
+    assert!(serve_check_ok(&out));
+}
+
+#[test]
+fn flags_of_another_mode_are_refused() {
+    let dir = scratch_dir();
+    let o = ExportOptions {
+        caps: Some(0.3),
+        ..sim_options(&dir.join("simout"))
+    };
+    let e = export::run(&o).unwrap_err();
+    assert!(e.contains("--sim does not take --caps"), "{e}");
+    assert!(!dir.join("simout").exists());
+    let cal = write_cal(
+        &dir,
+        &json!({"direction": rep(1.0, 7), "offset": rep(0.0, 7)}),
+    );
+    let o = ExportOptions {
+        urdf: Some(fixture("maker_arm_sdk.urdf")),
+        ..rig_options(&cal, 0.5, &dir.join("rig.json"))
+    };
+    assert!(export::run(&o)
+        .unwrap_err()
+        .contains("does not take --urdf"));
+    assert!(!dir.join("rig.json").exists());
+}
+
+#[test]
+fn a_urdf_with_the_wrong_chain_is_refused_by_joint_name() {
+    let dir = scratch_dir();
+    let text = std::fs::read_to_string(fixture("maker_arm_sdk.urdf")).unwrap();
+    for (from, to, joint) in [
+        (
+            "<child link=\"link_004\"",
+            "<child link=\"link_005\"",
+            "link_004_joint",
+        ),
+        (
+            "<parent link=\"link_007\" />\n    <child link=\"gripper_left\"",
+            "<parent link=\"link_006\" />\n    <child link=\"gripper_left\"",
+            "gripper_left_joint",
+        ),
+    ] {
+        assert!(text.contains(from), "{from}");
+        let urdf = dir.join("bad.urdf");
+        std::fs::write(&urdf, text.replacen(from, to, 1)).unwrap();
+        let outdir = dir.join("o");
+        let o = ExportOptions {
+            urdf: Some(urdf),
+            ..sim_options(&outdir)
+        };
+        let e = export::run(&o).unwrap_err();
+        assert!(e.contains(&format!("joint {joint}")), "{e}");
+        assert!(!outdir.exists());
+    }
 }
