@@ -516,6 +516,18 @@ pub fn run(o: &ServeOptions, check: bool) -> Result<(), String> {
         return Ok(());
     }
     let socket = socket_path(&o.interface, o.socket.as_deref());
+    // A missing directory fails only at the bind, after the motors were enabled.
+    let dir = socket
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    if !dir.is_dir() {
+        log(&format!(
+            "serve: the socket directory {} does not exist or is not a directory",
+            dir.display()
+        ));
+        std::process::exit(2);
+    }
     // Before the socket file and the bus: a refused daemon touches neither. Held to exit.
     // `sim` needs no lock, because each daemon has its own `SimArm`.
     let _bus = (o.interface != "sim")

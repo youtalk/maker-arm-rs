@@ -59,6 +59,17 @@ fn check_fails_for_params_the_controller_refuses() {
 }
 
 #[test]
+fn a_socket_in_a_missing_directory_exits_2_before_the_bus() {
+    let dir = scratch_dir();
+    let missing = dir.join("none");
+    let (status, out, err) = run_to_exit(serve_command(&missing.join("s.sock"), &[]));
+    assert_eq!(status.code(), Some(2));
+    assert!(!out.contains("SERVE_READY"), "{out}");
+    assert!(err.contains(&missing.display().to_string()), "{err}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn usage_errors_exit_2() {
     let dir = scratch_dir();
     let mut c = serve_command(&dir.join("s.sock"), &[]);
