@@ -178,6 +178,7 @@ fn ident_dynamics(ident: &Path, urdf: &Path, out: PathBuf) -> Result<(PathBuf, S
     let provenance = json!({"source": "ident", "ident": data.get("provenance")});
     let text = read_text(urdf)?;
     let doc = Document::parse(&text).map_err(|e| format!("{}: {e}", urdf.display()))?;
+    check_chain(&doc).map_err(|e| format!("{}: {e}", urdf.display()))?;
     let v = dynamics_spec(
         &doc,
         get("bodies")?,
