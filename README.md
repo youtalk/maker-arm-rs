@@ -76,6 +76,8 @@ PATH=/usr/lib/rust-1.85/bin:$PATH cargo install --locked --path maker-arm-rs/cra
 
 The apt cargo cannot install from a git URL, so clone the repository first.
 
+The daemon sets the error clamp to `0.03 / kp_scale` rad per arm joint, where `kp_scale` is the profile's `kp` over the `maker_arm_v1` value (rule R33), and it refuses a params `e_max` above that cap at load time.
+
 The daemon is not yet verified on a real arm. Support the arm before you start `serve` on a real interface.
 
 Three commands. For `PROFILE` and `MODEL`, use the profile and model files that ship with your arm's ROS package. Do not write them by hand.
@@ -89,6 +91,23 @@ maker-arm-cli release --interface can0                                   # disab
 The socket is `--socket PATH`. If you omit it, the path is `$XDG_RUNTIME_DIR/maker-arm-<interface>.sock`. If that variable is not set, pass `--socket`. `status` and `release` use the same rule. They never open the bus.
 
 `status` prints `STATUS {"mode": ..., "t": ..., "q": [7 values], "clamped": ..., "refused": ..., "fault": ..., "digest": ...}` and exits 0. It exits 1 if no daemon runs on the socket.
+
+### Export the daemon's files
+
+`maker-arm-cli export` writes the profile and the dynamics model for your own arm. It takes the arm's URDF as an input. Every file passes the daemon's own loader before it is written. If a check fails, `export` prints one error line, exits non-zero and writes nothing. On success it prints each path it wrote.
+
+```sh
+# Simulation: a profile with the URDF's joint limits, and a model from the URDF's inertials
+maker-arm-cli export --sim --urdf ARM.urdf --out_dir DIR
+# Real arm: the v1 profile, gains and torque caps times F (0 < F <= 1), limits in your joint frame
+maker-arm-cli export --calibration CAL.json --caps F --out PROFILE
+# A model from an identification file (bodies, friction, armature) and the URDF's links
+maker-arm-cli export --ident IDENT.json --urdf ARM.urdf --out MODEL
+```
+
+`CAL.json` holds exactly two keys: `direction` (7 values, each -1.0 or 1.0) and `offset` (7 values, each at most pi in absolute value, in radians). Any other key, or a missing key, is refused.
+
+The procedure to measure `direction` and `offset` is not published yet. A guessed calibration can drive a joint into its stop. Do not enable a real arm on a profile whose calibration you did not measure. A profile with `--caps` below 1 cuts `kp`, so the daemon applies the R33 error clamp to it (`e_max = 0.03 / kp_scale`).
 
 Hold rules:
 

@@ -1,0 +1,95 @@
+{
+  "joints": [
+    {
+      "motor_id": 1,
+      "name": "j1",
+      "model": "RS00",
+      "kp": 60.0,
+      "kd": 4.0,
+      "tau_max": 4.0,
+      "q_lo": -2.8,
+      "q_hi": 2.8,
+      "direction": 1.0,
+      "offset": 0.0
+    },
+    {
+      "motor_id": 2,
+      "name": "j2",
+      "model": "RS02",
+      "kp": 150.0,
+      "kd": 4.5,
+      "tau_max": 12.0,
+      "q_lo": -3.14,
+      "q_hi": 0.0,
+      "direction": 1.0,
+      "offset": 0.0
+    },
+    {
+      "motor_id": 3,
+      "name": "j3",
+      "model": "RS02",
+      "kp": 90.0,
+      "kd": 3.0,
+      "tau_max": 10.0,
+      "q_lo": 0.0,
+      "q_hi": 3.14,
+      "direction": 1.0,
+      "offset": 0.0
+    },
+    {
+      "motor_id": 4,
+      "name": "j4",
+      "model": "RS00",
+      "kp": 30.0,
+      "kd": 2.0,
+      "tau_max": 4.0,
+      "q_lo": -1.6,
+      "q_hi": 1.73,
+      "direction": 1.0,
+      "offset": 0.0
+    },
+    {
+      "motor_id": 5,
+      "name": "j5",
+      "model": "RS00",
+      "kp": 30.0,
+      "kd": 2.0,
+      "tau_max": 4.0,
+      "q_lo": -1.57,
+      "q_hi": 1.57,
+      "direction": 1.0,
+      "offset": 0.0
+    },
+    {
+      "motor_id": 6,
+      "name": "j6",
+      "model": "RS00",
+      "kp": 30.0,
+      "kd": 2.0,
+      "tau_max": 4.0,
+      "q_lo": -2.7,
+      "q_hi": 2.7,
+      "direction": 1.0,
+      "offset": 0.0
+    },
+    {
+      "motor_id": 7,
+      "name": "gripper",
+      "model": "RS00",
+      "kp": 20.0,
+      "kd": 0.5,
+      "tau_max": 2.0,
+      "q_lo": -2.092,
+      "q_hi": -0.039,
+      "direction": 1.0,
+      "offset": 0.0
+    }
+  ],
+  "control_rate_hz": 200.0,
+  "max_velocity": 5.0,
+  "feedback_timeout": 0.2,
+  "limit_margin": 0.0,
+  "kp_max": 200.0,
+  "kd_max": 5.0,
+  "temp_hold_c": 70.0
+}

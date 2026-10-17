@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use clap::{error::ErrorKind, CommandFactory, Parser, Subcommand};
 use maker_arm::{ArmConfig, HoldController, Session, SimArm};
+use maker_arm_cli::export::{self, ExportOptions};
 use maker_arm_cli::files::ServeOptions;
 use maker_arm_transport::{BusLock, CanBackend};
 
@@ -40,6 +41,27 @@ enum Command {
     },
     /// Connect, enable, and hold the current pose until a typed RELEASE
     Hold,
+    /// Write the profile and dynamics files that serve loads: --sim, --calibration or --ident
+    Export {
+        /// The URDF (with --sim and --ident)
+        #[arg(long)]
+        urdf: Option<PathBuf>,
+        /// Joint calibration JSON: {"direction": [7], "offset": [7]}
+        #[arg(long)]
+        calibration: Option<PathBuf>,
+        /// Identification JSON with bodies, friction and armature
+        #[arg(long)]
+        ident: Option<PathBuf>,
+        /// Scale for kp, kd and tau_max, in (0, 1] (with --calibration)
+        #[arg(long)]
+        caps: Option<f64>,
+        /// The output file (with --calibration and --ident)
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// The output directory (with --sim)
+        #[arg(long = "out_dir")]
+        out_dir: Option<PathBuf>,
+    },
     /// Ask a running serve daemon to disable the motors, after a typed RELEASE
     Release {
         #[arg(long)]
@@ -154,6 +176,32 @@ fn main() -> Result<(), String> {
             persist,
         };
         return serve::run(&o, check);
+    }
+    if let Command::Export {
+        urdf,
+        calibration,
+        ident,
+        caps,
+        out,
+        out_dir,
+    } = cli.command
+    {
+        if cli.can.is_some() {
+            return Err("export takes no --can".into());
+        }
+        let o = ExportOptions {
+            sim: cli.sim,
+            urdf,
+            calibration,
+            ident,
+            caps,
+            out,
+            out_dir,
+        };
+        for p in export::run(&o)? {
+            println!("{}", p.display());
+        }
+        return Ok(());
     }
     match &cli.command {
         Command::Release { interface, socket } => {
@@ -303,7 +351,10 @@ fn main() -> Result<(), String> {
             res.map_err(|e| e.to_string())?;
             let _ = writeln!(std::io::stdout(), "torque released.");
         }
-        Command::Serve { .. } | Command::Release { .. } | Command::Status { .. } => {
+        Command::Serve { .. }
+        | Command::Export { .. }
+        | Command::Release { .. }
+        | Command::Status { .. } => {
             unreachable!("handled above")
         }
     }

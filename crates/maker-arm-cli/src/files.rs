@@ -115,10 +115,18 @@ pub fn load(o: &ServeOptions) -> Result<Loaded, String> {
     };
     let (model, source) =
         dynamics_from_json(&parse(&o.dynamics, &dynamics)?).map_err(|e| at(&o.dynamics, e))?;
-    let tracking = match (&o.params, &params) {
-        (Some(p), Some(b)) => params_from_json(&parse(p, b)?).map_err(|e| at(p, e))?,
-        _ => TrackingParams::default(),
+    let (mut tracking, given) = match (&o.params, &params) {
+        (Some(p), Some(b)) => {
+            let v = parse(p, b)?;
+            let given = v.get("e_max").is_some();
+            (params_from_json(&v).map_err(|e| at(p, e))?, given)
+        }
+        _ => (TrackingParams::default(), false),
     };
+    apply_e_max_cap(&mut tracking, given, &config).map_err(|e| match &o.params {
+        Some(p) => at(p, e),
+        None => e,
+    })?;
     if tracking.tau_th.iter().any(|t| t.is_finite()) && source != "ident" {
         return Err(
             "a deadband ships only with the identified model: params set a finite tau_th \
@@ -155,6 +163,39 @@ pub fn load(o: &ServeOptions) -> Result<Loaded, String> {
         grip,
         digest,
     })
+}
+
+/// The part of the controller build that depends on the profile only: the default tracking
+/// parameters under R33, then the checks `TrackingController::new` makes on them and on the
+/// gains. `export` runs it so that it never writes a profile that `serve` refuses.
+pub fn check_tracking(config: &ArmConfig) -> Result<(), String> {
+    let mut p = TrackingParams::default();
+    apply_e_max_cap(&mut p, false, config)?;
+    p.validate().map_err(|e| e.to_string())?;
+    for (i, j) in config.joints.iter().take(ARM_DOF).enumerate() {
+        if j.kp <= 0.0 {
+            return Err(format!("joints[{i}].kp: {} is not positive", j.kp));
+        }
+    }
+    Ok(())
+}
+
+/// Ruling R33: `e_max_j = default / kp_scale_j`, so the spring ceiling `kp e_max` stays at the
+/// v1 value when the profile cuts kp. A params `e_max` is kept only where it is within that cap.
+fn apply_e_max_cap(p: &mut TrackingParams, given: bool, c: &ArmConfig) -> Result<(), String> {
+    let v1 = ArmConfig::maker_arm_v1();
+    for (j, base) in TrackingParams::default().e_max.into_iter().enumerate() {
+        let cap = base / (c.joints[j].kp / v1.joints[j].kp);
+        if !given {
+            p.e_max[j] = cap;
+        } else if p.e_max[j] > cap * (1.0 + 1e-12) {
+            return Err(format!(
+                "e_max[{j}]: {} exceeds the cap {cap} (R33: {base} / kp scale)",
+                p.e_max[j]
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn object<'a>(v: &'a Value, what: &str) -> Result<&'a Map<String, Value>, String> {
@@ -618,7 +659,13 @@ mod tests {
     }
 
     fn scratch(name: &str, body: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("maker-arm-files-{}", std::process::id()));
+        // One directory per test thread: tests share file names and run in parallel.
+        let t = std::thread::current();
+        let dir = std::env::temp_dir().join(format!(
+            "maker-arm-files-{}-{}",
+            std::process::id(),
+            t.name().unwrap_or("t").replace("::", "-")
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join(name);
         std::fs::write(&p, body).unwrap();
@@ -637,6 +684,53 @@ mod tests {
             socket: None,
             persist: false,
         }
+    }
+
+    fn half_kp_options(params: Option<&str>) -> ServeOptions {
+        let mut v = v1_json();
+        for j in v["joints"].as_array_mut().unwrap() {
+            let kp = j["kp"].as_f64().unwrap();
+            j["kp"] = json!(kp * 0.5);
+        }
+        let mut o = options();
+        o.profile = Some(scratch("half_kp.json", &v.to_string()));
+        o.params = params.map(|t| scratch("half_kp_params.json", t));
+        o
+    }
+
+    #[test]
+    fn a_half_kp_profile_doubles_the_default_e_max() {
+        let l = load(&half_kp_options(None)).unwrap();
+        for j in 0..ARM_DOF {
+            assert!((l.params.e_max[j] - 0.06).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn a_params_e_max_within_the_cap_is_kept() {
+        let l = load(&half_kp_options(Some(
+            r#"{"e_max": [0.05,0.05,0.05,0.05,0.05,0.05]}"#,
+        )))
+        .unwrap();
+        assert_eq!(l.params.e_max, [0.05; ARM_DOF]);
+    }
+
+    #[test]
+    fn a_params_e_max_past_the_cap_is_refused() {
+        let e = load(&half_kp_options(Some(
+            r#"{"e_max": [0.05,0.05,0.07,0.05,0.05,0.05]}"#,
+        )))
+        .err()
+        .unwrap();
+        assert!(e.contains("e_max[2]") && e.contains("cap 0.06"), "{e}");
+    }
+
+    #[test]
+    fn the_v1_kp_keeps_the_default_e_max() {
+        assert_eq!(load(&options()).unwrap().params.e_max, [0.03; ARM_DOF]);
+        let mut o = options();
+        o.profile = Some(scratch("v1.json", &v1_json().to_string()));
+        assert_eq!(load(&o).unwrap().params.e_max, [0.03; ARM_DOF]);
     }
 
     #[test]
