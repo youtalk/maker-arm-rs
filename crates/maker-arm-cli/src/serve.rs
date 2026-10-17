@@ -504,6 +504,13 @@ pub fn run(o: &ServeOptions, check: bool) -> Result<(), String> {
         grip,
         digest,
     } = files::load(o)?;
+    // Before --check and the bus: neither needs the arm, and a file the daemon refuses must
+    // fail the check too.
+    let grip_window = GRIP_TAU_MAX_NM / config.joints[ARM_DOF].kp;
+    let mut ctrl =
+        TrackingController::new(dynamics, params, &config, residual).map_err(|e| e.to_string())?;
+    ctrl.restart_for_loop().map_err(|e| e.to_string())?;
+    let shared = ctrl.shared();
     if check {
         say(&format!("SERVE_CHECK_OK {{\"digest\": \"{digest:016x}\"}}"));
         return Ok(());
@@ -532,12 +539,6 @@ pub fn run(o: &ServeOptions, check: bool) -> Result<(), String> {
              the motors to their CAN_TIMEOUT watchdog"
         ));
     }
-    let grip_window = GRIP_TAU_MAX_NM / config.joints[ARM_DOF].kp;
-    let mut ctrl =
-        TrackingController::new(dynamics, params, &config, residual).map_err(|e| e.to_string())?;
-    ctrl.restart_for_loop().map_err(|e| e.to_string())?;
-    let shared = ctrl.shared();
-
     let mut session = Session::connect(open(&o.interface, &config)?, config.clone())
         .map_err(|e| format!("connect {}: {e}", o.interface))?;
     if SIGNALED.load(Ordering::Relaxed) {

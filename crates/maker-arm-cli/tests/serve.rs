@@ -44,6 +44,21 @@ fn check_prints_the_digest_and_opens_nothing() {
 }
 
 #[test]
+fn check_fails_for_params_the_controller_refuses() {
+    let dir = scratch_dir();
+    // params_from_json takes it. TrackingParams::validate, in TrackingController::new, does not.
+    let params = dir.join("p.json");
+    std::fs::write(&params, r#"{"e_max": [0.03, 0.03, 0.03, 0.0, 0.03, 0.03]}"#).unwrap();
+    let mut c = serve_command(&dir.join("s.sock"), &["--check", "--params"]);
+    c.arg(&params);
+    let (status, out, err) = run_to_exit(c);
+    assert_eq!(status.code(), Some(1));
+    assert!(!out.contains("SERVE_CHECK_OK"), "{out}");
+    assert!(err.contains("e_max"), "{err}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn usage_errors_exit_2() {
     let dir = scratch_dir();
     let mut c = serve_command(&dir.join("s.sock"), &[]);
