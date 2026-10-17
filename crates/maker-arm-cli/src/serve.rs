@@ -9,9 +9,8 @@ use maker_arm::{ArmConfig, FaultReason, LoopRt, RunningArm, Session, SimArm};
 use maker_arm_cli::files::{self, GripMap, Loaded, ServeOptions};
 use maker_arm_cli::wire::{self, ClientFrame, Mode, Op, Role, StateFrame, WireError};
 use maker_arm_transport::CanBackend;
-use std::io::{ErrorKind, Write};
-use std::os::linux::net::SocketAddrExt;
-use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
+use std::io::Write;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -380,26 +379,6 @@ pub fn socket_path(interface: &str, socket: Option<&Path>) -> PathBuf {
     }
 }
 
-/// Holds the abstract socket `maker-arm-bus-<interface>` while it lives, so a second daemon
-/// never opens a bus that one drives: its `RunningArm` drop would disable the first one's
-/// motors. The kernel frees the name when the process dies. `sim` needs no lock, because each
-/// daemon has its own `SimArm`.
-fn bus_lock(interface: &str) -> Result<Option<UnixListener>, String> {
-    if interface == "sim" {
-        return Ok(None);
-    }
-    let name = format!("maker-arm-bus-{interface}");
-    SocketAddr::from_abstract_name(name.as_bytes())
-        .and_then(|a| UnixListener::bind_addr(&a))
-        .map(Some)
-        .map_err(|e| match e.kind() {
-            ErrorKind::AddrInUse => {
-                format!("another daemon already drives {interface}: it holds the lock @{name}")
-            }
-            _ => format!("lock @{name} for {interface}: {e}"),
-        })
-}
-
 /// Waits for the first tick's pose and tracking clock, which Activate needs. A signal, a
 /// stopped loop, a fault or `timeout` ends the wait with an error. Only the controller starts
 /// the clock, and a fault hold never calls it, so a first-tick fault would wait forever.
@@ -531,7 +510,11 @@ pub fn run(o: &ServeOptions, check: bool) -> Result<(), String> {
     }
     let socket = socket_path(&o.interface, o.socket.as_deref());
     // Before the socket file and the bus: a refused daemon touches neither. Held to exit.
-    let _bus = bus_lock(&o.interface)?;
+    // `sim` needs no lock, because each daemon has its own `SimArm`.
+    let _bus = (o.interface != "sim")
+        .then(|| maker_arm_transport::bus_lock(&o.interface))
+        .transpose()
+        .map_err(|e| e.to_string())?;
     if UnixStream::connect(&socket).is_ok() {
         return Err(format!("a daemon already runs on {}", socket.display()));
     }
@@ -724,17 +707,5 @@ mod tests {
             Duration::from_secs(5),
         );
         assert!(e.unwrap_err().contains("interrupted"));
-    }
-
-    #[test]
-    fn the_bus_lock_is_exclusive_and_freed_on_drop() {
-        let iface = format!("vcan-unit{}", std::process::id());
-        let held = bus_lock(&iface).unwrap();
-        assert!(held.is_some());
-        let e = bus_lock(&iface).unwrap_err();
-        assert!(e.contains(&iface), "{e}");
-        drop(held);
-        assert!(bus_lock(&iface).unwrap().is_some());
-        assert!(bus_lock("sim").unwrap().is_none());
     }
 }

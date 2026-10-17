@@ -273,7 +273,26 @@ fn a_second_daemon_on_a_held_bus_exits_1_before_it_opens_the_bus() {
     let (status, _, err) = run_to_exit(c);
     assert_eq!(status.code(), Some(1));
     assert!(err.contains(&name) && !err.contains("open "), "{err}");
+    let hint = format!("maker-arm-cli status --interface {iface}");
+    assert!(err.contains(&hint) && err.contains("ss -xlp"), "{err}");
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn doctor_on_a_held_bus_exits_before_it_opens_the_bus() {
+    // As above: no such device, so an opened bus would fail with "open <iface>". Not the name
+    // above: both tests run in this process at once.
+    let iface = format!("vcand{}", std::process::id());
+    let _held = maker_arm_transport::bus_lock(&iface).unwrap();
+    let mut c = std::process::Command::new(common::BIN);
+    c.args(["--can", &iface, "doctor"]);
+    let (status, out, err) = run_to_exit(c);
+    assert_ne!(status.code(), Some(0));
+    assert!(out.is_empty(), "{out}");
+    assert!(
+        err.contains(&format!("maker-arm-bus-{iface}")) && !err.contains("open "),
+        "{err}"
+    );
 }
 
 /// Runs `maker-arm-cli <sub>` against `socket` with `stdin` typed in.

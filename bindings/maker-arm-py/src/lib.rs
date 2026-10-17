@@ -443,6 +443,10 @@ enum ArmHandle {
 struct Arm {
     handle: ArmHandle,
     config: ArmConfig,
+    /// The bus lock of a SocketCAN arm, held while the arm lives so that no other opener
+    /// probes the bus. Fields drop in order: the lock goes after the handle, whose drop
+    /// disables the motors.
+    _bus: Option<maker_arm_transport::BusLock>,
 }
 
 fn session_config(profile: Option<&Bound<'_, PyDict>>) -> PyResult<ArmConfig> {
@@ -538,20 +542,27 @@ impl Arm {
         Ok(Arm {
             handle: ArmHandle::Idle(session),
             config,
+            _bus: None,
         })
     }
 
     /// Connect over SocketCAN, e.g. Arm.socketcan("can0").
     /// `profile` as for `sim`; it is checked before the socket opens.
+    ///
+    /// Takes the bus lock of `interface` before the socket opens and holds it while the arm
+    /// lives. Raises RuntimeError, before any frame is sent, if another process holds it,
+    /// for example a `maker-arm-cli serve` daemon.
     #[staticmethod]
     #[pyo3(signature = (interface, profile = None))]
     fn socketcan(interface: &str, profile: Option<&Bound<'_, PyDict>>) -> PyResult<Arm> {
         let config = session_config(profile)?;
+        let bus = maker_arm_transport::bus_lock(interface).map_err(err)?;
         let backend = maker_arm_transport::SocketCanBackend::open(interface).map_err(err)?;
         let session = Session::connect(Box::new(backend), config.clone()).map_err(err)?;
         Ok(Arm {
             handle: ArmHandle::Idle(session),
             config,
+            _bus: Some(bus),
         })
     }
 

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use clap::{error::ErrorKind, CommandFactory, Parser, Subcommand};
 use maker_arm::{ArmConfig, HoldController, Session, SimArm};
 use maker_arm_cli::files::ServeOptions;
-use maker_arm_transport::CanBackend;
+use maker_arm_transport::{BusLock, CanBackend};
 
 mod serve;
 
@@ -92,14 +92,21 @@ enum Command {
     },
 }
 
-fn open_backend(cli: &Cli, config: &ArmConfig) -> Result<Box<dyn CanBackend>, String> {
+/// A real bus comes with its lock, which the caller holds for the whole command: the probes of
+/// scan, doctor and zero and the connect of hold send disable frames, which would drop an arm
+/// that a serve daemon holds.
+fn open_backend(
+    cli: &Cli,
+    config: &ArmConfig,
+) -> Result<(Option<BusLock>, Box<dyn CanBackend>), String> {
     match (&cli.can, cli.sim) {
         (Some(iface), false) => {
             #[cfg(feature = "socketcan")]
             {
+                let lock = maker_arm_transport::bus_lock(iface).map_err(|e| e.to_string())?;
                 let b = maker_arm_transport::SocketCanBackend::open(iface)
                     .map_err(|e| format!("open {iface}: {e}"))?;
-                Ok(Box::new(b))
+                Ok((Some(lock), Box::new(b)))
             }
             #[cfg(not(feature = "socketcan"))]
             {
@@ -107,7 +114,7 @@ fn open_backend(cli: &Cli, config: &ArmConfig) -> Result<Box<dyn CanBackend>, St
                 Err("built without the socketcan feature".into())
             }
         }
-        (None, true) => Ok(Box::new(SimArm::new(config))),
+        (None, true) => Ok((None, Box::new(SimArm::new(config)))),
         _ => Err("pass exactly one of --can <iface> or --sim".into()),
     }
 }
@@ -158,7 +165,8 @@ fn main() -> Result<(), String> {
         _ => {}
     }
     let config = ArmConfig::maker_arm_v1();
-    let mut backend = open_backend(&cli, &config)?;
+    // Declared before anything that can hold the arm, so it drops last.
+    let (_bus, mut backend) = open_backend(&cli, &config)?;
     match cli.command {
         Command::Scan => {
             let rows = maker_arm_cli::scan(backend.as_mut(), &config).map_err(|e| e.to_string())?;

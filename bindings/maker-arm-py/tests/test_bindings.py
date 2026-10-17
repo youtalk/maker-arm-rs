@@ -841,6 +841,24 @@ def test_socketcan_refuses_a_bad_profile_before_the_socket_opens():
         m.Arm.socketcan("nocan99", profile=p)
 
 
+def test_socketcan_refuses_a_held_bus_lock_before_the_socket_opens():
+    import os
+    import socket
+
+    # No interface of this name exists: an opener that skipped the lock would fail with
+    # "open CAN interface" instead of naming the lock.
+    iface = f"vcan{os.getpid()}"
+    held = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    held.bind(f"\0maker-arm-bus-{iface}")
+    try:
+        with pytest.raises(RuntimeError) as e:
+            m.Arm.socketcan(iface)
+        assert f"maker-arm-bus-{iface}" in str(e.value)
+        assert "open CAN interface" not in str(e.value)
+    finally:
+        held.close()
+
+
 def test_a_lowered_range_and_gains_are_accepted():
     p = m.profile()
     p["joints"][0]["q_lo"] += 0.1
