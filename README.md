@@ -76,6 +76,8 @@ PATH=/usr/lib/rust-1.85/bin:$PATH cargo install --locked --path maker-arm-rs/cra
 
 The apt cargo cannot install from a git URL, so clone the repository first.
 
+The daemon sets the error clamp to `0.03 / kp_scale` rad per arm joint, where `kp_scale` is the profile's `kp` over the `maker_arm_v1` value (rule R33), and it refuses a params `e_max` above that cap at load time.
+
 The daemon is not yet verified on a real arm. Support the arm before you start `serve` on a real interface.
 
 Three commands. For `PROFILE` and `MODEL`, use the profile and model files that ship with your arm's ROS package. Do not write them by hand.
