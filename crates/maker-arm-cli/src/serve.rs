@@ -1,7 +1,7 @@
 //! `maker-arm-cli serve`: a resident daemon that owns the bus and the `Tracking` loop and
 //! serves one command client over a Unix socket. When its client stops, on a signal and on a
-//! fault, it holds the arm. On a real interface only an explicit release disables the
-//! motors; on a virtual one the daemon ends with its client unless `--persist`.
+//! fault, it holds the arm. Once it is ready, on a real interface only an explicit release
+//! disables the motors; on a virtual one the daemon ends with its client unless `--persist`.
 
 use maker_arm::kinematics::ARM_DOF;
 use maker_arm::tracking::{Push, Row, TrackingController, TrackingShared, ROW};
