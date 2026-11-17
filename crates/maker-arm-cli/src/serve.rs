@@ -5,7 +5,7 @@
 
 use maker_arm::kinematics::ARM_DOF;
 use maker_arm::tracking::{Push, Row, TrackingController, TrackingShared, ROW};
-use maker_arm::{ArmConfig, FaultReason, LoopRt, RunningArm, Session, SimArm};
+use maker_arm::{ArmConfig, FaultReason, LoopRt, RunningArm, Session, SessionError, SimArm};
 use maker_arm_cli::files::{self, GripMap, Loaded, ServeOptions};
 use maker_arm_cli::wire::{self, ClientFrame, Mode, Op, Role, StateFrame, WireError};
 use maker_arm_transport::CanBackend;
@@ -115,6 +115,8 @@ fn fault_code(f: &FaultReason) -> u32 {
         FaultReason::BadCommand { .. } => 4,
         FaultReason::FaultReplyTimeout { .. } => 5,
         FaultReason::Warning { .. } => 6,
+        // 7 is MotorRestarted's.
+        FaultReason::Transport { .. } => 8,
     }
 }
 
@@ -278,7 +280,21 @@ impl Daemon {
         let mut st = self.lock();
         let mut frame = self.state_frame(&st, seq);
         frame.mode = Mode::Released;
-        let failed = st.arm.take().and_then(|arm| arm.stop_and_disable().1.err());
+        let failed = st
+            .arm
+            .take()
+            .and_then(|arm| match arm.stop_and_disable().1 {
+                Ok(()) => None,
+                // Every motor is confirmed off. Say why the loop had stopped.
+                Err(SessionError::LoopStopped {
+                    error,
+                    release: None,
+                }) => {
+                    log(&format!("the control loop had stopped: {error}"));
+                    None
+                }
+                Err(e) => Some(e),
+            });
         if failed.is_some() {
             // Never claim a release that did not happen.
             frame.mode = Mode::Fault;
@@ -701,6 +717,8 @@ mod tests {
         );
         let detail = String::new();
         assert_eq!(fault_code(&FaultReason::BadCommand { detail }), 5);
+        let detail = String::new();
+        assert_eq!(fault_code(&FaultReason::Transport { detail }), 9);
     }
 
     #[test]

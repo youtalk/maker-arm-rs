@@ -117,6 +117,7 @@ Hold rules:
 
 - On a real interface, after `SERVE_READY`, the daemon does not disable the motors by itself. It holds the arm when the client leaves, on SIGINT and SIGTERM, and on a fault.
 - Before `SERVE_READY`, a start-up failure can disable the motors that the daemon just enabled. The arm can then drop.
+- A short CAN error does not stop the control loop. The arm holds as on a fault. The loop stops only when the errors last longer than 0.25 s or the CAN interface is gone. `release` then still tries to disable the motors.
 - If the control loop stops, or the daemon process is killed, nothing commands the motors. Each motor keeps its last command. Only a gripper whose firmware has parameter access has a watchdog. To stop the motors, support the arm and press the emergency stop.
 - After `SERVE_READY`, only `release` disables the motors. It asks you to type `RELEASE`. Until you do, the arm holds. Release the torque only when the arm is supported.
 - While the daemon runs, `scan`, `doctor`, `zero`, `hold` and the Python binding refuse to open the same interface. Each one names the bus lock `maker-arm-bus-<interface>`.

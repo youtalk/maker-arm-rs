@@ -43,6 +43,11 @@ pub enum FaultReason {
     BadCommand {
         detail: String,
     },
+    /// A send or receive failed. The loop holds and keeps ticking, and
+    /// ends only when the errors last. Raised by the control loop.
+    Transport {
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for FaultReason {
@@ -71,6 +76,7 @@ impl std::fmt::Display for FaultReason {
                 write!(f, "motor {motor_id} over temperature: {celsius:.1} degC")
             }
             FaultReason::BadCommand { detail } => write!(f, "bad command: {detail}"),
+            FaultReason::Transport { detail } => write!(f, "CAN transport: {detail}"),
         }
     }
 }

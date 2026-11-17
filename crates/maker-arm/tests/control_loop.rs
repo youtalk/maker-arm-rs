@@ -1,6 +1,6 @@
 use maker_arm::{
     ArmCommand, ArmConfig, ArmState, Controller, FaultReason, HoldController, JointCommand, LoopRt,
-    RtError, Session, SessionState, SimArm,
+    RtError, Session, SessionError, SessionState, SimArm,
 };
 use maker_arm_protocol::{mit, RS00};
 use maker_arm_transport::{CanBackend, TransportError};
@@ -870,4 +870,126 @@ fn power_loss_then_return_never_re_enables() {
     assert_eq!(s.state(), SessionState::Fault);
     let sim = s.backend_as_sim().unwrap();
     assert!((1..=7).all(|m| !sim.enabled(m)));
+}
+
+/// What the `Enobufs` bus does to the next sends.
+#[derive(Default)]
+struct Bus {
+    /// This many sends fail.
+    fail_next: u32,
+    /// Every send to this motor fails.
+    dead: Option<u8>,
+    /// Disable frames tried, failed or not.
+    disables_tried: u32,
+}
+
+/// A SimArm whose sends fail as a full CAN TX queue makes them fail on a
+/// candleLight adapter: with ENOBUFS.
+struct Enobufs {
+    sim: SimArm,
+    bus: Arc<Mutex<Bus>>,
+}
+
+impl Enobufs {
+    fn session(c: &ArmConfig) -> (Session, Arc<Mutex<Bus>>) {
+        let bus = Arc::new(Mutex::new(Bus::default()));
+        let b = Enobufs {
+            sim: SimArm::new(c),
+            bus: bus.clone(),
+        };
+        let mut s = Session::connect(Box::new(b), c.clone()).expect("connect");
+        s.enable().expect("enable");
+        (s, bus)
+    }
+}
+
+impl CanBackend for Enobufs {
+    fn send(&mut self, id: u32, data: &[u8; 8]) -> Result<(), TransportError> {
+        let mut bus = self.bus.lock().unwrap();
+        if *data == mit::encode_disable(id as u8).data {
+            bus.disables_tried += 1;
+        }
+        if bus.fail_next > 0 || bus.dead == Some(id as u8) {
+            bus.fail_next = bus.fail_next.saturating_sub(1);
+            return Err(TransportError::Io(
+                "No buffer space available (os error 105)".into(),
+            ));
+        }
+        self.sim.send(id, data)
+    }
+
+    fn recv(&mut self, timeout: Duration) -> Result<Option<(u32, [u8; 8])>, TransportError> {
+        self.sim.recv(timeout)
+    }
+
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(&mut self.sim)
+    }
+}
+
+#[test]
+fn one_failed_send_holds_and_the_loop_keeps_running() {
+    let c = fast(ArmConfig::maker_arm_v1());
+    let (mut s, bus) = Enobufs::session(&c);
+    let before = s.positions();
+    let mut hold = HoldController::from_config(&c);
+    let stop = AtomicBool::new(false);
+    s.run(&mut hold, &stop, Some(5)).expect("run");
+    bus.lock().unwrap().fail_next = 1;
+    s.run(&mut hold, &stop, Some(100))
+        .expect("one failed send does not end the loop");
+    assert_eq!(s.state(), SessionState::Fault);
+    assert!(
+        matches!(s.fault(), Some(FaultReason::Transport { .. })),
+        "{:?}",
+        s.fault()
+    );
+    let after = s.positions();
+    for i in 0..7 {
+        assert!((after[i] - before[i]).abs() < 1e-3, "joint {i} moved");
+    }
+    let sim = s.backend_as_sim().unwrap();
+    assert!((1..=7).all(|m| sim.enabled(m)));
+}
+
+#[test]
+fn a_release_after_the_loop_stopped_still_disables() {
+    let c = fast(ArmConfig::maker_arm_v1());
+    let (s, bus) = Enobufs::session(&c);
+    let running = s
+        .start(Box::new(HoldController::from_config(&c)), None)
+        .expect("start");
+    std::thread::sleep(Duration::from_millis(50));
+    let tried = bus.lock().unwrap().disables_tried;
+    bus.lock().unwrap().fail_next = u32::MAX;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !running.loop_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(running.loop_finished(), "errors that last end the loop");
+    // The loop never disables on its own.
+    assert_eq!(bus.lock().unwrap().disables_tried, tried);
+    // The bus works again, except for motor 4.
+    *bus.lock().unwrap() = Bus {
+        dead: Some(4),
+        ..Bus::default()
+    };
+    let (mut s, res) = running.stop_and_disable();
+    match res {
+        Err(SessionError::LoopStopped {
+            error,
+            release: Some(r),
+        }) => {
+            assert!(matches!(*error, SessionError::Transport(_)), "{error}");
+            assert!(
+                matches!(&*r, SessionError::NotDisabled { motors, .. } if motors == &[4]),
+                "{r}"
+            );
+        }
+        other => panic!("expected the loop error and motor 4, got {other:?}"),
+    }
+    let sim = s.backend_as_sim().unwrap();
+    for m in 1..=7 {
+        assert_eq!(sim.enabled(m), m == 4, "motor {m}");
+    }
 }

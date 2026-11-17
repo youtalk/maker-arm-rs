@@ -43,6 +43,16 @@ fn accept_frame(frame: &CanFrame) -> Option<(u32, [u8; 8])> {
     Some((u32::from(sid.as_raw()), data))
 }
 
+/// `Closed` for an interface that is gone or down, `Io` for the rest. The
+/// kernel's CAN_RAW answers ENODEV (19) once and then ENXIO (6) after the
+/// adapter is unplugged, and ENETDOWN (100) while the interface is down.
+fn io_error(e: std::io::Error) -> TransportError {
+    match e.raw_os_error() {
+        Some(6 | 19 | 100) => TransportError::Closed,
+        _ => TransportError::Io(e.to_string()),
+    }
+}
+
 /// The 11-bit id of a frame, or an error above `0x7FF`.
 fn standard_id(id: u32) -> Result<StandardId, TransportError> {
     u16::try_from(id)
@@ -73,9 +83,7 @@ impl CanBackend for SocketCanBackend {
     fn send(&mut self, id: u32, data: &[u8; 8]) -> Result<(), TransportError> {
         let frame = CanFrame::new(standard_id(id)?, data)
             .ok_or_else(|| TransportError::Io("frame construction failed".into()))?;
-        self.sock
-            .write_frame(&frame)
-            .map_err(|e| TransportError::Io(e.to_string()))
+        self.sock.write_frame(&frame).map_err(io_error)
     }
 
     fn recv(&mut self, timeout: Duration) -> Result<Option<(u32, [u8; 8])>, TransportError> {
@@ -91,9 +99,7 @@ impl CanBackend for SocketCanBackend {
             self.sock.read_frame_timeout(Duration::ZERO)
         } else {
             if self.read_timeout != Some(timeout) {
-                self.sock
-                    .set_read_timeout(timeout)
-                    .map_err(|e| TransportError::Io(e.to_string()))?;
+                self.sock.set_read_timeout(timeout).map_err(io_error)?;
                 self.read_timeout = Some(timeout);
             }
             self.sock.read_frame()
@@ -114,7 +120,7 @@ impl CanBackend for SocketCanBackend {
             {
                 Ok(None)
             }
-            Err(e) => Err(TransportError::Io(e.to_string())),
+            Err(e) => Err(io_error(e)),
         }
     }
 }
@@ -143,6 +149,17 @@ mod tests {
         // feedback frame with every channel at its negative rail.
         let frame = CanFrame::new_remote(StandardId::new(0x0FD).unwrap(), 8).unwrap();
         assert_eq!(accept_frame(&frame), None);
+    }
+
+    #[test]
+    fn a_gone_or_down_interface_is_closed() {
+        for errno in [6, 19, 100] {
+            let e = io_error(std::io::Error::from_raw_os_error(errno));
+            assert!(matches!(e, TransportError::Closed), "errno {errno}: {e}");
+        }
+        // A full TX queue (ENOBUFS) passes.
+        let e = io_error(std::io::Error::from_raw_os_error(105));
+        assert!(matches!(e, TransportError::Io(_)), "{e}");
     }
 
     #[test]

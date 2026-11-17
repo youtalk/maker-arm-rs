@@ -35,8 +35,8 @@ pub enum SessionState {
 pub enum SessionError {
     Transport(TransportError),
     Clamp(ClampError),
-    /// A motor did not reply in time: to the probe, the preload, the enable
-    /// or the checked disable.
+    /// A motor did not reply in time: to the probe, the preload or the
+    /// enable.
     Probe {
         motor_id: u8,
     },
@@ -83,6 +83,19 @@ pub enum SessionError {
     },
     WrongState {
         expected: &'static str,
+    },
+    /// The checked disable could not confirm these motors off. They may
+    /// still hold torque. `cause` is the first other error of the sweep.
+    NotDisabled {
+        motors: Vec<u8>,
+        cause: Option<Box<SessionError>>,
+    },
+    /// The control loop had stopped on `error` before the release.
+    /// `release` is the checked disable's error, `None` when it
+    /// confirmed every motor off.
+    LoopStopped {
+        error: Box<SessionError>,
+        release: Option<Box<SessionError>>,
     },
 }
 
@@ -160,6 +173,21 @@ impl std::fmt::Display for SessionError {
             SessionError::WrongState { expected } => {
                 write!(f, "operation requires state {expected}")
             }
+            SessionError::NotDisabled { motors, cause } => {
+                let ids: Vec<String> = motors.iter().map(u8::to_string).collect();
+                write!(f, "motors {} did not confirm the disable", ids.join(", "))?;
+                if let Some(c) = cause {
+                    write!(f, " ({c})")?;
+                }
+                write!(f, " -- they may still hold torque")
+            }
+            SessionError::LoopStopped { error, release } => {
+                write!(f, "the control loop had stopped: {error}")?;
+                match release {
+                    Some(r) => write!(f, "; the release then failed: {r}"),
+                    None => write!(f, "; the release confirmed every motor off"),
+                }
+            }
         }
     }
 }
@@ -206,6 +234,8 @@ pub struct Session {
     pub(crate) fault_hold: Option<HoldController>,
     /// When the loop last sent the released gripper its disable.
     pub(crate) release_sent: Option<Instant>,
+    /// When the current run of transport errors in `tick` began.
+    pub(crate) failing_since: Option<Instant>,
     /// The gripper's CAN_TIMEOUT from before enable, kept for the restore.
     watchdog_restore: Option<u32>,
 }
@@ -259,6 +289,7 @@ impl Session {
             later_faults: Vec::new(),
             fault_hold: None,
             release_sent: None,
+            failing_since: None,
             watchdog_restore: None,
         };
         let motor_ids: Vec<u8> = s.config.joints.iter().map(|j| j.motor_id).collect();
@@ -532,6 +563,7 @@ impl Session {
         self.later_faults.clear();
         self.fault_hold = None;
         self.release_sent = None;
+        self.failing_since = None;
         self.health = HealthMonitor::new(&self.config);
         Ok(())
     }
@@ -610,8 +642,9 @@ impl Session {
     /// disable whose reply must come within `REPLY_TIMEOUT` and show mode 0
     /// where the firmware reports mode (3 tries). The gripper watchdog is
     /// restored only once the gripper is confirmed off. Every motor gets
-    /// its frames whatever failed before; the first error (a send, a drain,
-    /// or an unconfirmed motor as `Probe`) is returned after the sweep.
+    /// its frames whatever failed before. After the sweep, the motors that
+    /// did not confirm come back as `NotDisabled`; with none, the first
+    /// error (a send, a drain, the watchdog restore).
     ///
     /// Also resets `fault`/`fault_hold`/`health`: torque is off and the
     /// session is back at `Connected`, so the health monitor must start
@@ -649,6 +682,7 @@ impl Session {
             note(self.send_raw(f.id, &f.data));
         }
         let mut gripper_off = false;
+        let mut unconfirmed = Vec::new();
         for i in 0..n {
             let m = self.config.joints[i].motor_id;
             let mut off = false;
@@ -666,7 +700,7 @@ impl Session {
                 }
             }
             if !off {
-                note(Err(SessionError::Probe { motor_id: m }));
+                unconfirmed.push(m);
             }
             if self.config.gripper.is_some_and(|g| g.motor_id == m) {
                 gripper_off = off;
@@ -693,6 +727,13 @@ impl Session {
         self.fault_hold = None;
         self.release_sent = None;
         self.health = HealthMonitor::new(&self.config);
+        if !unconfirmed.is_empty() {
+            // It names every motor that may still hold torque, so it wins.
+            return Err(SessionError::NotDisabled {
+                motors: unconfirmed,
+                cause: first_err.map(Box::new),
+            });
+        }
         first_err.map_or(Ok(()), Err)
     }
 
