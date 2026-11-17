@@ -602,6 +602,7 @@ pub fn run(o: &ServeOptions, check: bool) -> Result<(), String> {
         serde_json::json!(socket.display().to_string())
     ));
     let mut fault_logged = false;
+    let mut later_logged = 0;
     loop {
         if SIGNALED.swap(false, Ordering::Relaxed) {
             let mut st = d.lock();
@@ -643,16 +644,22 @@ pub fn run(o: &ServeOptions, check: bool) -> Result<(), String> {
             .saturating_add(u32::try_from(clamped).unwrap_or(u32::MAX));
         if st.faulted() {
             st.mode = Mode::Fault;
+            let snap = st.arm.as_ref().and_then(RunningArm::snapshot);
             if !fault_logged {
                 fault_logged = true;
-                let why = st.arm.as_ref().and_then(|a| a.snapshot()?.fault);
-                log(&match why {
+                log(&match snap.as_ref().and_then(|s| s.fault.as_ref()) {
                     Some(f) => format!("FAULT: {f}; holding the measured pose"),
                     None => "FAULT: the control loop stopped; the motors keep their last \
                              command"
                         .into(),
                 });
             }
+            // Each later fault during the hold, once.
+            let later = snap.map_or(vec![], |s| s.later_faults);
+            for f in later.iter().skip(later_logged) {
+                log(&format!("FAULT (later, still holding): {f}"));
+            }
+            later_logged = later_logged.max(later.len());
         }
         if let Some(why) = st.exit {
             drop(st);

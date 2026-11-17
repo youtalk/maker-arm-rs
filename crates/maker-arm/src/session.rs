@@ -200,6 +200,9 @@ pub struct Session {
     pub(crate) tick: u64,
     pub(crate) health: HealthMonitor,
     pub(crate) fault: Option<FaultReason>,
+    /// Faults found after the first one while the arm holds, as the
+    /// vendor's `fault_reasons`.
+    pub(crate) later_faults: Vec<FaultReason>,
     pub(crate) fault_hold: Option<HoldController>,
     /// When the loop last sent the released gripper its disable.
     pub(crate) release_sent: Option<Instant>,
@@ -253,6 +256,7 @@ impl Session {
             tick: 0,
             health,
             fault: None,
+            later_faults: Vec::new(),
             fault_hold: None,
             release_sent: None,
             watchdog_restore: None,
@@ -525,6 +529,7 @@ impl Session {
         // Cleared on the success path only, so a failed enable keeps the
         // fault reason a caller most wants to read.
         self.fault = None;
+        self.later_faults.clear();
         self.fault_hold = None;
         self.release_sent = None;
         self.health = HealthMonitor::new(&self.config);
@@ -684,6 +689,7 @@ impl Session {
         }
         self.state = SessionState::Connected;
         self.fault = None;
+        self.later_faults.clear();
         self.fault_hold = None;
         self.release_sent = None;
         self.health = HealthMonitor::new(&self.config);

@@ -821,11 +821,19 @@ fn a_gripper_fault_during_a_hold_still_releases_it() {
     let base = sim.disables(7);
     sim.set_temperature(7, 56.0);
     s.run(&mut hold, &stop, Some(200)).expect("run 1 s");
-    // The first fault stays the session's reason.
+    // The first fault stays the session's reason, and the later one is kept.
     assert!(matches!(
         s.fault(),
         Some(FaultReason::MotorFault { motor_id: 3, .. })
     ));
+    assert!(
+        matches!(
+            s.later_faults(),
+            [FaultReason::OverTemperature { motor_id: 7, .. }]
+        ),
+        "{:?}",
+        s.later_faults()
+    );
     let sim = s.backend_as_sim().unwrap();
     assert!(!sim.enabled(7));
     assert!((1..=6).all(|m| sim.enabled(m)));

@@ -47,6 +47,9 @@ pub const RING_TICKS: usize = 4000;
 /// one lost disable must not leave it energized.
 const RELEASE_RESEND: Duration = Duration::from_millis(100);
 
+/// `later_faults` keeps at most this many, as the vendor caps its list.
+const LATER_FAULTS_MAX: usize = 100;
+
 /// A bounded ring of records and the number it dropped since the last `take`.
 #[derive(Debug)]
 pub struct TickRing<T> {
@@ -253,7 +256,22 @@ impl Session {
         self.fault.as_ref()
     }
 
+    /// The faults found after the first one while the arm held, oldest
+    /// first. `fault` stays the first.
+    pub fn later_faults(&self) -> &[FaultReason] {
+        &self.later_faults
+    }
+
     fn enter_fault(&mut self, reason: FaultReason, at: &ArmState) -> Result<(), SessionError> {
+        if self.fault.is_some() {
+            // A later fault while the arm holds is kept, as the vendor's
+            // `fault_reasons`. It does not retarget the hold, which would
+            // walk a sagging arm downhill.
+            if self.later_faults.len() < LATER_FAULTS_MAX {
+                self.later_faults.push(reason);
+            }
+            return Ok(());
+        }
         if self.config().hold_on_fault {
             let mut hold = HoldController::from_config(self.config());
             // The hold target is the pose the arm was measured at, but it
@@ -268,8 +286,7 @@ impl Session {
             // path -- but it is operator-visible motion during a fault.
             hold.retarget_to_state(at);
             self.fault_hold = Some(hold);
-            // The first fault stays the session's reason.
-            self.fault.get_or_insert(reason);
+            self.fault = Some(reason);
             self.set_state(SessionState::Fault);
             Ok(())
         } else {
@@ -295,10 +312,10 @@ impl Session {
     /// As the vendor's, health is checked every tick, in `Fault` too. A
     /// motor that faulted is skipped from then on, so a later fault on
     /// another motor still shows. Only the first fault enters `Fault`:
-    /// it stays the session's reason, and a later one does not
-    /// `retarget_to_state` the hold, which would walk a sagging arm
-    /// downhill. A later fault on the gripper still releases it
-    /// (`send_mit_all`).
+    /// it stays the session's reason, and a later one goes to
+    /// `later_faults` and does not `retarget_to_state` the hold, which
+    /// would walk a sagging arm downhill. A later fault on the gripper
+    /// still releases it (`send_mit_all`).
     pub fn tick(&mut self, controller: &mut dyn Controller) -> Result<TickOutcome, SessionError> {
         if self.state() != SessionState::Enabled && self.state() != SessionState::Fault {
             return Err(SessionError::WrongState {
@@ -318,19 +335,15 @@ impl Session {
         let cfg = self.config().clone();
         let dt = 1.0 / cfg.control_rate_hz;
 
-        // In `Fault` a later fault only marks its motor in the health
-        // monitor; see this function's doc comment.
         if let Some(reason) = self.health.check(&snapshot, &cfg) {
-            if self.fault.is_none() {
-                self.enter_fault(reason, &snapshot)?;
-                if self.state() == SessionState::Connected {
-                    // hold_on_fault = false path: motors already disabled.
-                    return Ok(TickOutcome {
-                        fault: self.fault.clone(),
-                        clamped: false,
-                        record: None,
-                    });
-                }
+            self.enter_fault(reason, &snapshot)?;
+            if self.state() == SessionState::Connected {
+                // hold_on_fault = false path: motors already disabled.
+                return Ok(TickOutcome {
+                    fault: self.fault.clone(),
+                    clamped: false,
+                    record: None,
+                });
             }
         }
 
@@ -592,6 +605,7 @@ impl Session {
                 let snap = Snapshot {
                     state: self.state(),
                     fault: self.fault.clone(),
+                    later_faults: self.later_faults.clone(),
                     arm: self.arm_state(),
                 };
                 unpublished = match sh.snapshot.try_lock() {
@@ -655,6 +669,8 @@ pub struct LoopShared {
 pub struct Snapshot {
     pub state: SessionState,
     pub fault: Option<FaultReason>,
+    /// `Session::later_faults`.
+    pub later_faults: Vec<FaultReason>,
     pub arm: ArmState,
 }
 
