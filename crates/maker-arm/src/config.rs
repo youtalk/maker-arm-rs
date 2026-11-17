@@ -102,8 +102,9 @@ pub struct ArmConfig {
     pub enable_limit_grace: f64,
     /// Consecutive ticks of mode != 2 before faulting.
     pub mode_fault_ticks: u32,
-    /// Our addition: any motor at or above this temperature (°C) trips an
-    /// automatic hold (design §4 item 3). Not an upstream behavior.
+    /// Our addition: a joint at or above this temperature (°C) trips an
+    /// automatic hold (design §4 item 3). The gripper uses its own
+    /// `GripperRules::max_temperature_c`.
     pub temp_hold_c: f64,
     /// Our addition: experiment gain ceiling for kp (design §2) — well below
     /// the protocol's KP_MAX = 500.0, tuned by hardware sessions under

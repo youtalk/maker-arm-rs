@@ -291,7 +291,7 @@ fn disable_estop_and_clear_faults_transitions() {
 }
 
 #[test]
-fn poll_fault_queries_the_oldest_motor_once_per_interval() {
+fn poll_fault_asks_each_motor_once_per_interval_by_send_time() {
     let c = ArmConfig::maker_arm_v1();
     let (backend, cfg) = FlakyBackend::new(SimArm::new(&c));
     let mut s = Session::connect(Box::new(backend), c.clone()).expect("connect");
@@ -307,21 +307,17 @@ fn poll_fault_queries_the_oldest_motor_once_per_interval() {
             .collect();
         q
     };
-    cfg.lock().unwrap().sent.clear();
-    // Every motor answered a fault query during enable, less than an interval ago.
-    s.poll_fault().unwrap();
-    assert!(queries(&cfg).is_empty());
-    std::thread::sleep(Duration::from_secs_f64(c.fault_poll_interval));
-    for _ in 0..10 {
-        s.poll_fault().unwrap();
+    // Paced by the last query sent, not the last reply: the motor asked
+    // longest ago goes first, one query per call, each motor once per
+    // interval. Enable's own queries do not count.
+    for _ in 0..2 {
+        cfg.lock().unwrap().sent.clear();
+        for _ in 0..10 {
+            s.poll_fault().unwrap();
+        }
+        assert_eq!(queries(&cfg), (1..=7).collect::<Vec<u32>>());
+        std::thread::sleep(Duration::from_secs_f64(c.fault_poll_interval));
     }
-    // Oldest first, one query per call, and each motor once.
-    assert_eq!(queries(&cfg), (1..=7).collect::<Vec<u32>>());
-    assert!(s
-        .arm_state()
-        .motors
-        .iter()
-        .all(|m| m.fault_reply_age < 0.25));
 }
 
 #[test]
@@ -482,7 +478,7 @@ fn connect_refuses_a_wrap_that_cannot_map_the_configured_range() {
     // park its raw angle at 11.0 rad -- physically reachable -- and the
     // only wrap that lands the pose inside the grace window is -2π
     // (11.0 - 6.283 = 4.717). But then q_hi maps to 7.955 + 6.283 =
-    // 14.238 rad, past the encoder's +12.57: `float_to_u16` would clamp
+    // 14.238 rad, past the encoder's +12.57: `float_to_uint` would clamp
     // that to the rail with no error, truncating a position command by
     // 1.61 rad at kp 90 while reporting `clamped: false`. Refuse at
     // connect instead, with an error that says what to DO about it.

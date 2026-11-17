@@ -2,10 +2,12 @@ use maker_arm::{
     ArmCommand, ArmConfig, ArmState, Controller, FaultReason, HoldController, JointCommand, LoopRt,
     RtError, Session, SessionState, SimArm,
 };
+use maker_arm_protocol::{mit, RS00};
+use maker_arm_transport::{CanBackend, TransportError};
 use std::f64::consts::TAU;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 fn fast(mut c: ArmConfig) -> ArmConfig {
     c.inter_frame_us = 0; // no wire pacing against an in-memory sim
@@ -335,11 +337,12 @@ fn run_keeps_holding_through_a_fault_until_max_ticks() {
         50,
         "run() must keep ticking (holding) through a fault, not exit early"
     );
-    // torque never dropped -- still holding, not disabled
+    // joints 1 to 6 keep torque and hold; only the gripper is released
     let sim = s.backend_as_sim().unwrap();
-    for id in 1..=7u8 {
+    for id in 1..=6u8 {
         assert!(sim.enabled(id));
     }
+    assert!(!sim.enabled(7));
 }
 
 #[test]
@@ -512,9 +515,9 @@ fn commands_travel_through_a_negative_wrap_too() {
 fn a_saturating_motor_position_faults_instead_of_being_truncated() {
     // Backstop for the same critical finding: if a computed motor-frame
     // position ever falls outside the encoder's ±12.57 window,
-    // `encode_mit`'s `float_to_u16` would clamp it to the rail and report
-    // nothing -- a silently truncated position command at full kp. The
-    // output stage must fault instead.
+    // `mit::encode_control`'s `float_to_uint` would clamp it to the rail
+    // and report nothing -- a silently truncated position command at full
+    // kp. The output stage must fault instead.
     //
     // The connect-time check makes this unreachable through the normal
     // path (it verifies exactly the range the clamp permits), so the test
@@ -679,4 +682,137 @@ fn start_without_the_rtprio_right_fails_and_returns_the_session() {
         .expect("no rtprio right, so SCHED_FIFO 80 must be refused");
     assert!(matches!(err.error, RtError::Priority { priority: 80, .. }));
     assert_eq!(err.session.state(), SessionState::Enabled);
+}
+
+/// A `SimArm` that logs the motor id of every fault query it is sent and,
+/// once the flag in `log` is set, drops motor 4's fault status replies.
+struct Tap {
+    sim: SimArm,
+    /// (fault queries sent, motor 4 deaf)
+    log: Arc<Mutex<(Vec<u8>, bool)>>,
+}
+
+impl CanBackend for Tap {
+    fn send(&mut self, id: u32, data: &[u8; 8]) -> Result<(), TransportError> {
+        if *data == mit::encode_fault_query(id as u8).data {
+            self.log.lock().unwrap().0.push(id as u8);
+        }
+        self.sim.send(id, data)
+    }
+
+    fn recv(&mut self, timeout: Duration) -> Result<Option<(u32, [u8; 8])>, TransportError> {
+        loop {
+            let r = self.sim.recv(timeout)?;
+            let deaf = self.log.lock().unwrap().1;
+            match r {
+                Some((id, d))
+                    if deaf
+                        && matches!(mit::parse_frame(id, &d, &RS00),
+                                    Some(mit::Parsed::Fault(f)) if f.motor_id == 4) => {}
+                other => return Ok(other),
+            }
+        }
+    }
+}
+
+#[test]
+fn each_tick_sends_at_most_one_fault_query() {
+    let c = fast(ArmConfig::maker_arm_v1());
+    let log = Arc::new(Mutex::new((Vec::new(), false)));
+    let tap = Tap {
+        sim: SimArm::new(&c),
+        log: log.clone(),
+    };
+    let mut s = Session::connect(Box::new(tap), c.clone()).expect("connect");
+    s.enable().expect("enable");
+    *log.lock().unwrap() = (Vec::new(), true);
+    let mut hold = HoldController::from_config(&c);
+    // (motor, before the tick, after the tick)
+    let mut sent = Vec::new();
+    for _ in 0..180 {
+        let before = Instant::now();
+        s.tick(&mut hold).expect("tick");
+        let q = std::mem::take(&mut log.lock().unwrap().0);
+        assert!(q.len() <= 1, "fault queries {q:?} in one tick");
+        sent.extend(q.into_iter().map(|m| (m, before, Instant::now())));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let first: Vec<u8> = sent.iter().take(7).map(|q| q.0).collect();
+    assert_eq!(first, (1..=7).collect::<Vec<u8>>());
+    // Motor 4 never answers, yet it is asked once per interval like the
+    // others, so it cannot starve them.
+    let interval = Duration::from_secs_f64(c.fault_poll_interval);
+    for m in 1..=7u8 {
+        let mine: Vec<_> = sent.iter().filter(|q| q.0 == m).collect();
+        assert!(mine.len() >= 3, "motor {m}: {} queries", mine.len());
+        for w in mine.windows(2) {
+            assert!(
+                w[1].2 - w[0].1 >= interval,
+                "motor {m} asked twice in an interval"
+            );
+        }
+    }
+    assert!(matches!(
+        s.fault(),
+        Some(FaultReason::FaultReplyTimeout { motor_id: 4, .. })
+    ));
+}
+
+#[test]
+fn a_fault_releases_the_gripper_and_holds_the_joints() {
+    let c = fast(ArmConfig::maker_arm_v1());
+    let mut s = enabled_session(&c);
+    let before = s.positions();
+    let sim = s.backend_as_sim().unwrap();
+    // Connect and enable send disables too: count from here.
+    let base = sim.disables(7);
+    sim.inject_fault(3, 1 << 14);
+    let mut hold = HoldController::from_config(&c);
+    let stop = AtomicBool::new(false);
+    s.run(&mut hold, &stop, Some(200)).expect("run 1 s");
+    assert!(matches!(
+        s.fault(),
+        Some(FaultReason::MotorFault { motor_id: 3, .. })
+    ));
+    assert_eq!(s.state(), SessionState::Fault);
+    let after = s.positions();
+    for i in 0..6 {
+        assert!((after[i] - before[i]).abs() < 1e-3, "joint {i} moved");
+    }
+    let sim = s.backend_as_sim().unwrap();
+    assert!(!sim.enabled(7));
+    assert!((1..=6).all(|m| sim.enabled(m)));
+    let disables = sim.disables(7) - base;
+    assert!(
+        (9..=11).contains(&disables),
+        "{disables} gripper disables in 1 s"
+    );
+}
+
+#[test]
+fn power_loss_then_return_never_re_enables() {
+    let c = fast(ArmConfig::maker_arm_v1());
+    let mut s = enabled_session(&c);
+    let mut hold = HoldController::from_config(&c);
+    let stop = AtomicBool::new(false);
+    let sim = s.backend_as_sim().unwrap();
+    for m in 1..=7 {
+        sim.set_muted(m, true);
+    }
+    s.run(&mut hold, &stop, Some(100))
+        .expect("run to the timeout");
+    assert!(matches!(
+        s.fault(),
+        Some(FaultReason::FeedbackTimeout { .. })
+    ));
+    let sim = s.backend_as_sim().unwrap();
+    sim.power_cycle();
+    for m in 1..=7 {
+        sim.set_muted(m, false);
+    }
+    s.run(&mut hold, &stop, Some(50))
+        .expect("run after power returns");
+    assert_eq!(s.state(), SessionState::Fault);
+    let sim = s.backend_as_sim().unwrap();
+    assert!((1..=7).all(|m| !sim.enabled(m)));
 }

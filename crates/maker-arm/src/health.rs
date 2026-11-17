@@ -1,8 +1,11 @@
-//! Per-tick health checks, mirroring arm.py's _check_health (upstream @
-//! 2026-08-20): feedback age, fault bits, and mode-not-Motor with a
-//! 5-tick debounce. Over-temperature is OUR addition (design §4 item 3);
-//! upstream does not check temperature. Checks run in motor order and the
-//! first failure wins — one fault at a time is enough to stop on.
+//! Per-tick health checks, following arm.py's _check_health (vendor SDK
+//! 0245316, spec 6.2). Per motor, in this order: feedback age, fault word
+//! or flag, fault reply age (three fault poll intervals), temperature,
+//! the gripper's warning flag, and mode 2 for 5 ticks where the firmware
+//! has parameter access. The gripper stops at the vendor's 55 degC; the
+//! 70 degC limit on joints 1 to 6 is ours (design §4 item 3). Checks run
+//! in motor order and the first failure wins — one fault at a time is
+//! enough to stop on.
 
 use crate::config::ArmConfig;
 use crate::state::ArmState;
@@ -16,6 +19,15 @@ pub enum FaultReason {
     MotorFault {
         motor_id: u8,
         word: u32,
+    },
+    /// No fault status reply for three fault poll intervals.
+    FaultReplyTimeout {
+        motor_id: u8,
+        age: f64,
+    },
+    /// The gripper's warning flag, a fault as the vendor treats it.
+    Warning {
+        motor_id: u8,
     },
     ModeNotMotor {
         motor_id: u8,
@@ -44,6 +56,13 @@ impl std::fmt::Display for FaultReason {
             FaultReason::MotorFault { motor_id, word } => {
                 write!(f, "motor {motor_id} fault word {word:#010x}")
             }
+            FaultReason::FaultReplyTimeout { motor_id, age } => {
+                write!(
+                    f,
+                    "motor {motor_id} sent no fault status for {age:.3}s -- check bus/power"
+                )
+            }
+            FaultReason::Warning { motor_id } => write!(f, "motor {motor_id} warning flag set"),
             FaultReason::ModeNotMotor { motor_id, ticks } => {
                 write!(f, "motor {motor_id} not in Motor mode for {ticks} ticks")
             }
@@ -67,7 +86,9 @@ impl HealthMonitor {
     }
 
     pub fn check(&mut self, state: &ArmState, config: &ArmConfig) -> Option<FaultReason> {
+        let reply_timeout = 3.0 * config.fault_poll_interval;
         for (i, (m, j)) in state.motors.iter().zip(&config.joints).enumerate() {
+            let gripper = config.gripper.filter(|g| g.motor_id == j.motor_id);
             if m.feedback_age > config.feedback_timeout {
                 return Some(FaultReason::FeedbackTimeout {
                     motor_id: j.motor_id,
@@ -80,13 +101,25 @@ impl HealthMonitor {
                     word: m.fault_word,
                 });
             }
-            if m.temperature >= config.temp_hold_c {
+            if m.fault_reply_age > reply_timeout {
+                return Some(FaultReason::FaultReplyTimeout {
+                    motor_id: j.motor_id,
+                    age: m.fault_reply_age,
+                });
+            }
+            if m.temperature >= gripper.map_or(config.temp_hold_c, |g| g.max_temperature_c) {
                 return Some(FaultReason::OverTemperature {
                     motor_id: j.motor_id,
                     celsius: m.temperature,
                 });
             }
-            if m.mode != 2 {
+            if gripper.is_some() && m.warning_flag {
+                return Some(FaultReason::Warning {
+                    motor_id: j.motor_id,
+                });
+            }
+            // Legacy firmware reports mode 0 even while enabled.
+            if m.params && m.mode != 2 {
                 self.bad_mode_ticks[i] += 1;
                 if self.bad_mode_ticks[i] >= config.mode_fault_ticks {
                     return Some(FaultReason::ModeNotMotor {
@@ -117,6 +150,8 @@ mod tests {
                     mode: 2,
                     temperature: 35.0,
                     feedback_age: 0.001,
+                    fault_reply_age: 0.001,
+                    params: true,
                     ..MotorState::stale()
                 })
                 .collect(),
@@ -147,7 +182,7 @@ mod tests {
     }
 
     #[test]
-    fn fault_word_or_flag_faults_immediately() {
+    fn a_fault_word_faults_at_once() {
         let c = ArmConfig::maker_arm_v1();
         let mut h = HealthMonitor::new(&c);
         let mut s = healthy(&c);
@@ -171,11 +206,40 @@ mod tests {
     }
 
     #[test]
-    fn over_temperature_faults() {
+    fn a_missing_fault_reply_faults_after_three_intervals() {
         let c = ArmConfig::maker_arm_v1();
         let mut h = HealthMonitor::new(&c);
         let mut s = healthy(&c);
-        s.motors[1].temperature = 70.0; // >= temp_hold_c
+        s.motors[3].fault_reply_age = 0.74;
+        assert_eq!(h.check(&s, &c), None);
+        s.motors[3].fault_reply_age = 0.76;
+        assert_eq!(
+            h.check(&s, &c),
+            Some(FaultReason::FaultReplyTimeout {
+                motor_id: 4,
+                age: 0.76
+            })
+        );
+    }
+
+    #[test]
+    fn the_gripper_overheats_at_55_and_the_joints_at_70() {
+        let c = ArmConfig::maker_arm_v1();
+        let mut h = HealthMonitor::new(&c);
+        let mut s = healthy(&c);
+        s.motors[6].temperature = 54.9;
+        s.motors[1].temperature = 69.9;
+        assert_eq!(h.check(&s, &c), None);
+        s.motors[6].temperature = 55.0;
+        assert_eq!(
+            h.check(&s, &c),
+            Some(FaultReason::OverTemperature {
+                motor_id: 7,
+                celsius: 55.0
+            })
+        );
+        let mut s = healthy(&c);
+        s.motors[1].temperature = 70.0;
         assert_eq!(
             h.check(&s, &c),
             Some(FaultReason::OverTemperature {
@@ -183,6 +247,33 @@ mod tests {
                 celsius: 70.0
             })
         );
+    }
+
+    #[test]
+    fn a_gripper_warning_is_a_fault() {
+        let c = ArmConfig::maker_arm_v1();
+        let mut h = HealthMonitor::new(&c);
+        // A joint's warning flag is not a fault.
+        let mut s = healthy(&c);
+        s.motors[2].warning_flag = true;
+        assert_eq!(h.check(&s, &c), None);
+        s.motors[6].warning_flag = true;
+        assert_eq!(h.check(&s, &c), Some(FaultReason::Warning { motor_id: 7 }));
+    }
+
+    #[test]
+    fn mode_is_checked_only_with_parameter_access() {
+        let c = ArmConfig::maker_arm_v1();
+        let mut h = HealthMonitor::new(&c);
+        // Legacy firmware reports mode 0 even while enabled.
+        let mut s = healthy(&c);
+        for m in &mut s.motors {
+            m.params = false;
+            m.mode = 0;
+        }
+        for _ in 0..10 {
+            assert_eq!(h.check(&s, &c), None);
+        }
     }
 
     #[test]

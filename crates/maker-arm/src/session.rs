@@ -71,7 +71,7 @@ pub enum SessionError {
     /// range outside the encoder's `[p_min, p_max]` window. Distinct from
     /// [`SessionError::PositionOutOfRange`] on purpose: the arm's current
     /// pose is fine, but commands near this limit would silently saturate
-    /// in `float_to_u16`, so the operator's action is different (re-zero
+    /// in `float_to_uint`, so the operator's action is different (re-zero
     /// the motor, or rotate it one full turn) rather than "move the joint
     /// back into range".
     RangeNotMappable {
@@ -187,6 +187,8 @@ struct MotorSlot {
     wrap: f64,
     last_feedback: Option<Instant>,
     last_fault_reply: Option<Instant>,
+    /// When `poll_fault` last sent this motor a fault query.
+    last_fault_query: Option<Instant>,
 }
 
 pub struct Session {
@@ -199,6 +201,8 @@ pub struct Session {
     pub(crate) health: HealthMonitor,
     pub(crate) fault: Option<FaultReason>,
     pub(crate) fault_hold: Option<HoldController>,
+    /// When the loop last sent the released gripper its disable.
+    pub(crate) release_sent: Option<Instant>,
     /// The gripper's CAN_TIMEOUT from before enable, kept for the restore.
     watchdog_restore: Option<u32>,
 }
@@ -236,6 +240,7 @@ impl Session {
                 wrap: 0.0,
                 last_feedback: None,
                 last_fault_reply: None,
+                last_fault_query: None,
             })
             .collect();
         let health = HealthMonitor::new(&config);
@@ -249,6 +254,7 @@ impl Session {
             health,
             fault: None,
             fault_hold: None,
+            release_sent: None,
             watchdog_restore: None,
         };
         let motor_ids: Vec<u8> = s.config.joints.iter().map(|j| j.motor_id).collect();
@@ -297,7 +303,7 @@ impl Session {
             // `to_motor(q) - wrap` for every commanded q in
             // `q_lo..q_hi`. If either end of that configured range falls
             // outside the encoder's `[p_min, p_max]` window,
-            // `float_to_u16` would clamp it to the rail with no error --
+            // `float_to_uint` would clamp it to the rail with no error --
             // a silently truncated position command at full kp (the
             // reviewer measured 1.61 rad of truncation on J3 with
             // `clamped: false` reported). Refuse to connect instead: the
@@ -704,25 +710,27 @@ impl Session {
         result.and(drained)
     }
 
-    /// Sends one non-clearing fault query to the motor whose last fault
-    /// reply is oldest, once that age reaches `fault_poll_interval`. Drains
-    /// first, so a reply already on the bus counts.
+    /// Sends one non-clearing fault query to the motor asked longest ago,
+    /// once `fault_poll_interval` has passed since that query, as the
+    /// vendor does. Paced by the query sent, not the reply: a motor that
+    /// never answers is still asked only once per interval, so it cannot
+    /// starve the others.
     pub fn poll_fault(&mut self) -> Result<(), SessionError> {
-        self.drain()?;
         let Some((i, slot)) = self
             .slots
             .iter()
             .enumerate()
-            .min_by_key(|(_, s)| s.last_fault_reply)
+            .min_by_key(|(_, s)| s.last_fault_query)
         else {
             return Ok(());
         };
         if slot
-            .last_fault_reply
+            .last_fault_query
             .is_some_and(|t| t.elapsed().as_secs_f64() < self.config.fault_poll_interval)
         {
             return Ok(());
         }
+        self.slots[i].last_fault_query = Some(Instant::now());
         let f = mit::encode_fault_query(self.config.joints[i].motor_id);
         self.send_raw(f.id, &f.data)
     }
