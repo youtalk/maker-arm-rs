@@ -1,8 +1,9 @@
 //! Per-tick health checks, following arm.py's _check_health (vendor SDK
-//! 0245316, spec 6.2). Per motor, in this order: feedback age, fault word
-//! or flag, fault reply age (three fault poll intervals), temperature,
-//! the gripper's warning flag, and mode 2 for 5 ticks where the firmware
-//! has parameter access. The gripper stops at the vendor's 55 degC; the
+//! 0245316, spec 6.2). Per motor, in this order: a restart seen in an
+//! enabled session (ours: legacy firmware gives no other sign), feedback
+//! age, fault word or flag, fault reply age (three fault poll intervals),
+//! temperature, the gripper's warning flag, and mode 2 for 5 ticks where
+//! the firmware has parameter access. The gripper stops at the vendor's 55 degC; the
 //! 70 degC limit on joints 1 to 6 is ours (design §4 item 3). Checks run
 //! in motor order and the first failure wins. A motor that faulted is
 //! skipped from then on, as the vendor does, so the checks keep running
@@ -43,6 +44,16 @@ pub enum FaultReason {
     BadCommand {
         detail: String,
     },
+    /// A power-up announcement came from this motor while the session was
+    /// enabled: it restarted with torque off. It is never re-enabled.
+    MotorRestarted {
+        motor_id: u8,
+    },
+    /// A send or receive failed. The loop holds and keeps ticking, and
+    /// ends only when the errors last. Raised by the control loop.
+    Transport {
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for FaultReason {
@@ -71,6 +82,12 @@ impl std::fmt::Display for FaultReason {
                 write!(f, "motor {motor_id} over temperature: {celsius:.1} degC")
             }
             FaultReason::BadCommand { detail } => write!(f, "bad command: {detail}"),
+            FaultReason::MotorRestarted { motor_id } => write!(
+                f,
+                "motor {motor_id} restarted (power-up announcement): its torque is off -- \
+                 check its power connector"
+            ),
+            FaultReason::Transport { detail } => write!(f, "CAN transport: {detail}"),
         }
     }
 }
@@ -118,6 +135,11 @@ impl HealthMonitor {
         config: &ArmConfig,
     ) -> Option<FaultReason> {
         let gripper = config.gripper.filter(|g| g.motor_id == j.motor_id);
+        if m.restarted {
+            return Some(FaultReason::MotorRestarted {
+                motor_id: j.motor_id,
+            });
+        }
         if m.feedback_age > config.feedback_timeout {
             return Some(FaultReason::FeedbackTimeout {
                 motor_id: j.motor_id,

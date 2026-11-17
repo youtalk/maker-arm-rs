@@ -282,6 +282,15 @@ fn main() -> Result<(), String> {
             }
         }
         Command::Zero { motor, yes } => {
+            // A dead daemon may have left the arm raised on enabled motors:
+            // ask before the disables drop it. Input that ends aborts.
+            if !yes {
+                println!("every motor will be disabled: support the arm, then press ENTER");
+                let mut line = String::new();
+                if !matches!(std::io::stdin().read_line(&mut line), Ok(n) if n > 0) {
+                    return Err("aborted".into());
+                }
+            }
             // Runs after every motor is disabled.
             let confirm = || {
                 if yes {
@@ -299,17 +308,20 @@ fn main() -> Result<(), String> {
             let pos = maker_arm_cli::zero_motor(backend.as_mut(), &config, motor, confirm)?;
             println!("motor {motor} zeroed; joint position now {pos:.4} rad");
             // Presentation only: `zero_motor` reports a true register
-            // value, not a claim that it is a safe pose. Some joints'
-            // configured ranges do not include zero (e.g. J5, J6), so
-            // warn here -- `Session::enable()` remains the real gate and
-            // will refuse to energize a joint left outside its range.
+            // value, not a claim that it is a safe pose. Enable accepts a
+            // joint up to `enable_limit_grace` past its range, so warn only
+            // outside that window -- `Session::enable()` remains the real
+            // gate.
             if let Some(j) = config.joint_by_motor_id(motor) {
-                if pos < j.q_lo || pos > j.q_hi {
+                let (lo, hi) = (
+                    j.q_lo - config.enable_limit_grace,
+                    j.q_hi + config.enable_limit_grace,
+                );
+                if !(lo..=hi).contains(&pos) {
                     println!(
-                        "WARNING: {pos:.4} rad is outside motor {motor}'s configured range \
-                         [{:.3}, {:.3}]; enable will refuse this pose until it is moved back \
-                         inside range",
-                        j.q_lo, j.q_hi
+                        "WARNING: {pos:.4} rad is outside motor {motor}'s enable window \
+                         [{lo:.3}, {hi:.3}]; enable will refuse this pose until it is moved \
+                         back inside"
                     );
                 }
             }

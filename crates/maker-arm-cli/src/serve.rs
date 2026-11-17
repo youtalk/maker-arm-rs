@@ -5,7 +5,7 @@
 
 use maker_arm::kinematics::ARM_DOF;
 use maker_arm::tracking::{Push, Row, TrackingController, TrackingShared, ROW};
-use maker_arm::{ArmConfig, FaultReason, LoopRt, RunningArm, Session, SimArm};
+use maker_arm::{ArmConfig, FaultReason, LoopRt, RunningArm, Session, SessionError, SimArm};
 use maker_arm_cli::files::{self, GripMap, Loaded, ServeOptions};
 use maker_arm_cli::wire::{self, ClientFrame, Mode, Op, Role, StateFrame, WireError};
 use maker_arm_transport::CanBackend;
@@ -115,6 +115,8 @@ fn fault_code(f: &FaultReason) -> u32 {
         FaultReason::BadCommand { .. } => 4,
         FaultReason::FaultReplyTimeout { .. } => 5,
         FaultReason::Warning { .. } => 6,
+        FaultReason::MotorRestarted { .. } => 7,
+        FaultReason::Transport { .. } => 8,
     }
 }
 
@@ -278,7 +280,21 @@ impl Daemon {
         let mut st = self.lock();
         let mut frame = self.state_frame(&st, seq);
         frame.mode = Mode::Released;
-        let failed = st.arm.take().and_then(|arm| arm.stop_and_disable().1.err());
+        let failed = st
+            .arm
+            .take()
+            .and_then(|arm| match arm.stop_and_disable().1 {
+                Ok(()) => None,
+                // Every motor is confirmed off. Say why the loop had stopped.
+                Err(SessionError::LoopStopped {
+                    error,
+                    release: None,
+                }) => {
+                    log(&format!("the control loop had stopped: {error}"));
+                    None
+                }
+                Err(e) => Some(e),
+            });
         if failed.is_some() {
             // Never claim a release that did not happen.
             frame.mode = Mode::Fault;
@@ -559,7 +575,7 @@ pub fn run(o: &ServeOptions, check: bool) -> Result<(), String> {
         return Err("interrupted before the motors were enabled".into());
     }
     if let Err(e) = session.enable() {
-        // Torque was off a moment ago; leave it off.
+        // Leave torque off on every motor, also on one that a dead daemon left on.
         let _ = session.disable();
         return Err(format!("enable {}: {e}", o.interface));
     }
@@ -601,7 +617,7 @@ pub fn run(o: &ServeOptions, check: bool) -> Result<(), String> {
         "SERVE_READY {{\"socket\": {}, \"digest\": \"{digest:016x}\"}}",
         serde_json::json!(socket.display().to_string())
     ));
-    let mut fault_logged = false;
+    let (mut fault_logged, mut later_logged, mut stop_logged) = (false, 0, false);
     loop {
         if SIGNALED.swap(false, Ordering::Relaxed) {
             let mut st = d.lock();
@@ -643,15 +659,24 @@ pub fn run(o: &ServeOptions, check: bool) -> Result<(), String> {
             .saturating_add(u32::try_from(clamped).unwrap_or(u32::MAX));
         if st.faulted() {
             st.mode = Mode::Fault;
-            if !fault_logged {
+            let (first, later) = st
+                .arm
+                .as_ref()
+                .and_then(RunningArm::snapshot)
+                .map_or((None, vec![]), |s| (s.fault, s.later_faults));
+            if let Some(f) = first.filter(|_| !fault_logged) {
                 fault_logged = true;
-                let why = st.arm.as_ref().and_then(|a| a.snapshot()?.fault);
-                log(&match why {
-                    Some(f) => format!("FAULT: {f}; holding the measured pose"),
-                    None => "FAULT: the control loop stopped; the motors keep their last \
-                             command"
-                        .into(),
-                });
+                log(&format!("FAULT: {f}; holding the measured pose"));
+            }
+            // Each later fault during the hold, once.
+            for f in later.iter().skip(later_logged) {
+                log(&format!("FAULT (later, still holding): {f}"));
+            }
+            later_logged = later_logged.max(later.len());
+            // Also after a transport hold: errors that last end the loop.
+            if !stop_logged && st.arm.as_ref().is_none_or(RunningArm::loop_finished) {
+                stop_logged = true;
+                log("FAULT: the control loop stopped; the motors keep their last command");
             }
         }
         if let Some(why) = st.exit {
@@ -694,6 +719,9 @@ mod tests {
         );
         let detail = String::new();
         assert_eq!(fault_code(&FaultReason::BadCommand { detail }), 5);
+        let detail = String::new();
+        assert_eq!(fault_code(&FaultReason::Transport { detail }), 9);
+        assert_eq!(fault_code(&FaultReason::MotorRestarted { motor_id: 2 }), 8);
     }
 
     #[test]

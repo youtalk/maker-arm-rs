@@ -20,6 +20,8 @@ use std::time::Duration;
 #[derive(Debug)]
 pub enum TransportError {
     Io(String),
+    /// The interface is gone (an unplugged adapter) or down. No frame can
+    /// pass until someone acts.
     Closed,
 }
 
@@ -27,7 +29,7 @@ impl std::fmt::Display for TransportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TransportError::Io(m) => write!(f, "transport I/O error: {m}"),
-            TransportError::Closed => write!(f, "transport closed"),
+            TransportError::Closed => write!(f, "the CAN interface is gone or down"),
         }
     }
 }

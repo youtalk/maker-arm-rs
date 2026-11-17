@@ -491,8 +491,8 @@ const STARTING: &str = "starting";
 /// Reported once the control thread has exited without being joined. The
 /// loop is NOT commanding the motors any more; if it exited on an error it
 /// did not disable them either, so torque may still be on and the motors
-/// keep their last command. `stop()` joins the thread and surfaces the
-/// error.
+/// keep their last command. `stop()` joins the thread, tries the disable
+/// and surfaces the error.
 const LOOP_STOPPED: &str = "loop_stopped";
 
 impl Arm {
@@ -789,8 +789,8 @@ impl Arm {
     /// * "loop_stopped" -- the thread has exited and has not been joined.
     ///   It is no longer commanding the motors, and if it exited on an
     ///   error it did not disable them either, so torque may still be on
-    ///   and the motors keep their last command. Call stop() to join it
-    ///   and surface the error.
+    ///   and the motors keep their last command. Call stop() to join it,
+    ///   try the disable and surface the error.
     ///
     /// This used to default to "enabled" whenever no snapshot was
     /// available, which reported a dead loop -- or an un-energized arm --

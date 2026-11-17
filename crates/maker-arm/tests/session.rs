@@ -207,8 +207,8 @@ fn a_failed_enable_disables_every_motor() {
     let mut s = Session::connect(Box::new(backend), c).expect("connect");
     cfg.lock().unwrap().after_control_to = Some((5, |sim| sim.set_muted(5, true)));
     match s.enable() {
-        Err(SessionError::Probe { motor_id: 5 }) => {}
-        other => panic!("expected Probe(5), got {other:?}"),
+        Err(SessionError::NotDisabled { motors, .. }) if motors == [5] => {}
+        other => panic!("expected motor 5 not disabled, got {other:?}"),
     }
     assert_eq!(s.state(), SessionState::Connected);
     let sim = s.backend_as_sim().unwrap();
@@ -247,8 +247,8 @@ fn a_failed_release_after_a_failed_enable_names_the_motor() {
     let mut s = Session::connect(Box::new(backend), c).expect("connect");
     cfg.lock().unwrap().after_control_to = Some((3, |sim| sim.inject_fault(3, 1 << 14)));
     match s.enable() {
-        Err(SessionError::Probe { motor_id: 6 }) => {}
-        other => panic!("expected Probe(6), got {other:?}"),
+        Err(SessionError::NotDisabled { motors, .. }) if motors == [6] => {}
+        other => panic!("expected motor 6 not disabled, got {other:?}"),
     }
     assert_eq!(s.state(), SessionState::Connected);
 }
@@ -458,8 +458,12 @@ fn a_transport_error_during_enable_still_disables_every_motor() {
     let (backend, cfg) = FlakyBackend::new(SimArm::new(&c));
     let mut s = Session::connect(Box::new(backend), c.clone()).expect("connect");
     cfg.lock().unwrap().fail_recv_after_n_enables = Some(c.joints.len() as u8);
+    // No reply confirms a disable, and the error keeps the cause.
     match s.enable() {
-        Err(SessionError::Transport(_)) => {}
+        Err(SessionError::NotDisabled {
+            motors,
+            cause: Some(c),
+        }) if motors == [1, 2, 3, 4, 5, 6, 7] && matches!(*c, SessionError::Transport(_)) => {}
         other => panic!("expected a transport error, got {other:?}"),
     }
     assert_eq!(s.state(), SessionState::Connected);
