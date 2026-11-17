@@ -20,6 +20,9 @@ pub struct MotorState {
     pub fault_reply_age: f64,
     /// The firmware answers parameter reads (found at connect).
     pub params: bool,
+    /// A power-up announcement came while the session was enabled: the
+    /// motor restarted with torque off.
+    pub restarted: bool,
 }
 
 impl MotorState {
@@ -36,6 +39,7 @@ impl MotorState {
             feedback_age: f64::INFINITY,
             fault_reply_age: f64::INFINITY,
             params: false,
+            restarted: false,
         }
     }
 }

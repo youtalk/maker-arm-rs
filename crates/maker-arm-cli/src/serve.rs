@@ -115,7 +115,7 @@ fn fault_code(f: &FaultReason) -> u32 {
         FaultReason::BadCommand { .. } => 4,
         FaultReason::FaultReplyTimeout { .. } => 5,
         FaultReason::Warning { .. } => 6,
-        // 7 is MotorRestarted's.
+        FaultReason::MotorRestarted { .. } => 7,
         FaultReason::Transport { .. } => 8,
     }
 }
@@ -719,6 +719,7 @@ mod tests {
         assert_eq!(fault_code(&FaultReason::BadCommand { detail }), 5);
         let detail = String::new();
         assert_eq!(fault_code(&FaultReason::Transport { detail }), 9);
+        assert_eq!(fault_code(&FaultReason::MotorRestarted { motor_id: 2 }), 8);
     }
 
     #[test]

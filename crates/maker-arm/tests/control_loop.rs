@@ -993,3 +993,34 @@ fn a_release_after_the_loop_stopped_still_disables() {
         assert_eq!(sim.enabled(m), m == 4, "motor {m}");
     }
 }
+
+#[test]
+fn a_motor_that_restarts_mid_session_holds_the_arm_and_stays_off() {
+    // Legacy firmware leaves mode and the fault bits at 0, and a restarted
+    // motor still answers every control frame. Only its power-up
+    // announcement tells.
+    let c = fast(ArmConfig::maker_arm_v1());
+    let mut sim = SimArm::new(&c);
+    sim.set_params_supported(false);
+    let mut s = Session::connect(Box::new(sim), c.clone()).expect("connect");
+    s.enable().expect("enable");
+    let mut hold = HoldController::from_config(&c);
+    let stop = AtomicBool::new(false);
+    s.run(&mut hold, &stop, Some(5)).expect("run");
+    // Motor 2 loses power for a moment: torque off, then it announces
+    // itself with a synthetic MCU id, never a real motor's.
+    let sim = s.backend_as_sim().unwrap();
+    let f = mit::encode_disable(2);
+    sim.send(f.id, &f.data).unwrap();
+    sim.queue_raw(2, [0xA5, 0x5A, 0, 0, 0, 0, 0, 2]);
+    s.run(&mut hold, &stop, Some(200)).expect("run 1 s");
+    assert_eq!(s.state(), SessionState::Fault);
+    assert_eq!(
+        s.fault(),
+        Some(&FaultReason::MotorRestarted { motor_id: 2 })
+    );
+    let sim = s.backend_as_sim().unwrap();
+    assert!(!sim.enabled(2));
+    assert_eq!(sim.enables(2), 1);
+    assert!([1, 3, 4, 5, 6, 7].iter().all(|&m| sim.enabled(m)));
+}

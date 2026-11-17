@@ -439,9 +439,15 @@ impl Session {
     }
 
     /// Routes one raw frame into the right motor slot. Anything that is
-    /// not an MIT reply (a power-up announcement, say) is ignored.
+    /// not an MIT reply is ignored, except a frame on a motor's own id in
+    /// an enabled session: that is the motor's power-up announcement, so
+    /// it restarted with torque off. Legacy firmware gives no other sign.
     pub(crate) fn dispatch(&mut self, id: u32, data: &[u8; 8]) {
         let Some(idx) = mit::reply_motor_id(id, data).and_then(|m| self.index_of(m)) else {
+            let enabled = matches!(self.state, SessionState::Enabled | SessionState::Fault);
+            if let Some(i) = u8::try_from(id).ok().and_then(|m| self.index_of(m)) {
+                self.slots[i].state.restarted |= enabled;
+            }
             return;
         };
         let j = &self.config.joints[idx];
@@ -565,6 +571,9 @@ impl Session {
         self.release_sent = None;
         self.failing_since = None;
         self.health = HealthMonitor::new(&self.config);
+        for slot in &mut self.slots {
+            slot.state.restarted = false;
+        }
         Ok(())
     }
 
@@ -853,22 +862,39 @@ mod tests {
     }
 
     #[test]
-    fn power_up_announcements_change_nothing() {
+    fn a_power_up_announcement_is_ignored_before_enable_and_holds_after() {
         let mut s = connected();
-        s.enable().expect("enable");
         let seen = |s: &Session| -> Vec<_> {
             s.slots
                 .iter()
                 .map(|m| (m.state, m.last_feedback, m.last_fault_reply))
                 .collect()
         };
-        let before = seen(&s);
         // A synthetic MCU id, never a real motor's.
-        s.backend_as_sim()
-            .unwrap()
-            .queue_raw(3, [0xA5, 0x5A, 0, 0, 0, 0, 0, 3]);
+        let announce = |s: &mut Session| {
+            s.backend_as_sim()
+                .unwrap()
+                .queue_raw(3, [0xA5, 0x5A, 0, 0, 0, 0, 0, 3])
+        };
+        // Before enable (connect, probe), it changes nothing.
+        let before = seen(&s);
+        announce(&mut s);
         s.drain().unwrap();
         assert_eq!(seen(&s), before);
+        // In an enabled session, motor 3 restarted with torque off: hold.
+        s.enable().expect("enable");
+        let position = s.positions()[2];
+        announce(&mut s);
+        let mut hold = HoldController::from_config(&s.config().clone());
+        s.tick(&mut hold).expect("tick");
+        assert_eq!(s.state(), SessionState::Fault);
+        assert_eq!(
+            s.fault(),
+            Some(&FaultReason::MotorRestarted { motor_id: 3 })
+        );
+        assert!((s.positions()[2] - position).abs() < 1e-3);
+        // No enable went out.
+        assert_eq!(s.backend_as_sim().unwrap().enables(3), 1);
     }
 
     #[test]
