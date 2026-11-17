@@ -16,7 +16,8 @@ pub struct RecordedFrame {
 }
 
 /// Parses one `candump -l` line: `(ts) iface ID#HEXDATA`. Returns None on
-/// anything that isn't a well-formed frame line.
+/// anything that isn't a well-formed standard-id frame line: the id must be
+/// 3 hex digits (an 8-digit extended id is skipped).
 ///
 /// Note the classic-CAN shape: a CAN FD capable adapter makes `candump -l`
 /// emit `ID##flags+data` (a doubled `#`), which this parser rejects. Use
@@ -33,6 +34,9 @@ pub fn parse_candump_line(line: &str) -> Option<RecordedFrame> {
     let interface = parts.next()?.to_string();
     let frame = parts.next()?;
     let (id_hex, data_hex) = frame.split_once('#')?;
+    if id_hex.len() != 3 {
+        return None;
+    }
     let id = u32::from_str_radix(id_hex, 16).ok()?;
     // Byte length alone doesn't guarantee char boundaries: a multi-byte UTF-8
     // character can make `data_hex.len()` even and <= 16 while still landing
@@ -165,35 +169,43 @@ mod tests {
     use crate::CanBackend;
     use std::time::Duration;
 
-    // candump -l format: "(ts) iface ID#HEXDATA" with 8-hex-digit extended ids.
+    // candump -l format: "(ts) iface ID#HEXDATA" with 3-hex-digit standard ids.
     const LOG: &str = "\
-(1755600000.000100) can0 0300FD01#0000000000000000
-(1755600000.000350) can0 028001FD#8000800080000159
-(1755600000.000500) can0 01800001#80008000051F3333
+(1755600000.000100) can0 301#0000000000000000
+(1755600000.000350) can0 0FD#8000800080000159
+(1755600000.000500) can0 007#80008000051F3333
 ";
 
     #[test]
     #[allow(clippy::excessive_precision)]
     fn parses_candump_lines() {
-        let f = parse_candump_line("(1755600000.000350) can0 028001FD#8000800080000159").unwrap();
+        let f = parse_candump_line("(1755600000.000350) can0 0FD#8000800080000159").unwrap();
         assert_eq!(f.timestamp, 1755600000.000350);
         assert_eq!(f.interface, "can0");
-        assert_eq!(f.id, 0x028001FD);
+        assert_eq!(f.id, 0xFD);
         assert_eq!(f.data, [0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x01, 0x59]);
         assert_eq!(f.dlc, 8);
         // short payloads are zero-padded but keep their true dlc
-        let s = parse_candump_line("(1.0) can0 0400FD02#01").unwrap();
+        let s = parse_candump_line("(1.0) can0 402#01").unwrap();
         assert_eq!(s.dlc, 1);
         assert_eq!(s.data[0], 0x01);
         assert_eq!(s.data[1], 0x00);
         // empty payload is a legitimate zero-length CAN frame (DLC 0)
-        let z = parse_candump_line("(1.0) can0 0300FD01#").unwrap();
+        let z = parse_candump_line("(1.0) can0 301#").unwrap();
         assert_eq!(z.dlc, 0);
         assert_eq!(z.data, [0u8; 8]);
-        assert_eq!(z.id, 0x0300FD01);
+        assert_eq!(z.id, 0x301);
         // garbage is None, not a panic
         assert!(parse_candump_line("not a frame").is_none());
         assert!(parse_candump_line("").is_none());
+    }
+
+    #[test]
+    fn replay_reads_three_digit_ids_and_skips_extended() {
+        let f = parse_candump_line("(1.0) can0 0FD#01BE907FD7FF00F0").unwrap();
+        assert_eq!(f.id, 0xFD);
+        assert_eq!(f.data, [0x01, 0xBE, 0x90, 0x7F, 0xD7, 0xFF, 0x00, 0xF0]);
+        assert!(parse_candump_line("(1.0) can0 00007FFE#0102030405060708").is_none());
     }
 
     #[test]
@@ -202,22 +214,22 @@ mod tests {
         // Multi-byte UTF-8 character as the whole payload: byte length is 4
         // (even, <= 16) but no char boundary at offset 2 -- this panics
         // without the is_ascii() guard.
-        assert!(parse_candump_line("(1.0) can0 0300FD01#\u{1f600}").is_none());
+        assert!(parse_candump_line("(1.0) can0 301#\u{1f600}").is_none());
         // Multi-byte character positioned so total byte length is still even
         // and <= 16, but the fixed 2-byte slice offsets land mid-character.
-        assert!(parse_candump_line("(1.0) can0 0300FD01#aa\u{1f600}").is_none());
+        assert!(parse_candump_line("(1.0) can0 301#aa\u{1f600}").is_none());
         // Odd-length hex payload.
-        assert!(parse_candump_line("(1.0) can0 0300FD01#010").is_none());
+        assert!(parse_candump_line("(1.0) can0 301#010").is_none());
         // Hex payload longer than 16 characters (more than 8 bytes).
-        assert!(parse_candump_line("(1.0) can0 0300FD01#0011223344556677889900").is_none());
+        assert!(parse_candump_line("(1.0) can0 301#0011223344556677889900").is_none());
         // Non-hex ASCII characters in the payload.
-        assert!(parse_candump_line("(1.0) can0 0300FD01#ZZ").is_none());
+        assert!(parse_candump_line("(1.0) can0 301#ZZ").is_none());
 
         // Earlier parsing guards: reject malformed timestamps, field structure.
         // No '#' separator at all.
-        assert!(parse_candump_line("(1.0) can0 0300FD01").is_none());
+        assert!(parse_candump_line("(1.0) can0 301").is_none());
         // Timestamp missing its parentheses.
-        assert!(parse_candump_line("1.0 can0 0300FD01#0102").is_none());
+        assert!(parse_candump_line("1.0 can0 301#0102").is_none());
         // Too few whitespace-separated fields.
         assert!(parse_candump_line("(1.0) can0").is_none());
     }
@@ -226,16 +238,16 @@ mod tests {
     // The doubled '#' leaves the payload starting with '#', so every line
     // fails to parse and the whole capture silently vanishes.
     const CAN_FD_LOG: &str = "\
-(1755600000.000100) can0 0300FD01##10000000000000000
-(1755600000.000350) can0 028001FD##18000800080000159
+(1755600000.000100) can0 301##10000000000000000
+(1755600000.000350) can0 0FD##18000800080000159
 ";
 
     #[test]
     fn from_log_reports_skipped_lines() {
         let text = "\
-(1755600000.000100) can0 0300FD01#0000000000000000
+(1755600000.000100) can0 301#0000000000000000
 
-(1755600000.000350) can0 028001FD##18000800080000159
+(1755600000.000350) can0 0FD##18000800080000159
 this is not a frame line
 ";
         let r = ReplayBackend::from_log(text);
@@ -248,7 +260,7 @@ this is not a frame line
             &[
                 SkippedLine {
                     number: 3,
-                    text: "(1755600000.000350) can0 028001FD##18000800080000159".to_string(),
+                    text: "(1755600000.000350) can0 0FD##18000800080000159".to_string(),
                 },
                 SkippedLine {
                     number: 4,
@@ -284,7 +296,7 @@ this is not a frame line
         assert!(ReplayBackend::from_log_strict(&padded).is_ok());
         assert_eq!(
             r.recv(Duration::from_millis(1)).unwrap(),
-            Some((0x0300FD01, [0u8; 8]))
+            Some((0x301, [0u8; 8]))
         );
         assert_eq!(r.remaining(), 2);
     }
@@ -293,10 +305,7 @@ this is not a frame line
     fn zero_timeout_recv_polls_without_waiting() {
         // Same contract as SocketCanBackend::recv: Duration::ZERO is a poll.
         let mut r = ReplayBackend::from_log(LOG);
-        assert_eq!(
-            r.recv(Duration::ZERO).unwrap(),
-            Some((0x0300FD01, [0u8; 8]))
-        );
+        assert_eq!(r.recv(Duration::ZERO).unwrap(), Some((0x301, [0u8; 8])));
         let mut empty = ReplayBackend::from_log("");
         assert_eq!(empty.recv(Duration::ZERO).unwrap(), None);
     }
@@ -306,14 +315,14 @@ this is not a frame line
         let mut r = ReplayBackend::from_log(LOG);
         assert_eq!(
             r.recv(Duration::from_millis(1)).unwrap(),
-            Some((0x0300FD01, [0u8; 8]))
+            Some((0x301, [0u8; 8]))
         );
         let (id, _) = r.recv(Duration::from_millis(1)).unwrap().unwrap();
-        assert_eq!(id, 0x028001FD);
-        r.send(0x0600FD03, &[1, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+        assert_eq!(id, 0xFD);
+        r.send(0x003, &[1, 0, 0, 0, 0, 0, 0, 0]).unwrap();
         assert_eq!(r.sent.len(), 1);
         let (id, _) = r.recv(Duration::from_millis(1)).unwrap().unwrap();
-        assert_eq!(id, 0x01800001);
+        assert_eq!(id, 0x7);
         assert_eq!(r.recv(Duration::from_millis(1)).unwrap(), None);
     }
 }

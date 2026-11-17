@@ -22,12 +22,11 @@ fn bus() -> MutexGuard<'static, ()> {
 
 #[test]
 #[ignore = "needs vcan0"]
-fn roundtrip_extended_frame_over_vcan() {
+fn standard_round_trip() {
     let _bus = bus();
     let mut tx = SocketCanBackend::open("vcan0").expect("open tx");
     let mut rx = SocketCanBackend::open("vcan0").expect("open rx");
-    // golden MIT frame from the protocol vectors
-    let id = 0x01800001;
+    let id = 0x007;
     let data = [0x80, 0x00, 0x80, 0x00, 0x05, 0x1F, 0x33, 0x33];
     tx.send(id, &data).expect("send");
     let got = rx
@@ -69,7 +68,7 @@ fn zero_timeout_recv_still_delivers_a_queued_frame() {
     let _bus = bus();
     let mut rx = SocketCanBackend::open("vcan0").expect("open rx");
     let mut tx = SocketCanBackend::open("vcan0").expect("open tx");
-    let id = 0x028001FD;
+    let id = 0x0FD;
     let data = [0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x01, 0x59];
     tx.send(id, &data).expect("send");
     // Give the loopback frame a moment to land in the rx socket's queue.
@@ -94,22 +93,21 @@ fn raw_send(frame: CanFrame) {
 fn remote_frames_are_not_delivered_as_motor_data() {
     let _bus = bus();
     let mut rx = SocketCanBackend::open("vcan0").expect("open rx");
-    // Extended-id RTR frame at the golden feedback id: an empty payload that
-    // would zero-pad into position -12.57 rad / velocity -33 rad/s /
-    // torque -14 Nm if it were accepted.
-    let id = ExtendedId::new(0x028001FD).unwrap();
+    // Standard-id RTR frame at the feedback id: an empty payload that would
+    // zero-pad into a full-scale-negative reading if it were accepted.
+    let id = StandardId::new(0x0FD).unwrap();
     raw_send(CanFrame::new_remote(id, 8).expect("build rtr"));
     assert_eq!(rx.recv(Duration::from_millis(200)).expect("recv"), None);
 }
 
 #[test]
 #[ignore = "needs vcan0"]
-fn standard_id_frames_are_not_delivered_as_motor_data() {
+fn extended_ids_not_delivered() {
     let _bus = bus();
     let mut rx = SocketCanBackend::open("vcan0").expect("open rx");
-    // Standard id 0x001 must not surface as extended id 0x00000001.
-    let sid = StandardId::new(0x001).unwrap();
-    raw_send(CanFrame::new(sid, &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]).unwrap());
+    // Extended id 0x00000001 must not surface as standard id 0x001.
+    let eid = ExtendedId::new(0x001).unwrap();
+    raw_send(CanFrame::new(eid, &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]).unwrap());
     assert_eq!(rx.recv(Duration::from_millis(200)).expect("recv"), None);
 }
 
@@ -120,13 +118,13 @@ fn standard_id_frames_are_not_delivered_as_motor_data() {
 fn a_good_frame_after_a_rejected_one_still_arrives() {
     let _bus = bus();
     let mut rx = SocketCanBackend::open("vcan0").expect("open rx");
-    raw_send(CanFrame::new_remote(ExtendedId::new(0x028001FD).unwrap(), 8).expect("build rtr"));
+    raw_send(CanFrame::new_remote(StandardId::new(0x0FD).unwrap(), 8).expect("build rtr"));
     raw_send(
-        CanFrame::new(StandardId::new(0x001).unwrap(), &[0xFF; 8]).expect("build standard frame"),
+        CanFrame::new(ExtendedId::new(0x001).unwrap(), &[0xFF; 8]).expect("build extended frame"),
     );
-    let id = 0x01800001;
+    let id: u32 = 0x007;
     let data = [0x80, 0x00, 0x80, 0x00, 0x05, 0x1F, 0x33, 0x33];
-    raw_send(CanFrame::new(ExtendedId::new(id).unwrap(), &data).expect("build data frame"));
+    raw_send(CanFrame::new(StandardId::new(id as u16).unwrap(), &data).expect("build data frame"));
     // recv may report the rejected frames as Ok(None) before the good one,
     // so keep reading until the deadline.
     let deadline = Instant::now() + Duration::from_secs(1);
