@@ -20,6 +20,8 @@ pub const KD_MIN: f64 = 0.0;
 pub const KD_MAX: f64 = 5.0; // protocol hard ceiling
 pub const HOST_CAN_ID: u8 = 0xFD;
 
+pub mod mit;
+
 /// Per-model u16 mapping ranges. The frame format is identical across
 /// models; only the ranges differ. Picking the wrong table shows up as
 /// torque/velocity scaled by the wrong factor.

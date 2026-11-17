@@ -21,6 +21,14 @@ The following files are derived from that project and have been modified:
       (branch main, 2026-08-20). Reorganized into Rust tests and extended
       with cases that are not present upstream.
 
+  crates/maker-arm-protocol/src/mit.rs
+      Ported from maker_arm/protocol.py at commit 0245316 (the MIT wire
+      protocol). Rewritten in Rust with different types and APIs.
+
+  crates/maker-arm-protocol/tests/mit_vectors.rs
+      Control and parameter frame vectors generated with the vendor SDK
+      at commit 0245316.
+
   bindings/maker-arm-py/tests/test_bindings.py
       Asserts the same golden values through the Python bindings.
 
