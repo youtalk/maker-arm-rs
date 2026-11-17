@@ -1,5 +1,6 @@
 use maker_arm::{ArmConfig, SimArm};
-use maker_arm_cli::{confirm_release, doctor, scan, zero_motor};
+use maker_arm_cli::files::GripMap;
+use maker_arm_cli::{confirm_release, doctor, scan, watch_sweep, zero_motor};
 use maker_arm_protocol::mit;
 use maker_arm_transport::{CanBackend, TransportError};
 use std::io::{Cursor, Write};
@@ -489,4 +490,55 @@ fn confirm_release_treats_write_errors_like_eof() {
         text.contains("Type RELEASE"),
         "prompt never made it through: {text}"
     );
+}
+
+/// The numbers of each `WATCH` line.
+fn watch_rows(out: &str) -> Vec<Vec<f64>> {
+    out.lines()
+        .map(|l| {
+            let mut w = l.split_whitespace();
+            assert_eq!(w.next(), Some("WATCH"), "{l}");
+            w.map(|x| x.parse().unwrap()).collect()
+        })
+        .collect()
+}
+
+#[test]
+fn watch_prints_count_lines_of_seven_values() {
+    let (code, out) = sim_cli(&["scan", "--watch", "--count", "2", "--hz", "50"], "");
+    assert_eq!(code, Some(0));
+    let rows = watch_rows(&out);
+    assert_eq!(rows.len(), 2);
+    for r in rows {
+        assert_eq!(r.len(), 8); // t then seven values
+        assert!(r.iter().all(|x| x.is_finite()), "{r:?}");
+    }
+}
+
+#[test]
+fn watch_applies_the_profile_direction() {
+    let c = ArmConfig::maker_arm_v1();
+    let mut flipped = c.clone();
+    flipped.joints[4].direction = -1.0;
+    // The same motors, read through the identity and through the flipped J5.
+    let mut sim = SimArm::new(&c);
+    let grip = GripMap::provisional();
+    let plain = watch_sweep(&mut sim, &c, &grip, &mut None).unwrap();
+    let flip = watch_sweep(&mut sim, &flipped, &grip, &mut None).unwrap();
+    assert!((flip[4] + plain[4]).abs() < 1e-9, "{flip:?} {plain:?}");
+    assert_eq!(flip[3], plain[3]);
+}
+
+#[test]
+fn watch_never_enables() {
+    let c = ArmConfig::maker_arm_v1();
+    let mut sim = SimArm::new(&c);
+    let mut wraps = None;
+    for _ in 0..3 {
+        let q = watch_sweep(&mut sim, &c, &GripMap::provisional(), &mut wraps).unwrap();
+        assert!(q.iter().all(|x| x.is_finite()));
+    }
+    for j in &c.joints {
+        assert_eq!(sim.enables(j.motor_id), 0);
+    }
 }
