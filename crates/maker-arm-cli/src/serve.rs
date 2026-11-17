@@ -575,7 +575,7 @@ pub fn run(o: &ServeOptions, check: bool) -> Result<(), String> {
         return Err("interrupted before the motors were enabled".into());
     }
     if let Err(e) = session.enable() {
-        // Torque was off a moment ago; leave it off.
+        // Leave torque off on every motor, also on one that a dead daemon left on.
         let _ = session.disable();
         return Err(format!("enable {}: {e}", o.interface));
     }
