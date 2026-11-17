@@ -95,12 +95,16 @@ impl std::fmt::Display for SessionError {
                 write!(f, "motor {motor_id} did not reply -- check bus/power")
             }
             SessionError::MotorFault { motor_id, word } => {
+                // A word of 0 means only the feedback fault flag was seen.
+                let text = match word {
+                    0 => "fault flag set".to_string(),
+                    _ => mit::fault_text(*word),
+                };
                 write!(
                     f,
-                    "motor {motor_id} reports a fault: {} (word {word:#010x}) -- fault kept. \
+                    "motor {motor_id} reports a fault: {text} (word {word:#010x}) -- fault kept. \
                      Fix the cause, then press and release the emergency stop, or run the \
-                     vendor `maker-arm scan --clear-faults`",
-                    mit::fault_text(*word)
+                     vendor `maker-arm scan --clear-faults`"
                 )
             }
             SessionError::RunMode { motor_id, value } => {
@@ -338,6 +342,13 @@ impl Session {
         if !self.ask(idx, mit::encode_clear_fault(motor_id), false, REPLY_TRIES)? {
             return Err(SessionError::Probe { motor_id });
         }
+        let st = self.slots[idx].state;
+        if st.fault_flag {
+            return Err(SessionError::MotorFault {
+                motor_id,
+                word: st.fault_word,
+            });
+        }
         Ok(())
     }
 
@@ -496,10 +507,10 @@ impl Session {
             }
         }
         if let Err(e) = self.arm_watchdog().and_then(|()| self.preload_and_enable()) {
-            // A motor may already be torque-on: release every motor. The
-            // enable error is the one to report.
-            let _ = self.disable_all();
-            return Err(e);
+            // A motor may already be torque-on: release every motor. A
+            // release error wins, because it names a motor that may still
+            // hold torque.
+            return Err(self.disable_all().err().unwrap_or(e));
         }
         self.state = SessionState::Enabled;
         // A freshly (re-)enabled session starts clean: any fault info that
@@ -564,6 +575,12 @@ impl Session {
                 return Err(SessionError::Probe { motor_id: m });
             }
             let st = self.slots[i].state;
+            if st.fault_flag {
+                return Err(SessionError::MotorFault {
+                    motor_id: m,
+                    word: st.fault_word,
+                });
+            }
             if st.params && st.mode != 2 {
                 return Err(SessionError::EnableMode {
                     motor_id: m,

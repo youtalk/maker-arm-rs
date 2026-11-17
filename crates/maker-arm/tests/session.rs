@@ -205,7 +205,7 @@ fn a_failed_enable_disables_every_motor() {
     let c = ArmConfig::maker_arm_v1();
     let (backend, cfg) = FlakyBackend::new(SimArm::new(&c));
     let mut s = Session::connect(Box::new(backend), c).expect("connect");
-    cfg.lock().unwrap().mute_after_control_to = Some(5);
+    cfg.lock().unwrap().after_control_to = Some((5, |sim| sim.set_muted(5, true)));
     match s.enable() {
         Err(SessionError::Probe { motor_id: 5 }) => {}
         other => panic!("expected Probe(5), got {other:?}"),
@@ -215,6 +215,42 @@ fn a_failed_enable_disables_every_motor() {
     // Motors 1 to 5 had torque on before motor 5 went quiet.
     assert!((1..=5).all(|m| sim.enables(m) == 1));
     assert!((1..=7).all(|m| !sim.enabled(m)));
+}
+
+#[test]
+fn enable_refuses_a_fault_flag_in_the_enable_reply() {
+    // The fault comes up between motor 3's preload and its enable, so only
+    // the enable reply carries it.
+    let c = ArmConfig::maker_arm_v1();
+    let (backend, cfg) = FlakyBackend::new(SimArm::new(&c));
+    let mut s = Session::connect(Box::new(backend), c).expect("connect");
+    cfg.lock().unwrap().after_control_to = Some((3, |sim| sim.inject_fault(3, 1 << 14)));
+    match s.enable() {
+        Err(SessionError::MotorFault { motor_id: 3, .. }) => {}
+        other => panic!("expected MotorFault(3), got {other:?}"),
+    }
+    assert_eq!(s.state(), SessionState::Connected);
+    let sim = s.backend_as_sim().unwrap();
+    assert!((1..=3).all(|m| sim.enables(m) == 1));
+    assert!((1..=7).all(|m| !sim.enabled(m)));
+}
+
+#[test]
+fn a_failed_release_after_a_failed_enable_names_the_motor() {
+    // Motor 3's enable fails, and then motor 6 never shows mode 0 to the
+    // checked disable. The caller must learn that motor 6 may still hold
+    // torque, so the release error wins over the enable error.
+    let c = ArmConfig::maker_arm_v1();
+    let mut sim = SimArm::new(&c);
+    sim.force_mode(6, Some(2));
+    let (backend, cfg) = FlakyBackend::new(sim);
+    let mut s = Session::connect(Box::new(backend), c).expect("connect");
+    cfg.lock().unwrap().after_control_to = Some((3, |sim| sim.inject_fault(3, 1 << 14)));
+    match s.enable() {
+        Err(SessionError::Probe { motor_id: 6 }) => {}
+        other => panic!("expected Probe(6), got {other:?}"),
+    }
+    assert_eq!(s.state(), SessionState::Connected);
 }
 
 #[test]
@@ -307,6 +343,8 @@ fn enable_requires_connected_state() {
 /// `Session`. Exists purely to exercise `Session`'s error-handling paths
 /// (best-effort estop, enable-vs-drain-failure state ordering); not a
 /// production type and not a new hook on `SimArm` itself.
+type SimHook = fn(&mut SimArm);
+
 #[derive(Default)]
 struct FlakyConfig {
     /// Every `send` addressed to this motor id fails.
@@ -317,8 +355,9 @@ struct FlakyConfig {
     /// have gone out.
     fail_recv_after_n_enables: Option<u8>,
     enables_seen: u8,
-    /// Mute this motor right after its first control frame reaches it.
-    mute_after_control_to: Option<u8>,
+    /// Runs once on the sim, right after the first control frame to this
+    /// motor reaches it.
+    after_control_to: Option<(u8, SimHook)>,
     /// Every frame that reached the sim, in order.
     sent: Vec<(u32, [u8; 8])>,
 }
@@ -361,8 +400,10 @@ impl CanBackend for FlakyBackend {
         cfg.sent.push((id, *data));
         self.inner.send(id, data)?;
         let command = data[..6] == [0xFF; 6];
-        if cfg.mute_after_control_to == Some(target) && id < 0x80 && !command {
-            self.inner.set_muted(target, true);
+        if id < 0x80 && !command {
+            if let Some((_, hook)) = cfg.after_control_to.take_if(|(m, _)| *m == target) {
+                hook(&mut self.inner);
+            }
         }
         Ok(())
     }
