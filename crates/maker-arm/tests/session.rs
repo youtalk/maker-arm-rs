@@ -1,5 +1,5 @@
 use maker_arm::{ArmConfig, Session, SessionError, SessionState, SimArm};
-use maker_arm_protocol::param_index;
+use maker_arm_protocol::{mit, param_index, ParamValue};
 use maker_arm_transport::{CanBackend, TransportError};
 use std::f64::consts::TAU;
 use std::sync::{Arc, Mutex};
@@ -26,7 +26,7 @@ fn connect_finds_all_seven_motors_torque_free() {
             mid(&c, i)
         );
     }
-    // probe-by-disable must not have enabled anything
+    // the probe must not have enabled anything
     let st = s.arm_state();
     for m in &st.motors {
         assert_eq!(m.mode, 0);
@@ -71,35 +71,164 @@ fn connect_rejects_unwrappable_position() {
 }
 
 #[test]
-fn enable_writes_verifies_and_enables() {
+fn connect_refuses_a_reported_fault() {
     let c = ArmConfig::maker_arm_v1();
-    let sim = SimArm::new(&c);
-    let mut s = Session::connect(Box::new(sim), c.clone()).expect("connect");
+    let mut sim = SimArm::new(&c);
+    sim.inject_fault(2, 1 << 2);
+    let (backend, cfg) = FlakyBackend::new(sim);
+    match Session::connect(Box::new(backend), c) {
+        Err(
+            e @ SessionError::MotorFault {
+                motor_id: 2,
+                word: 4,
+            },
+        ) => {
+            assert!(e.to_string().contains("undervoltage"), "not decoded: {e}");
+        }
+        other => panic!("expected MotorFault(2, 4), got {other:?}"),
+    }
+    // The clearing state read never went to the faulted motor.
+    let clear = mit::encode_clear_fault(2);
+    assert!(!cfg.lock().unwrap().sent.contains(&(clear.id, clear.data)));
+}
+
+#[test]
+fn connect_reads_run_mode_where_parameters_work() {
+    let c = ArmConfig::maker_arm_v1();
+    let s = Session::connect(Box::new(SimArm::new(&c)), c.clone()).expect("connect");
+    assert!(s.arm_state().motors.iter().all(|m| m.params));
+
+    let mut sim = SimArm::new(&c);
+    let w = mit::encode_write_param(4, param_index::RUN_MODE, ParamValue::U8(1));
+    sim.send(w.id, &w.data).unwrap();
+    match Session::connect(Box::new(sim), c) {
+        Err(SessionError::RunMode {
+            motor_id: 4,
+            value: 1,
+        }) => {}
+        other => panic!("expected RunMode(4, 1), got {other:?}"),
+    }
+}
+
+fn is_param_write(id: u32) -> bool {
+    id & 0x780 == mit::PARAM_WRITE_ID
+}
+
+#[test]
+fn legacy_firmware_connects_and_enables_without_parameters() {
+    let c = ArmConfig::maker_arm_v1();
+    let mut sim = SimArm::new(&c);
+    sim.set_params_supported(false);
+    let (backend, cfg) = FlakyBackend::new(sim);
+    let mut s = Session::connect(Box::new(backend), c.clone()).expect("connect");
     s.enable().expect("enable");
     assert_eq!(s.state(), SessionState::Enabled);
-    let sim = s.backend_as_sim().expect("sim backend");
+    assert!(s.arm_state().motors.iter().all(|m| !m.params));
+    assert!(!cfg.lock().unwrap().sent.iter().any(|f| is_param_write(f.0)));
+    let sim = s.backend_as_sim().unwrap();
     for j in &c.joints {
         assert!(sim.enabled(j.motor_id));
-        assert_eq!(sim.param_u8(j.motor_id, param_index::RUN_MODE), Some(0));
-        // 200 ms * 20 counts/ms = 4000 (CAN_TIMEOUT_PER_MS)
-        assert_eq!(
-            sim.param_u32(j.motor_id, param_index::CAN_TIMEOUT),
-            Some(4000)
-        );
     }
 }
 
 #[test]
-fn enable_fails_when_verify_gets_no_reply() {
+fn enable_never_writes_run_mode() {
     let c = ArmConfig::maker_arm_v1();
-    let sim = SimArm::new(&c);
+    let (backend, cfg) = FlakyBackend::new(SimArm::new(&c));
+    let mut s = Session::connect(Box::new(backend), c).expect("connect");
+    s.enable().expect("enable");
+    s.disable().expect("disable");
+    assert!(!cfg.lock().unwrap().sent.iter().any(|(id, d)| {
+        is_param_write(*id) && u16::from_le_bytes([d[0], d[1]]) == param_index::RUN_MODE
+    }));
+}
+
+#[test]
+fn the_watchdog_is_armed_on_the_gripper_only_and_restored() {
+    let c = ArmConfig::maker_arm_v1();
+    let mut sim = SimArm::new(&c);
+    // A non-zero original value, so the restore is visible.
+    let w = mit::encode_write_param(7, param_index::CAN_TIMEOUT, ParamValue::U32(4000));
+    sim.send(w.id, &w.data).unwrap();
     let mut s = Session::connect(Box::new(sim), c).expect("connect");
-    s.backend_as_sim().unwrap().set_muted(2, true);
+    s.enable().expect("enable");
+    let sim = s.backend_as_sim().unwrap();
+    // 500 ms * 20 counts/ms
+    assert_eq!(sim.param_u32(7, param_index::CAN_TIMEOUT), Some(10000));
+    for m in 1..=6 {
+        assert_eq!(sim.param_u32(m, param_index::CAN_TIMEOUT), Some(0));
+    }
+    s.disable().expect("disable");
+    let sim = s.backend_as_sim().unwrap();
+    assert_eq!(sim.param_u32(7, param_index::CAN_TIMEOUT), Some(4000));
+}
+
+#[test]
+fn enable_refuses_a_hot_gripper() {
+    let c = ArmConfig::maker_arm_v1();
+    let mut s = Session::connect(Box::new(SimArm::new(&c)), c).expect("connect");
+    s.backend_as_sim().unwrap().set_temperature(7, 45.0);
     match s.enable() {
-        Err(SessionError::EnableVerify { motor_id: 2, .. }) => {}
-        other => panic!("expected EnableVerify(2), got {other:?}"),
+        Err(SessionError::TooHot {
+            motor_id: 7,
+            celsius: 45.0,
+        }) => {}
+        other => panic!("expected TooHot(7, 45.0), got {other:?}"),
     }
     assert_eq!(s.state(), SessionState::Connected);
+    let sim = s.backend_as_sim().unwrap();
+    assert!((1..=7).all(|m| sim.enables(m) == 0));
+    // Joints are not held to the gripper's limit, and 44.9 degrees C is fine.
+    sim.set_temperature(1, 60.0);
+    sim.set_temperature(7, 44.9);
+    s.enable().expect("enable below 45 degrees C");
+}
+
+#[test]
+fn enable_preloads_a_zero_gain_frame_at_the_measured_pose() {
+    let c = ArmConfig::maker_arm_v1();
+    let mut s = Session::connect(Box::new(SimArm::new(&c)), c.clone()).expect("connect");
+    s.enable().expect("enable");
+    let sim = s.backend_as_sim().unwrap();
+    for j in &c.joints {
+        let p = j.model.params();
+        let (pos, vel, kp, kd, tau) = sim.preload(j.motor_id).expect("a preload");
+        assert!((pos - sim.position(j.motor_id)).abs() <= (p.p_max - p.p_min) / 65535.0);
+        assert!(vel.abs() <= (p.v_max - p.v_min) / 4095.0);
+        assert_eq!((kp, kd), (0.0, 0.0));
+        assert!(tau.abs() <= (p.t_max - p.t_min) / 4095.0);
+    }
+}
+
+#[test]
+fn a_failed_enable_disables_every_motor() {
+    let c = ArmConfig::maker_arm_v1();
+    let (backend, cfg) = FlakyBackend::new(SimArm::new(&c));
+    let mut s = Session::connect(Box::new(backend), c).expect("connect");
+    cfg.lock().unwrap().mute_after_control_to = Some(5);
+    match s.enable() {
+        Err(SessionError::Probe { motor_id: 5 }) => {}
+        other => panic!("expected Probe(5), got {other:?}"),
+    }
+    assert_eq!(s.state(), SessionState::Connected);
+    let sim = s.backend_as_sim().unwrap();
+    // Motors 1 to 5 had torque on before motor 5 went quiet.
+    assert!((1..=5).all(|m| sim.enables(m) == 1));
+    assert!((1..=7).all(|m| !sim.enabled(m)));
+}
+
+#[test]
+fn enable_refuses_a_silent_motor_before_any_enable() {
+    let c = ArmConfig::maker_arm_v1();
+    let mut s = Session::connect(Box::new(SimArm::new(&c)), c).expect("connect");
+    s.backend_as_sim().unwrap().set_muted(2, true);
+    match s.enable() {
+        Err(SessionError::Probe { motor_id: 2 }) => {}
+        other => panic!("expected Probe(2), got {other:?}"),
+    }
+    assert_eq!(s.state(), SessionState::Connected);
+    let sim = s.backend_as_sim().unwrap();
+    assert!((1..=7).all(|m| sim.enables(m) == 0));
 }
 
 #[test]
@@ -114,12 +243,49 @@ fn disable_estop_and_clear_faults_transitions() {
     for j in &c.joints {
         assert!(!sim.enabled(j.motor_id));
     }
-    // clear_faults sends disable(clear_fault=true)
-    s.backend_as_sim().unwrap().inject_fault(5, 0x21);
+    // A reported fault blocks enable until clear_faults clears it.
+    sim.inject_fault(5, 1 << 14);
+    match s.enable() {
+        Err(SessionError::MotorFault { motor_id: 5, .. }) => {}
+        other => panic!("expected MotorFault(5), got {other:?}"),
+    }
     s.clear_faults().expect("clear");
     assert_eq!(s.state(), SessionState::Connected);
-    let st = s.arm_state();
-    assert_eq!(st.motors[4].fault_bits, 0);
+    s.enable().expect("enable after clear_faults");
+}
+
+#[test]
+fn poll_fault_queries_the_oldest_motor_once_per_interval() {
+    let c = ArmConfig::maker_arm_v1();
+    let (backend, cfg) = FlakyBackend::new(SimArm::new(&c));
+    let mut s = Session::connect(Box::new(backend), c.clone()).expect("connect");
+    s.enable().expect("enable");
+    let queries = |cfg: &Mutex<FlakyConfig>| -> Vec<u32> {
+        let q: Vec<u32> = cfg
+            .lock()
+            .unwrap()
+            .sent
+            .iter()
+            .filter(|(_, d)| d[6..] == [0x00, 0xFB])
+            .map(|(id, _)| *id)
+            .collect();
+        q
+    };
+    cfg.lock().unwrap().sent.clear();
+    // Every motor answered a fault query during enable, less than an interval ago.
+    s.poll_fault().unwrap();
+    assert!(queries(&cfg).is_empty());
+    std::thread::sleep(Duration::from_secs_f64(c.fault_poll_interval));
+    for _ in 0..10 {
+        s.poll_fault().unwrap();
+    }
+    // Oldest first, one query per call, and each motor once.
+    assert_eq!(queries(&cfg), (1..=7).collect::<Vec<u32>>());
+    assert!(s
+        .arm_state()
+        .motors
+        .iter()
+        .all(|m| m.fault_reply_age < 0.25));
 }
 
 #[test]
@@ -147,11 +313,14 @@ struct FlakyConfig {
     fail_send_for: Option<u8>,
     /// Once true, every subsequent `recv` fails.
     fail_recv: bool,
-    /// When set, `fail_recv` flips to true once this many `COMM_ENABLE`
-    /// frames have gone out -- lets a test fail the *trailing drain* of
-    /// `enable()` without touching the enable frames themselves.
+    /// When set, `fail_recv` flips to true once this many enable frames
+    /// have gone out.
     fail_recv_after_n_enables: Option<u8>,
     enables_seen: u8,
+    /// Mute this motor right after its first control frame reaches it.
+    mute_after_control_to: Option<u8>,
+    /// Every frame that reached the sim, in order.
+    sent: Vec<(u32, [u8; 8])>,
 }
 
 struct FlakyBackend {
@@ -174,25 +343,28 @@ impl FlakyBackend {
 
 impl CanBackend for FlakyBackend {
     fn send(&mut self, id: u32, data: &[u8; 8]) -> Result<(), TransportError> {
-        let comm = ((id >> 24) & 0x1F) as u8;
-        let target = (id & 0xFF) as u8;
-        {
-            let mut cfg = self.cfg.lock().unwrap();
-            if cfg.fail_send_for == Some(target) {
-                return Err(TransportError::Io(format!(
-                    "injected send failure for motor {target}"
-                )));
-            }
-            if let Some(n) = cfg.fail_recv_after_n_enables {
-                if comm == maker_arm_protocol::COMM_ENABLE {
-                    cfg.enables_seen += 1;
-                    if cfg.enables_seen >= n {
-                        cfg.fail_recv = true;
-                    }
+        let target = (id & 0x7F) as u8;
+        let mut cfg = self.cfg.lock().unwrap();
+        if cfg.fail_send_for == Some(target) {
+            return Err(TransportError::Io(format!(
+                "injected send failure for motor {target}"
+            )));
+        }
+        if let Some(n) = cfg.fail_recv_after_n_enables {
+            if *data == mit::encode_enable(target).data {
+                cfg.enables_seen += 1;
+                if cfg.enables_seen >= n {
+                    cfg.fail_recv = true;
                 }
             }
         }
-        self.inner.send(id, data)
+        cfg.sent.push((id, *data));
+        self.inner.send(id, data)?;
+        let command = data[..6] == [0xFF; 6];
+        if cfg.mute_after_control_to == Some(target) && id < 0x80 && !command {
+            self.inner.set_muted(target, true);
+        }
+        Ok(())
     }
 
     fn recv(&mut self, timeout: Duration) -> Result<Option<(u32, [u8; 8])>, TransportError> {
@@ -241,22 +413,23 @@ fn estop_send_failure_still_disables_every_reachable_motor() {
 }
 
 #[test]
-fn enable_reports_enabled_even_if_the_trailing_drain_fails() {
-    // Critical fix 2: state must reflect physical reality. All seven enable
-    // frames go out successfully (motors are physically torque-on) and only
-    // the trailing drain() fails -- state must be Enabled, not Connected.
+fn a_transport_error_during_enable_still_disables_every_motor() {
+    // The bus fails while enable waits for the last motor's reply: every
+    // enable frame went out, so every motor must get its disable frame,
+    // and the state must say Connected.
     let c = ArmConfig::maker_arm_v1();
     let (backend, cfg) = FlakyBackend::new(SimArm::new(&c));
     let mut s = Session::connect(Box::new(backend), c.clone()).expect("connect");
     cfg.lock().unwrap().fail_recv_after_n_enables = Some(c.joints.len() as u8);
     match s.enable() {
         Err(SessionError::Transport(_)) => {}
-        other => panic!("expected a transport error from the trailing drain, got {other:?}"),
+        other => panic!("expected a transport error, got {other:?}"),
     }
-    assert_eq!(s.state(), SessionState::Enabled);
+    assert_eq!(s.state(), SessionState::Connected);
     let sim = s.backend_as_sim().unwrap();
     for j in &c.joints {
-        assert!(sim.enabled(j.motor_id));
+        assert_eq!(sim.enables(j.motor_id), 1);
+        assert!(!sim.enabled(j.motor_id));
     }
 }
 

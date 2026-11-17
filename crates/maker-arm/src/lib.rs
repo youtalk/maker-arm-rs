@@ -18,7 +18,7 @@ pub mod state;
 pub mod tracking;
 
 pub use clamp::{clamp_command, ClampError};
-pub use config::{ArmConfig, JointConfig, MotorModel};
+pub use config::{ArmConfig, GripperRules, JointConfig, MotorModel};
 pub use control_loop::{
     HoldHandle, LoopRt, RingWriter, RtError, RunningArm, Snapshot, StartError, TickOutcome,
     TickRecord, TickRing, RING_TICKS,

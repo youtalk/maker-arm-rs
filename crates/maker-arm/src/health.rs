@@ -15,7 +15,7 @@ pub enum FaultReason {
     },
     MotorFault {
         motor_id: u8,
-        bits: u8,
+        word: u32,
     },
     ModeNotMotor {
         motor_id: u8,
@@ -41,8 +41,8 @@ impl std::fmt::Display for FaultReason {
                     "motor {motor_id} feedback timeout {age:.3}s -- check bus/power"
                 )
             }
-            FaultReason::MotorFault { motor_id, bits } => {
-                write!(f, "motor {motor_id} fault bits {bits:#04x}")
+            FaultReason::MotorFault { motor_id, word } => {
+                write!(f, "motor {motor_id} fault word {word:#010x}")
             }
             FaultReason::ModeNotMotor { motor_id, ticks } => {
                 write!(f, "motor {motor_id} not in Motor mode for {ticks} ticks")
@@ -74,10 +74,10 @@ impl HealthMonitor {
                     age: m.feedback_age,
                 });
             }
-            if m.fault_bits != 0 {
+            if m.fault_flag || m.fault_word != 0 {
                 return Some(FaultReason::MotorFault {
                     motor_id: j.motor_id,
-                    bits: m.fault_bits,
+                    word: m.fault_word,
                 });
             }
             if m.temperature >= config.temp_hold_c {
@@ -139,7 +139,7 @@ mod tests {
         let c = ArmConfig::maker_arm_v1();
         let mut h = HealthMonitor::new(&c);
         let mut s = healthy(&c);
-        s.motors[3].feedback_age = 0.25; // > 0.2 s timeout
+        s.motors[3].feedback_age = 0.26; // > 0.25 s timeout
         match h.check(&s, &c) {
             Some(FaultReason::FeedbackTimeout { motor_id: 4, .. }) => {}
             other => panic!("expected FeedbackTimeout(4), got {other:?}"),
@@ -147,16 +147,25 @@ mod tests {
     }
 
     #[test]
-    fn fault_bits_fault_immediately() {
+    fn fault_word_or_flag_faults_immediately() {
         let c = ArmConfig::maker_arm_v1();
         let mut h = HealthMonitor::new(&c);
         let mut s = healthy(&c);
-        s.motors[4].fault_bits = 0x21;
+        s.motors[4].fault_word = 1 << 14;
         assert_eq!(
             h.check(&s, &c),
             Some(FaultReason::MotorFault {
                 motor_id: 5,
-                bits: 0x21
+                word: 1 << 14
+            })
+        );
+        let mut s = healthy(&c);
+        s.motors[2].fault_flag = true;
+        assert_eq!(
+            h.check(&s, &c),
+            Some(FaultReason::MotorFault {
+                motor_id: 3,
+                word: 0
             })
         );
     }

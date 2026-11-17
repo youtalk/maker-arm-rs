@@ -154,9 +154,9 @@ fn nan_from_a_controller_becomes_a_holding_fault() {
 }
 
 #[test]
-fn motor_fault_bits_trigger_hold_and_ignore_the_controller() {
-    // `Session` only learns about a motor's fault bits when a feedback
-    // frame carrying them is dispatched. `inject_fault` mutates the sim
+fn motor_fault_flag_triggers_hold_and_ignores_the_controller() {
+    // `Session` only learns about a motor's fault flag when a feedback
+    // frame carrying it is dispatched. `inject_fault` mutates the sim
     // directly with no frame, so detection lands one tick after it (the
     // reply to THIS tick's own MIT send, drained at the end of the tick,
     // per Task 5's/Task 7's convention) -- the same one-control-period
@@ -175,13 +175,10 @@ fn motor_fault_bits_trigger_hold_and_ignore_the_controller() {
     assert!(out1.fault.is_none());
     assert_eq!(s.state(), SessionState::Enabled);
     let out2 = s.tick(&mut away).expect("tick 2: fault now visible");
-    assert_eq!(
+    assert!(matches!(
         out2.fault,
-        Some(FaultReason::MotorFault {
-            motor_id: 5,
-            bits: 0x21
-        })
-    );
+        Some(FaultReason::MotorFault { motor_id: 5, .. })
+    ));
     assert_eq!(s.state(), SessionState::Fault);
     let held = s.positions();
     for _ in 0..5 {
@@ -207,13 +204,10 @@ fn hold_on_fault_false_disables_outright() {
     let out1 = s.tick(&mut hold).expect("tick 1: fault not visible yet");
     assert!(out1.fault.is_none());
     let out2 = s.tick(&mut hold).expect("tick 2: fault now visible");
-    assert_eq!(
+    assert!(matches!(
         out2.fault,
-        Some(FaultReason::MotorFault {
-            motor_id: 2,
-            bits: 0x01
-        })
-    );
+        Some(FaultReason::MotorFault { motor_id: 2, .. })
+    ));
     assert_eq!(s.state(), SessionState::Connected);
     let sim = s.backend_as_sim().unwrap();
     for id in 1..=7u8 {
@@ -231,7 +225,9 @@ fn stale_feedback_faults() {
     // feedback_timeout comfortably larger than one nominal tick period,
     // so ONLY the muted motor -- not all seven -- crosses it.
     let mut c = fast(ArmConfig::maker_arm_v1());
-    c.feedback_timeout = 0.02; // 4x the nominal 5 ms tick period
+    // Twice the ~70 ms that enable's 10 ms spacing puts between motor 1's
+    // last reply and the first tick, and 30x the nominal 5 ms tick period.
+    c.feedback_timeout = 0.15;
     let mut s = enabled_session(&c);
     let mut hold = HoldController::from_config(&c);
     let stop = AtomicBool::new(false);
@@ -242,7 +238,7 @@ fn stale_feedback_faults() {
     // Drive enough further paced ticks for motor 4's un-refreshed age to
     // cross feedback_timeout while the other six, refreshed every tick by
     // their own MIT round trip, stay comfortably under it.
-    s.run(&mut hold, &stop, Some(15)).expect("run to fault");
+    s.run(&mut hold, &stop, Some(60)).expect("run to fault");
     assert!(matches!(
         s.fault(),
         Some(FaultReason::FeedbackTimeout { motor_id: 4, .. })
@@ -398,16 +394,13 @@ fn reenabling_without_clear_faults_still_resets_the_stale_fault() {
     let mut hold = HoldController::from_config(&c);
     s.tick(&mut hold).expect("tick 1: fault not visible yet");
     s.tick(&mut hold).expect("tick 2: fault now visible");
-    assert_eq!(
+    assert!(matches!(
         s.fault().cloned(),
-        Some(FaultReason::MotorFault {
-            motor_id: 6,
-            bits: 0x02
-        })
-    );
+        Some(FaultReason::MotorFault { motor_id: 6, .. })
+    ));
     assert_eq!(s.state(), SessionState::Connected);
 
-    // Clear the sim-side fault bits so what's under test here is
+    // Clear the sim-side fault so what's under test here is
     // enable()'s OWN reset, not a still-genuinely-faulted motor 6
     // re-tripping the health check immediately after re-enable.
     s.backend_as_sim().unwrap().inject_fault(6, 0x00);
@@ -428,13 +421,10 @@ fn reenabling_without_clear_faults_still_resets_the_stale_fault() {
     let out1 = s.tick(&mut hold2).expect("tick 1 after re-enable");
     assert!(out1.fault.is_none());
     let out2 = s.tick(&mut hold2).expect("tick 2 after re-enable");
-    assert_eq!(
+    assert!(matches!(
         out2.fault,
-        Some(FaultReason::MotorFault {
-            motor_id: 1,
-            bits: 0x04
-        })
-    );
+        Some(FaultReason::MotorFault { motor_id: 1, .. })
+    ));
 }
 
 #[test]

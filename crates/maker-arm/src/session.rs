@@ -1,8 +1,12 @@
-//! Arm session: state machine and bus I/O, mirroring the official SDK's
-//! arm.py semantics (verified upstream @ main, 2026-08-20): probe by
-//! disable frame, 2π wrap correction at connect, RUN_MODE/CAN_TIMEOUT
-//! write-and-verify at enable, positions checked against the grace window
-//! before torque is ever enabled.
+//! Arm session: state machine and bus I/O over the RobStride MIT protocol,
+//! following the vendor SDK's arm.py (maker-arm-sdk 0245316, spec 6.2).
+//! Connect sends each motor a non-clearing fault query and reads its state
+//! only after a clean answer, infers parameter access from a RUN_MODE read,
+//! and applies the 2π wrap correction once. Enable refuses a reported fault,
+//! a pose outside the grace window and a hot gripper, arms the gripper
+//! watchdog where parameters work, then preloads each motor with a
+//! zero-gain frame before it enables it. Disable is checked per motor, then
+//! the gripper watchdog is restored.
 //!
 //! One backend, one socket: commands and replies share a single
 //! `CanBackend`, which also resolves the SocketCAN loopback hazard from the
@@ -15,7 +19,7 @@ use crate::controller::HoldController;
 use crate::health::{FaultReason, HealthMonitor};
 use crate::sim::SimArm;
 use crate::state::{ArmState, MotorState};
-use maker_arm_protocol as p;
+use maker_arm_protocol::{self as p, mit};
 use maker_arm_transport::{CanBackend, TransportError};
 use std::f64::consts::TAU;
 use std::time::{Duration, Instant};
@@ -31,8 +35,29 @@ pub enum SessionState {
 pub enum SessionError {
     Transport(TransportError),
     Clamp(ClampError),
+    /// A motor did not reply in time: to the probe, the preload, the enable
+    /// or the checked disable.
     Probe {
         motor_id: u8,
+    },
+    /// The motor reports a fault word. The fault is kept, never cleared.
+    MotorFault {
+        motor_id: u8,
+        word: u32,
+    },
+    RunMode {
+        motor_id: u8,
+        value: u8,
+    },
+    /// The gripper is at or above its enable temperature.
+    TooHot {
+        motor_id: u8,
+        celsius: f64,
+    },
+    /// The enable reply shows a mode other than 2 (run).
+    EnableMode {
+        motor_id: u8,
+        mode: u8,
     },
     EnableVerify {
         motor_id: u8,
@@ -67,9 +92,33 @@ impl std::fmt::Display for SessionError {
             SessionError::Transport(e) => write!(f, "transport: {e}"),
             SessionError::Clamp(e) => write!(f, "clamp: {e}"),
             SessionError::Probe { motor_id } => {
+                write!(f, "motor {motor_id} did not reply -- check bus/power")
+            }
+            SessionError::MotorFault { motor_id, word } => {
                 write!(
                     f,
-                    "motor {motor_id} did not answer the probe -- check bus/power"
+                    "motor {motor_id} reports a fault: {} (word {word:#010x}) -- fault kept. \
+                     Fix the cause, then press and release the emergency stop, or run the \
+                     vendor `maker-arm scan --clear-faults`",
+                    mit::fault_text(*word)
+                )
+            }
+            SessionError::RunMode { motor_id, value } => {
+                write!(
+                    f,
+                    "motor {motor_id} RUN_MODE is {value}, not 0 (MIT control)"
+                )
+            }
+            SessionError::TooHot { motor_id, celsius } => {
+                write!(
+                    f,
+                    "motor {motor_id} is {celsius:.1} degC, too hot to enable"
+                )
+            }
+            SessionError::EnableMode { motor_id, mode } => {
+                write!(
+                    f,
+                    "motor {motor_id} enable rejected: mode {mode}, not 2 (run)"
                 )
             }
             SessionError::EnableVerify { motor_id, index } => {
@@ -133,6 +182,7 @@ struct MotorSlot {
     /// 2π correction added to the raw motor position (0, +2π, or -2π).
     wrap: f64,
     last_feedback: Option<Instant>,
+    last_fault_reply: Option<Instant>,
 }
 
 pub struct Session {
@@ -145,6 +195,8 @@ pub struct Session {
     pub(crate) health: HealthMonitor,
     pub(crate) fault: Option<FaultReason>,
     pub(crate) fault_hold: Option<HoldController>,
+    /// The gripper's CAN_TIMEOUT from before enable, kept for the restore.
+    watchdog_restore: Option<u32>,
 }
 
 impl std::fmt::Debug for Session {
@@ -156,10 +208,15 @@ impl std::fmt::Debug for Session {
     }
 }
 
-const PROBE_TIMEOUT: Duration = Duration::from_millis(50);
+// The vendor's timing (arm.py and motor.py).
+const REPLY_TIMEOUT: Duration = Duration::from_millis(50);
+const REPLY_TRIES: u32 = 3;
+const PARAM_TIMEOUT: Duration = Duration::from_millis(120);
+const PARAM_TRIES: u32 = 2;
+/// Between a parameter write and its read-back.
 const PARAM_SPACING: Duration = Duration::from_millis(5);
-const VERIFY_RETRY: Duration = Duration::from_millis(20);
-const VERIFY_TRIES: u32 = 5;
+/// Between two motors' enables, and between two clearing frames.
+const MOTOR_SPACING: Duration = Duration::from_millis(10);
 
 impl Session {
     pub fn connect(
@@ -174,6 +231,7 @@ impl Session {
                 raw_position: 0.0,
                 wrap: 0.0,
                 last_feedback: None,
+                last_fault_reply: None,
             })
             .collect();
         let health = HealthMonitor::new(&config);
@@ -187,10 +245,30 @@ impl Session {
             health,
             fault: None,
             fault_hold: None,
+            watchdog_restore: None,
         };
         let motor_ids: Vec<u8> = s.config.joints.iter().map(|j| j.motor_id).collect();
         for m in &motor_ids {
             s.probe(*m)?;
+        }
+        // Parameter access, inferred per motor from a RUN_MODE read.
+        for (i, &m) in motor_ids.iter().enumerate() {
+            let mut reply = None;
+            for _ in 0..PARAM_TRIES {
+                reply = s.read_param(m, p::param_index::RUN_MODE)?;
+                if reply.is_some() {
+                    break;
+                }
+            }
+            if let Some(raw) = reply {
+                s.slots[i].state.params = true;
+                if raw[0] != 0 {
+                    return Err(SessionError::RunMode {
+                        motor_id: m,
+                        value: raw[0],
+                    });
+                }
+            }
         }
         // 2π wrap correction, once, at connect (upstream convention).
         for i in 0..s.config.joints.len() {
@@ -245,25 +323,60 @@ impl Session {
         Ok(s)
     }
 
-    /// Read-only probe: a disable frame triggers one feedback frame (the
-    /// RobStride probing convention); harmless on a torque-free motor.
+    /// The vendor's order: a non-clearing fault query first, then the
+    /// clearing state read only after a clean answer, so a reported fault
+    /// is never erased.
     fn probe(&mut self, motor_id: u8) -> Result<(), SessionError> {
-        let f = p::encode_disable(motor_id, false, self.config.host_id);
-        self.backend.send(f.id, &f.data)?;
         let idx = self.index_of(motor_id).expect("known motor");
-        let before = self.slots[idx].last_feedback;
-        let deadline = Instant::now() + PROBE_TIMEOUT;
-        loop {
-            if let Some(frame) = self.backend.recv(Duration::from_millis(2))? {
-                self.dispatch(frame.0, &frame.1);
+        if !self.ask(idx, mit::encode_fault_query(motor_id), true, REPLY_TRIES)? {
+            return Err(SessionError::Probe { motor_id });
+        }
+        let word = self.slots[idx].state.fault_word;
+        if word != 0 {
+            return Err(SessionError::MotorFault { motor_id, word });
+        }
+        if !self.ask(idx, mit::encode_clear_fault(motor_id), false, REPLY_TRIES)? {
+            return Err(SessionError::Probe { motor_id });
+        }
+        Ok(())
+    }
+
+    /// Sends `f` up to `tries` times and waits `REPLY_TIMEOUT` each time
+    /// for a new reply in motor slot `idx`: a fault status when `fault`,
+    /// else feedback. False when none came.
+    fn ask(
+        &mut self,
+        idx: usize,
+        f: p::Frame,
+        fault: bool,
+        tries: u32,
+    ) -> Result<bool, SessionError> {
+        let last = |s: &MotorSlot| {
+            if fault {
+                s.last_fault_reply
+            } else {
+                s.last_feedback
             }
-            if self.slots[idx].last_feedback != before && self.slots[idx].last_feedback.is_some() {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(SessionError::Probe { motor_id });
+        };
+        for _ in 0..tries {
+            self.drain()?;
+            let before = last(&self.slots[idx]);
+            self.backend.send(f.id, &f.data)?;
+            let deadline = Instant::now() + REPLY_TIMEOUT;
+            loop {
+                if let Some((id, data)) = self.backend.recv(Duration::from_millis(2))? {
+                    self.dispatch(id, &data);
+                }
+                let now = last(&self.slots[idx]);
+                if now.is_some() && now != before {
+                    return Ok(true);
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
             }
         }
+        Ok(false)
     }
 
     fn index_of(&self, motor_id: u8) -> Option<usize> {
@@ -273,31 +386,37 @@ impl Session {
             .position(|j| j.motor_id == motor_id)
     }
 
-    /// Routes one raw frame into the right motor slot.
+    /// Routes one raw frame into the right motor slot. Anything that is
+    /// not an MIT reply (a power-up announcement, say) is ignored.
     pub(crate) fn dispatch(&mut self, id: u32, data: &[u8; 8]) {
-        let motor_id = ((id >> 8) & 0xFF) as u8;
-        let Some(idx) = self.index_of(motor_id) else {
+        let Some(idx) = mit::reply_motor_id(id, data).and_then(|m| self.index_of(m)) else {
             return;
         };
         let j = &self.config.joints[idx];
-        let Some(parsed) = p::parse_frame(id, data, j.model.params()) else {
-            return;
-        };
-        if let p::ParsedFrame::Feedback(fb) = parsed {
-            let slot = &mut self.slots[idx];
-            slot.raw_position = fb.position;
-            slot.state = MotorState {
-                position: j.to_joint(fb.position + slot.wrap),
-                velocity: j.direction * fb.velocity,
-                torque: j.direction * fb.torque,
-                temperature: fb.temperature,
-                mode: fb.mode,
-                fault_bits: fb.fault_bits,
-                feedback_age: 0.0,
-            };
-            slot.last_feedback = Some(Instant::now());
+        let slot = &mut self.slots[idx];
+        match mit::parse_frame(id, data, j.model.params()) {
+            Some(mit::Parsed::Feedback(fb)) => {
+                slot.raw_position = fb.position;
+                slot.state = MotorState {
+                    position: j.to_joint(fb.position + slot.wrap),
+                    velocity: j.direction * fb.velocity,
+                    torque: j.direction * fb.torque,
+                    temperature: fb.temperature,
+                    mode: fb.mode,
+                    fault_flag: fb.fault,
+                    warning_flag: fb.warning,
+                    feedback_age: 0.0,
+                    ..slot.state
+                };
+                slot.last_feedback = Some(Instant::now());
+            }
+            Some(mit::Parsed::Fault(fs)) => {
+                slot.state.fault_word = fs.word;
+                slot.last_fault_reply = Some(Instant::now());
+            }
+            // Parameter replies are consumed synchronously by read_param.
+            Some(mit::Parsed::Param(_)) | None => {}
         }
-        // Param replies are consumed synchronously by read_param_raw.
     }
 
     /// Non-blocking drain of everything queued on the bus.
@@ -308,25 +427,38 @@ impl Session {
         Ok(())
     }
 
-    /// Sends a param read and waits for the matching reply.
-    fn read_param_raw(&mut self, motor_id: u8, index: u16) -> Option<[u8; 4]> {
-        let f = p::encode_read_param(motor_id, index, self.config.host_id);
-        self.backend.send(f.id, &f.data).ok()?;
-        let deadline = Instant::now() + VERIFY_RETRY;
-        loop {
-            if let Some((id, data)) = self.backend.recv(Duration::from_millis(2)).ok()? {
-                if let Some(p::ParsedFrame::ParamReply(r)) = p::parse_frame(id, &data, &p::RS00) {
-                    if r.motor_id == motor_id && r.index == index {
-                        return Some(r.raw);
+    /// Sends a parameter read and waits for its reply; `None` when none
+    /// comes within `PARAM_TIMEOUT`.
+    fn read_param(&mut self, motor_id: u8, index: u16) -> Result<Option<[u8; 4]>, SessionError> {
+        let f = mit::encode_read_param(motor_id, index);
+        self.backend.send(f.id, &f.data)?;
+        let deadline = Instant::now() + PARAM_TIMEOUT;
+        while Instant::now() < deadline {
+            if let Some((id, data)) = self.backend.recv(Duration::from_millis(2))? {
+                match mit::parse_frame(id, &data, &p::RS00) {
+                    Some(mit::Parsed::Param(r))
+                        if !r.write && r.motor_id == motor_id && r.index == index =>
+                    {
+                        return Ok(Some(r.raw));
                     }
-                } else {
-                    self.dispatch(id, &data);
+                    _ => self.dispatch(id, &data),
                 }
             }
-            if Instant::now() >= deadline {
-                return None;
-            }
         }
+        Ok(None)
+    }
+
+    /// Writes a u32 parameter and reads it back.
+    fn write_param(
+        &mut self,
+        motor_id: u8,
+        index: u16,
+        value: u32,
+    ) -> Result<Option<u32>, SessionError> {
+        let f = mit::encode_write_param(motor_id, index, p::ParamValue::U32(value));
+        self.backend.send(f.id, &f.data)?;
+        std::thread::sleep(PARAM_SPACING);
+        Ok(self.read_param(motor_id, index)?.map(u32::from_le_bytes))
     }
 
     pub fn enable(&mut self) -> Result<(), SessionError> {
@@ -335,145 +467,247 @@ impl Session {
                 expected: "Connected",
             });
         }
-        let host = self.config.host_id;
-        let timeout_counts = self.config.motor_can_timeout_ms * p::CAN_TIMEOUT_PER_MS;
+        // Gates: fresh fault status and position from every motor (cached
+        // values never authorize torque), then limits and the gripper's
+        // temperature.
         let motor_ids: Vec<u8> = self.config.joints.iter().map(|j| j.motor_id).collect();
-        // Write RUN_MODE=0 (MIT) and the motor-side watchdog, spaced 5 ms.
-        for &m in &motor_ids {
-            let f = p::encode_write_param(m, p::param_index::RUN_MODE, p::ParamValue::U8(0), host);
-            self.backend.send(f.id, &f.data)?;
-            std::thread::sleep(PARAM_SPACING);
-            let f = p::encode_write_param(
-                m,
-                p::param_index::CAN_TIMEOUT,
-                p::ParamValue::U32(timeout_counts),
-                host,
-            );
-            self.backend.send(f.id, &f.data)?;
-            std::thread::sleep(PARAM_SPACING);
-        }
-        // Read back and verify both params, up to 5 tries each.
-        for &m in &motor_ids {
-            for (index, want) in [
-                (p::param_index::RUN_MODE, vec![0u8]),
-                (
-                    p::param_index::CAN_TIMEOUT,
-                    timeout_counts.to_le_bytes().to_vec(),
-                ),
-            ] {
-                let mut ok = false;
-                for _ in 0..VERIFY_TRIES {
-                    if let Some(raw) = self.read_param_raw(m, index) {
-                        if raw[..want.len()] == want[..] {
-                            ok = true;
-                            break;
-                        }
-                    }
-                    std::thread::sleep(VERIFY_RETRY);
-                }
-                if !ok {
-                    return Err(SessionError::EnableVerify { motor_id: m, index });
-                }
-            }
-        }
-        // Fresh feedback, then the position sanity gate, then torque on.
         for &m in &motor_ids {
             self.probe(m)?;
         }
         for (i, j) in self.config.joints.iter().enumerate() {
-            let q = self.slots[i].state.position;
+            let st = &self.slots[i].state;
             let (lo, hi) = (
                 j.q_lo - self.config.enable_limit_grace,
                 j.q_hi + self.config.enable_limit_grace,
             );
-            if !q.is_finite() || q < lo || q > hi {
+            if !st.position.is_finite() || st.position < lo || st.position > hi {
                 return Err(SessionError::PositionOutOfRange {
                     motor_id: j.motor_id,
-                    joint_pos: q,
+                    joint_pos: st.position,
                 });
             }
-        }
-        for &m in &motor_ids {
-            let f = p::encode_enable(m, host);
-            self.backend.send(f.id, &f.data)?;
-        }
-        // Every enable frame has now gone out: the motors are physically
-        // torque-on. Report that truthfully even if the trailing drain
-        // below fails -- state must never lag reality in the unsafe
-        // direction (Connected while motors are actually enabled).
-        self.state = SessionState::Enabled;
-        // A freshly (re-)enabled session starts clean: any fault info
-        // that got us here (e.g. a hold_on_fault=false disable-on-fault
-        // that the caller re-enabled directly, without an intervening
-        // clear_faults()) no longer applies now that torque is back on,
-        // and the health monitor must not carry forward stale per-motor
-        // counters. Cleared here on the SUCCESS path only -- clearing at
-        // function entry would throw away the fault reason if enable()
-        // then failed partway through verification, exactly when a
-        // caller most wants to read it.
-        self.fault = None;
-        self.fault_hold = None;
-        self.health = HealthMonitor::new(&self.config);
-        self.drain()?;
-        Ok(())
-    }
-
-    /// Best-effort across every motor: an emergency stop must not give up
-    /// on motors 3..7 just because motor 2's frame failed to send. Every
-    /// motor gets an attempt regardless of earlier failures; the first
-    /// error encountered (send or drain) is remembered and returned after
-    /// the sweep, so the caller learns the bus is unreliable while every
-    /// reachable motor has still been commanded off.
-    ///
-    /// Also resets `fault`/`fault_hold`/`health`: torque is off and the
-    /// session is back at `Connected`, so whatever fault state got us here
-    /// is resolved and the health monitor must start clean on the next
-    /// `enable()` -- otherwise a single fault would permanently disable
-    /// health checking (`self.fault.is_some()` gates it in `tick()`) even
-    /// after a full `clear_faults()` + `enable()` cycle. The hold_on_fault
-    /// = false path in `enter_fault` calls `disable()` (hence this) and
-    /// then re-sets `self.fault` immediately afterward so the *caller* of
-    /// that specific tick still sees why the arm just went dark; an
-    /// externally-triggered `disable`/`estop`/`clear_faults` leaves it
-    /// cleared, as intended.
-    fn disable_all(&mut self, clear_fault: bool) -> Result<(), SessionError> {
-        let host = self.config.host_id;
-        let motor_ids: Vec<u8> = self.config.joints.iter().map(|j| j.motor_id).collect();
-        let mut first_err: Option<SessionError> = None;
-        for &m in &motor_ids {
-            let f = p::encode_disable(m, clear_fault, host);
-            if let Err(e) = self.backend.send(f.id, &f.data) {
-                if first_err.is_none() {
-                    first_err = Some(e.into());
+            if let Some(g) = self.config.gripper {
+                if g.motor_id == j.motor_id && st.temperature >= g.enable_temperature_c {
+                    return Err(SessionError::TooHot {
+                        motor_id: j.motor_id,
+                        celsius: st.temperature,
+                    });
                 }
             }
         }
-        if let Err(e) = self.drain() {
-            if first_err.is_none() {
-                first_err = Some(e);
+        if let Err(e) = self.arm_watchdog().and_then(|()| self.preload_and_enable()) {
+            // A motor may already be torque-on: release every motor. The
+            // enable error is the one to report.
+            let _ = self.disable_all();
+            return Err(e);
+        }
+        self.state = SessionState::Enabled;
+        // A freshly (re-)enabled session starts clean: any fault info that
+        // got us here no longer applies now that torque is back on, and the
+        // health monitor must not carry forward stale per-motor counters.
+        // Cleared on the success path only, so a failed enable keeps the
+        // fault reason a caller most wants to read.
+        self.fault = None;
+        self.fault_hold = None;
+        self.health = HealthMonitor::new(&self.config);
+        Ok(())
+    }
+
+    /// The vendor's motor watchdog: the gripper only, and only where the
+    /// firmware has parameter access. The original value is kept for the
+    /// restore after a checked disable.
+    fn arm_watchdog(&mut self) -> Result<(), SessionError> {
+        let Some(g) = self.config.gripper else {
+            return Ok(());
+        };
+        let Some(idx) = self.index_of(g.motor_id) else {
+            return Ok(());
+        };
+        if !self.slots[idx].state.params {
+            return Ok(());
+        }
+        let index = p::param_index::CAN_TIMEOUT;
+        let failed = SessionError::EnableVerify {
+            motor_id: g.motor_id,
+            index,
+        };
+        let Some(original) = self.read_param(g.motor_id, index)? else {
+            return Err(failed);
+        };
+        self.watchdog_restore = Some(u32::from_le_bytes(original));
+        let counts = g.can_timeout_ms * p::CAN_TIMEOUT_PER_MS;
+        if self.write_param(g.motor_id, index, counts)? != Some(counts) {
+            return Err(failed);
+        }
+        Ok(())
+    }
+
+    /// Per motor: a zero-gain frame at the measured pose, so the enable
+    /// cannot resume a stale setpoint left by an earlier session, then the
+    /// enable. Each needs a reply within `REPLY_TIMEOUT`, and the enable
+    /// reply must show mode 2 where the firmware reports mode.
+    fn preload_and_enable(&mut self) -> Result<(), SessionError> {
+        for i in 0..self.config.joints.len() {
+            let j = &self.config.joints[i];
+            let m = j.motor_id;
+            let f = mit::encode_control(
+                m,
+                self.slots[i].raw_position,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                j.model.params(),
+            )
+            .expect("a measured position always encodes");
+            if !self.ask(i, f, false, 1)? || !self.ask(i, mit::encode_enable(m), false, 1)? {
+                return Err(SessionError::Probe { motor_id: m });
+            }
+            let st = self.slots[i].state;
+            if st.params && st.mode != 2 {
+                return Err(SessionError::EnableMode {
+                    motor_id: m,
+                    mode: st.mode,
+                });
+            }
+            std::thread::sleep(MOTOR_SPACING);
+        }
+        Ok(())
+    }
+
+    /// The vendor's checked disable, best effort across every motor: a
+    /// zero-gain frame at the measured pose (so a later enable cannot
+    /// resume the old setpoint), a disable to every motor, then per motor a
+    /// disable whose reply must come within `REPLY_TIMEOUT` and show mode 0
+    /// where the firmware reports mode (3 tries). The gripper watchdog is
+    /// restored only once the gripper is confirmed off. Every motor gets
+    /// its frames whatever failed before; the first error (a send, a drain,
+    /// or an unconfirmed motor as `Probe`) is returned after the sweep.
+    ///
+    /// Also resets `fault`/`fault_hold`/`health`: torque is off and the
+    /// session is back at `Connected`, so the health monitor must start
+    /// clean on the next `enable()` -- otherwise a single fault would
+    /// permanently disable health checking (`self.fault.is_some()` gates it
+    /// in `tick()`). The hold_on_fault = false path in `enter_fault` calls
+    /// `disable()` and then re-sets `self.fault` so the caller of that tick
+    /// still sees why the arm just went dark.
+    fn disable_all(&mut self) -> Result<(), SessionError> {
+        let n = self.config.joints.len();
+        let mut first_err: Option<SessionError> = None;
+        let mut note = |r: Result<(), SessionError>| {
+            if let Err(e) = r {
+                first_err.get_or_insert(e);
+            }
+        };
+        for i in 0..n {
+            let j = &self.config.joints[i];
+            let f = mit::encode_control(
+                j.motor_id,
+                self.slots[i].raw_position,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                j.model.params(),
+            )
+            .expect("a measured position always encodes");
+            note(self.send_raw(f.id, &f.data));
+        }
+        for i in 0..n {
+            let f = mit::encode_disable(self.config.joints[i].motor_id);
+            note(self.send_raw(f.id, &f.data));
+        }
+        let mut gripper_off = false;
+        for i in 0..n {
+            let m = self.config.joints[i].motor_id;
+            let mut off = false;
+            for _ in 0..REPLY_TRIES {
+                match self.ask(i, mit::encode_disable(m), false, 1) {
+                    Ok(true) => {
+                        let st = self.slots[i].state;
+                        if !st.params || st.mode == 0 {
+                            off = true;
+                            break;
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(e) => note(Err(e)),
+                }
+            }
+            if !off {
+                note(Err(SessionError::Probe { motor_id: m }));
+            }
+            if self.config.gripper.is_some_and(|g| g.motor_id == m) {
+                gripper_off = off;
+            }
+        }
+        if let (true, Some(g), Some(original)) = (
+            gripper_off,
+            self.config.gripper,
+            self.watchdog_restore.take(),
+        ) {
+            let index = p::param_index::CAN_TIMEOUT;
+            match self.write_param(g.motor_id, index, original) {
+                Ok(Some(v)) if v == original => {}
+                Ok(_) => note(Err(SessionError::EnableVerify {
+                    motor_id: g.motor_id,
+                    index,
+                })),
+                Err(e) => note(Err(e)),
             }
         }
         self.state = SessionState::Connected;
         self.fault = None;
         self.fault_hold = None;
         self.health = HealthMonitor::new(&self.config);
-        match first_err {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
+        first_err.map_or(Ok(()), Err)
     }
 
     pub fn disable(&mut self) -> Result<(), SessionError> {
-        self.disable_all(false)
+        self.disable_all()
     }
 
     /// Callable from any state; torque off immediately.
     pub fn estop(&mut self) -> Result<(), SessionError> {
-        self.disable_all(false)
+        self.disable_all()
     }
 
+    /// Operator action, as the vendor's: the checked disable, then the
+    /// clearing frame to each motor, 10 ms apart.
     pub fn clear_faults(&mut self) -> Result<(), SessionError> {
-        self.disable_all(true)
+        let mut result = self.disable_all();
+        for i in 0..self.config.joints.len() {
+            let f = mit::encode_clear_fault(self.config.joints[i].motor_id);
+            if let Err(e) = self.send_raw(f.id, &f.data) {
+                result = result.and(Err(e));
+            }
+            std::thread::sleep(MOTOR_SPACING);
+        }
+        let drained = self.drain();
+        result.and(drained)
+    }
+
+    /// Sends one non-clearing fault query to the motor whose last fault
+    /// reply is oldest, once that age reaches `fault_poll_interval`. Drains
+    /// first, so a reply already on the bus counts.
+    pub fn poll_fault(&mut self) -> Result<(), SessionError> {
+        self.drain()?;
+        let Some((i, slot)) = self
+            .slots
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, s)| s.last_fault_reply)
+        else {
+            return Ok(());
+        };
+        if slot
+            .last_fault_reply
+            .is_some_and(|t| t.elapsed().as_secs_f64() < self.config.fault_poll_interval)
+        {
+            return Ok(());
+        }
+        let f = mit::encode_fault_query(self.config.joints[i].motor_id);
+        self.send_raw(f.id, &f.data)
     }
 
     pub fn state(&self) -> SessionState {
@@ -490,14 +724,14 @@ impl Session {
 
     pub fn arm_state(&self) -> ArmState {
         let now = Instant::now();
+        let age = |t: Option<Instant>| t.map_or(f64::INFINITY, |t| (now - t).as_secs_f64());
         ArmState {
             motors: self
                 .slots
                 .iter()
                 .map(|s| MotorState {
-                    feedback_age: s
-                        .last_feedback
-                        .map_or(f64::INFINITY, |t| (now - t).as_secs_f64()),
+                    feedback_age: age(s.last_feedback),
+                    fault_reply_age: age(s.last_fault_reply),
                     ..s.state
                 })
                 .collect(),
@@ -530,5 +764,50 @@ impl Session {
     pub(crate) fn send_raw(&mut self, id: u32, data: &[u8; 8]) -> Result<(), SessionError> {
         self.backend.send(id, data)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn connected() -> Session {
+        let c = ArmConfig::maker_arm_v1();
+        Session::connect(Box::new(SimArm::new(&c)), c).expect("connect")
+    }
+
+    #[test]
+    fn power_up_announcements_change_nothing() {
+        let mut s = connected();
+        s.enable().expect("enable");
+        let seen = |s: &Session| -> Vec<_> {
+            s.slots
+                .iter()
+                .map(|m| (m.state, m.last_feedback, m.last_fault_reply))
+                .collect()
+        };
+        let before = seen(&s);
+        // A synthetic MCU id, never a real motor's.
+        s.backend_as_sim()
+            .unwrap()
+            .queue_raw(3, [0xA5, 0x5A, 0, 0, 0, 0, 0, 3]);
+        s.drain().unwrap();
+        assert_eq!(seen(&s), before);
+    }
+
+    #[test]
+    fn a_fault_status_is_not_feedback() {
+        let mut s = connected();
+        std::thread::sleep(Duration::from_millis(20));
+        let before = s.arm_state().motors[1];
+        let last_feedback = s.slots[1].last_feedback;
+        // Bytes 1 and 2 are 0: as feedback, this would read p_min.
+        let f = mit::encode_fault_status(2, 0);
+        s.dispatch(f.id, &f.data);
+        let after = s.arm_state().motors[1];
+        assert_eq!(after.position, before.position);
+        assert_eq!(s.slots[1].last_feedback, last_feedback);
+        assert!(before.fault_reply_age >= 0.02);
+        assert!(after.fault_reply_age < 0.01);
     }
 }

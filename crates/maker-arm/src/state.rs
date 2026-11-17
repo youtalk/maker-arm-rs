@@ -9,9 +9,17 @@ pub struct MotorState {
     pub torque: f64,      // Nm (measured)
     pub temperature: f64, // °C
     pub mode: u8,         // 0=Reset 1=Cali 2=Motor
-    pub fault_bits: u8,
+    /// Fault word from the last fault status reply.
+    pub fault_word: u32,
+    /// Fault and warning flags from the last feedback frame.
+    pub fault_flag: bool,
+    pub warning_flag: bool,
     /// Seconds since the last feedback frame; INFINITY before the first.
     pub feedback_age: f64,
+    /// Seconds since the last fault status reply; INFINITY before the first.
+    pub fault_reply_age: f64,
+    /// The firmware answers parameter reads (found at connect).
+    pub params: bool,
 }
 
 impl MotorState {
@@ -22,8 +30,12 @@ impl MotorState {
             torque: 0.0,
             temperature: 0.0,
             mode: 0,
-            fault_bits: 0,
+            fault_word: 0,
+            fault_flag: false,
+            warning_flag: false,
             feedback_age: f64::INFINITY,
+            fault_reply_age: f64::INFINITY,
+            params: false,
         }
     }
 }

@@ -31,13 +31,10 @@ fn full_ladder_connect_fault_recover_release() {
     let out1 = s.tick(&mut hold).expect("tick 1: fault not visible yet");
     assert!(out1.fault.is_none());
     let out2 = s.tick(&mut hold).expect("tick 2: fault now visible");
-    assert_eq!(
+    assert!(matches!(
         out2.fault,
-        Some(FaultReason::MotorFault {
-            motor_id: 3,
-            bits: 0x08
-        })
-    );
+        Some(FaultReason::MotorFault { motor_id: 3, .. })
+    ));
     assert_eq!(s.state(), SessionState::Fault);
     for _ in 0..10 {
         s.tick(&mut hold).expect("holding");

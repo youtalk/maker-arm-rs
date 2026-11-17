@@ -427,7 +427,8 @@ impl Session {
     ///
     /// Returns `Ok(Some(detail))` — with NOTHING sent — when a computed
     /// motor-frame position falls outside that motor's encoder window
-    /// `[p_min, p_max]`. `encode_mit`'s `float_to_u16` would clamp such a
+    /// `[p_min, p_max]`, or when `mit::encode_control` refuses the command.
+    /// `encode_control`'s `float_to_uint` would clamp such a
     /// value to the rail and report nothing, so a truncated position at
     /// full kp would go out as if it were the commanded pose. The
     /// connect-time `RangeNotMappable` check should make this unreachable;
@@ -440,6 +441,7 @@ impl Session {
         &mut self,
         cmd: &[crate::state::JointCommand],
     ) -> Result<Option<String>, SessionError> {
+        let mut frames = Vec::with_capacity(cmd.len());
         for (i, c) in cmd.iter().enumerate() {
             let j = &self.config().joints[i];
             let params = j.model.params();
@@ -452,20 +454,24 @@ impl Session {
                     j.motor_id, params.p_min, params.p_max, c.pos
                 )));
             }
-        }
-        let spacing = self.config().inter_frame_us;
-        for (i, c) in cmd.iter().enumerate() {
-            let j = self.config().joints[i].clone();
-            let motor_pos = j.to_motor(c.pos) - self.wrap_of(i);
-            let f = maker_arm_protocol::encode_mit(
+            let Some(f) = maker_arm_protocol::mit::encode_control(
                 j.motor_id,
                 motor_pos,
                 j.direction * c.vel,
                 c.kp,
                 c.kd,
                 j.direction * c.tau,
-                j.model.params(),
-            );
+                params,
+            ) else {
+                return Ok(Some(format!(
+                    "motor {} command refused by the MIT encoder",
+                    j.motor_id
+                )));
+            };
+            frames.push(f);
+        }
+        let spacing = self.config().inter_frame_us;
+        for f in frames {
             self.send_raw(f.id, &f.data)?;
             if spacing > 0 {
                 let until = Instant::now() + Duration::from_micros(spacing);
