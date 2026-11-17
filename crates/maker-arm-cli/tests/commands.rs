@@ -219,10 +219,13 @@ fn zero_motor_refuses_a_faulted_motor() {
     assert_eq!(sim.position(5), 2.0);
 }
 
+/// Every frame sent, in order: (id, data).
+type SentLog = Arc<Mutex<Vec<(u32, [u8; 8])>>>;
+
 /// A SimArm that records every frame sent to it.
 struct Recorder {
     sim: SimArm,
-    sent: Arc<Mutex<Vec<(u32, [u8; 8])>>>,
+    sent: SentLog,
 }
 
 impl CanBackend for Recorder {
