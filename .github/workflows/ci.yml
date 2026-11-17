@@ -6,7 +6,7 @@ jobs:
   test:
     strategy:
       matrix:
-        runner: [ubuntu-latest, ubuntu-24.04-arm]
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -16,16 +16,18 @@ jobs:
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --exclude maker-arm-py --all-features
   vcan:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: bring up vcan0
         run: |
-          # GitHub's Azure kernel ships vcan in linux-modules-extra, not the base image.
-          sudo apt-get update
-          sudo apt-get install -y "linux-modules-extra-$(uname -r)"
-          sudo modprobe vcan
+          # The AWS kernel ships vcan.ko in the base image. Older Azure kernels need the extra package.
+          sudo modprobe vcan || {
+            sudo apt-get update
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+            sudo modprobe vcan
+          }
           sudo ip link add dev vcan0 type vcan
           sudo ip link set up vcan0
       - run: cargo test -p maker-arm-transport --features socketcan -- --ignored
@@ -33,7 +35,7 @@ jobs:
   wheels:
     strategy:
       matrix:
-        runner: [ubuntu-latest, ubuntu-24.04-arm]
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
