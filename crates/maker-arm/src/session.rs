@@ -526,6 +526,7 @@ impl Session {
         // fault reason a caller most wants to read.
         self.fault = None;
         self.fault_hold = None;
+        self.release_sent = None;
         self.health = HealthMonitor::new(&self.config);
         Ok(())
     }
@@ -609,11 +610,13 @@ impl Session {
     ///
     /// Also resets `fault`/`fault_hold`/`health`: torque is off and the
     /// session is back at `Connected`, so the health monitor must start
-    /// clean on the next `enable()` -- otherwise a single fault would
-    /// permanently disable health checking (`self.fault.is_some()` gates it
-    /// in `tick()`). The hold_on_fault = false path in `enter_fault` calls
-    /// `disable()` and then re-sets `self.fault` so the caller of that tick
-    /// still sees why the arm just went dark.
+    /// clean on the next `enable()` -- otherwise a stale `fault` would keep
+    /// `tick()` from ever entering `Fault` again, and the motors that
+    /// faulted would stay skipped by the health monitor. The gripper
+    /// release (`release_sent`) resets with them. The hold_on_fault = false
+    /// path in `enter_fault` calls `disable()` and then re-sets
+    /// `self.fault` so the caller of that tick still sees why the arm just
+    /// went dark.
     fn disable_all(&mut self) -> Result<(), SessionError> {
         let n = self.config.joints.len();
         let mut first_err: Option<SessionError> = None;
@@ -682,6 +685,7 @@ impl Session {
         self.state = SessionState::Connected;
         self.fault = None;
         self.fault_hold = None;
+        self.release_sent = None;
         self.health = HealthMonitor::new(&self.config);
         first_err.map_or(Ok(()), Err)
     }

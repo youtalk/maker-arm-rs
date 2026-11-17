@@ -1,9 +1,9 @@
 //! The fixed-rate control loop and its output stage — the ONLY place that
 //! turns controller output into MIT frames, and therefore the single clamp
 //! enforcement point (design §2). On any health fault or rejected command
-//! the loop swaps to an internal hold at the last-good pose and releases
-//! the gripper (hold_on_fault, the vendor's semantics) or disables
-//! outright.
+//! the loop swaps to an internal hold at the last-good pose
+//! (hold_on_fault, the vendor's semantics) or disables outright. A gripper
+//! that faulted itself is released instead of held.
 
 use crate::clamp::clamp_command;
 use crate::controller::{Controller, HoldController};
@@ -33,8 +33,8 @@ pub struct TickRecord {
     /// The session tick count after this tick, so the first tick is 1.
     pub tick: u64,
     pub motors: Vec<MotorState>,
-    /// The command after `clamp_command`, as encoded for the motors. In
-    /// `Fault` the gripper gets a disable instead of its entry.
+    /// The command after `clamp_command`, as encoded for the motors. A
+    /// released gripper gets a disable instead of its entry.
     pub sent: ArmCommand,
     pub clamped: bool,
 }
@@ -43,8 +43,8 @@ pub struct TickRecord {
 /// controller's) use this one value.
 pub const RING_TICKS: usize = 4000;
 
-/// In `Fault`, the released gripper's disable is re-sent this often, as the
-/// vendor does: one lost disable must not leave it energized.
+/// A released gripper's disable is re-sent this often, as the vendor does:
+/// one lost disable must not leave it energized.
 const RELEASE_RESEND: Duration = Duration::from_millis(100);
 
 /// A bounded ring of records and the number it dropped since the last `take`.
@@ -268,11 +268,9 @@ impl Session {
             // path -- but it is operator-visible motion during a fault.
             hold.retarget_to_state(at);
             self.fault_hold = Some(hold);
-            self.fault = Some(reason);
+            // The first fault stays the session's reason.
+            self.fault.get_or_insert(reason);
             self.set_state(SessionState::Fault);
-            // The gripper is released: `send_mit_all` sends its disable on
-            // this tick and every `RELEASE_RESEND` after.
-            self.release_sent = None;
             Ok(())
         } else {
             // `disable()` (`disable_all`) resets `fault`/`fault_hold`/
@@ -288,29 +286,19 @@ impl Session {
     }
 
     /// One control cycle. Runs in `Enabled` (controller drives) and in
-    /// `Fault` when holding (internal hold drives joints 1 to 6, the gripper
-    /// is released; the controller is not consulted). Every tick also sends
-    /// at most one fault query (`Session::poll_fault`).
+    /// `Fault` when holding (internal hold drives; the controller is not
+    /// consulted). Every tick also sends at most one fault query
+    /// (`Session::poll_fault`).
     ///
-    /// # Health checks stop once a fault latches
+    /// # Health checks keep running in `Fault`
     ///
-    /// The health check below is gated on `self.fault.is_none()`, and
-    /// `fault` stays `Some` for the whole of `Fault`. So during an
-    /// indefinite hold-on-fault -- exactly the situation where a loaded
-    /// arm heats up -- NO further health check runs: `temp_hold_c` (our
-    /// own addition, not an upstream behavior) does not re-trip, and
-    /// neither does any other check. Only an explicit
-    /// `clear_faults()`/`disable()`/`estop()` or a fresh `enable()` re-arms
-    /// them.
-    ///
-    /// This is deliberate, not an oversight: re-entering `enter_fault`
-    /// every tick would re-`retarget_to_state` the hold to wherever the
-    /// arm has since sagged, walking it downhill. The motors' own firmware
-    /// protection remains the backstop for a genuine over-temperature, so
-    /// what is lost is OUR earlier trip point and the visibility that goes
-    /// with it, not protection outright. Changing it (e.g. a
-    /// latch-once-and-escalate path that disables instead of retargeting)
-    /// needs hardware to validate and is out of scope until then.
+    /// As the vendor's, health is checked every tick, in `Fault` too. A
+    /// motor that faulted is skipped from then on, so a later fault on
+    /// another motor still shows. Only the first fault enters `Fault`:
+    /// it stays the session's reason, and a later one does not
+    /// `retarget_to_state` the hold, which would walk a sagging arm
+    /// downhill. A later fault on the gripper still releases it
+    /// (`send_mit_all`).
     pub fn tick(&mut self, controller: &mut dyn Controller) -> Result<TickOutcome, SessionError> {
         if self.state() != SessionState::Enabled && self.state() != SessionState::Fault {
             return Err(SessionError::WrongState {
@@ -330,13 +318,10 @@ impl Session {
         let cfg = self.config().clone();
         let dt = 1.0 / cfg.control_rate_hz;
 
-        // `fault` stays `Some` for the whole of `Fault`, so this gate is
-        // closed for the entire duration of a hold-on-fault: health
-        // checking (including our `temp_hold_c` trip) does NOT run again
-        // until an explicit release re-arms it. See this function's doc
-        // comment for why re-checking every tick would be worse.
-        if self.fault.is_none() {
-            if let Some(reason) = self.health.check(&snapshot, &cfg) {
+        // In `Fault` a later fault only marks its motor in the health
+        // monitor; see this function's doc comment.
+        if let Some(reason) = self.health.check(&snapshot, &cfg) {
+            if self.fault.is_none() {
                 self.enter_fault(reason, &snapshot)?;
                 if self.state() == SessionState::Connected {
                     // hold_on_fault = false path: motors already disabled.
@@ -435,9 +420,10 @@ impl Session {
         })
     }
 
-    /// Encodes and sends one MIT frame per motor. In `Fault` the gripper
-    /// is released instead, as the vendor does: it gets a disable at most
-    /// every `RELEASE_RESEND`, and no control frame.
+    /// Encodes and sends one MIT frame per motor. A gripper that faulted
+    /// itself is released instead, as the vendor's `release_on_fault`: it
+    /// gets a disable at once and then every `RELEASE_RESEND`, and no
+    /// control frame. A fault on any other motor keeps the gripper held.
     ///
     /// Returns `Ok(Some(detail))` — with NOTHING sent — when a computed
     /// motor-frame position falls outside that motor's encoder window
@@ -452,17 +438,16 @@ impl Session {
     /// validated BEFORE the first frame goes out, so a refusal never
     /// leaves a partially-commanded arm.
     fn send_mit_all(&mut self, cmd: &[JointCommand]) -> Result<Option<String>, SessionError> {
-        let released = match self.config().gripper {
-            Some(g) if self.state() == SessionState::Fault => Some(g.motor_id),
-            _ => None,
-        };
+        let gripper = self.config().gripper.map(|g| g.motor_id);
+        let mut released = false;
         let resend = self
             .release_sent
             .is_none_or(|t| t.elapsed() >= RELEASE_RESEND);
         let mut frames = Vec::with_capacity(cmd.len());
         for (i, c) in cmd.iter().enumerate() {
             let j = &self.config().joints[i];
-            if released == Some(j.motor_id) {
+            if gripper == Some(j.motor_id) && self.health.faulted(i) {
+                released = true;
                 if resend {
                     frames.push(mit::encode_disable(j.motor_id));
                 }
@@ -494,7 +479,7 @@ impl Session {
             };
             frames.push(f);
         }
-        if released.is_some() && resend {
+        if released && resend {
             self.release_sent = Some(Instant::now());
         }
         let spacing = self.config().inter_frame_us;

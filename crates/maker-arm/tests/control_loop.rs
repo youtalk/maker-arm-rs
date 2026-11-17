@@ -281,8 +281,8 @@ fn run_paces_ticks_and_running_arm_lifecycle_works() {
 #[test]
 fn clearing_a_fault_resets_the_health_monitor_and_reenables_detection() {
     // `Session::fault` is only ever set to `Some(..)`; unless something
-    // clears it, `tick()`'s `if self.fault.is_none()` gates stay closed
-    // forever, so the health monitor never runs again -- even across a
+    // clears it, `tick()`'s `if self.fault.is_none()` gate stays closed
+    // forever, so no new fault ever enters `Fault` again -- even across a
     // clean clear_faults() + enable() cycle. Pin the intended recovery
     // path: clear_faults() must reset `fault` (and the health monitor's
     // internal counters) so a freshly re-enabled arm has live detection.
@@ -337,12 +337,11 @@ fn run_keeps_holding_through_a_fault_until_max_ticks() {
         50,
         "run() must keep ticking (holding) through a fault, not exit early"
     );
-    // joints 1 to 6 keep torque and hold; only the gripper is released
+    // torque never dropped -- still holding, not disabled
     let sim = s.backend_as_sim().unwrap();
-    for id in 1..=6u8 {
+    for id in 1..=7u8 {
         assert!(sim.enabled(id));
     }
-    assert!(!sim.enabled(7));
 }
 
 #[test]
@@ -759,12 +758,41 @@ fn each_tick_sends_at_most_one_fault_query() {
 }
 
 #[test]
-fn a_fault_releases_the_gripper_and_holds_the_joints() {
+fn a_gripper_fault_releases_the_gripper_and_holds_the_joints() {
     let c = fast(ArmConfig::maker_arm_v1());
     let mut s = enabled_session(&c);
     let before = s.positions();
     let sim = s.backend_as_sim().unwrap();
     // Connect and enable send disables too: count from here.
+    let base = sim.disables(7);
+    sim.inject_fault(7, 1 << 14);
+    let mut hold = HoldController::from_config(&c);
+    let stop = AtomicBool::new(false);
+    s.run(&mut hold, &stop, Some(200)).expect("run 1 s");
+    assert!(matches!(
+        s.fault(),
+        Some(FaultReason::MotorFault { motor_id: 7, .. })
+    ));
+    assert_eq!(s.state(), SessionState::Fault);
+    let after = s.positions();
+    for i in 0..6 {
+        assert!((after[i] - before[i]).abs() < 1e-3, "joint {i} moved");
+    }
+    let sim = s.backend_as_sim().unwrap();
+    assert!(!sim.enabled(7));
+    assert!((1..=6).all(|m| sim.enabled(m)));
+    let disables = sim.disables(7) - base;
+    assert!(
+        (9..=11).contains(&disables),
+        "{disables} gripper disables in 1 s"
+    );
+}
+
+#[test]
+fn a_joint_fault_holds_every_motor_including_the_gripper() {
+    let c = fast(ArmConfig::maker_arm_v1());
+    let mut s = enabled_session(&c);
+    let sim = s.backend_as_sim().unwrap();
     let base = sim.disables(7);
     sim.inject_fault(3, 1 << 14);
     let mut hold = HoldController::from_config(&c);
@@ -775,10 +803,29 @@ fn a_fault_releases_the_gripper_and_holds_the_joints() {
         Some(FaultReason::MotorFault { motor_id: 3, .. })
     ));
     assert_eq!(s.state(), SessionState::Fault);
-    let after = s.positions();
-    for i in 0..6 {
-        assert!((after[i] - before[i]).abs() < 1e-3, "joint {i} moved");
-    }
+    let sim = s.backend_as_sim().unwrap();
+    assert!((1..=7).all(|m| sim.enabled(m)));
+    assert_eq!(sim.disables(7), base);
+}
+
+#[test]
+fn a_gripper_fault_during_a_hold_still_releases_it() {
+    let c = fast(ArmConfig::maker_arm_v1());
+    let mut s = enabled_session(&c);
+    s.backend_as_sim().unwrap().inject_fault(3, 1 << 14);
+    let mut hold = HoldController::from_config(&c);
+    let stop = AtomicBool::new(false);
+    s.run(&mut hold, &stop, Some(5)).expect("run to the fault");
+    assert_eq!(s.state(), SessionState::Fault);
+    let sim = s.backend_as_sim().unwrap();
+    let base = sim.disables(7);
+    sim.set_temperature(7, 56.0);
+    s.run(&mut hold, &stop, Some(200)).expect("run 1 s");
+    // The first fault stays the session's reason.
+    assert!(matches!(
+        s.fault(),
+        Some(FaultReason::MotorFault { motor_id: 3, .. })
+    ));
     let sim = s.backend_as_sim().unwrap();
     assert!(!sim.enabled(7));
     assert!((1..=6).all(|m| sim.enabled(m)));

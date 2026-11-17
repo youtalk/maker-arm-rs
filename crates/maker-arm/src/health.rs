@@ -4,11 +4,12 @@
 //! the gripper's warning flag, and mode 2 for 5 ticks where the firmware
 //! has parameter access. The gripper stops at the vendor's 55 degC; the
 //! 70 degC limit on joints 1 to 6 is ours (design §4 item 3). Checks run
-//! in motor order and the first failure wins — one fault at a time is
-//! enough to stop on.
+//! in motor order and the first failure wins. A motor that faulted is
+//! skipped from then on, as the vendor does, so the checks keep running
+//! while the arm holds and a later fault on another motor still shows.
 
-use crate::config::ArmConfig;
-use crate::state::ArmState;
+use crate::config::{ArmConfig, JointConfig};
+use crate::state::{ArmState, MotorState};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FaultReason {
@@ -76,60 +77,87 @@ impl std::fmt::Display for FaultReason {
 
 pub struct HealthMonitor {
     bad_mode_ticks: Vec<u32>,
+    /// Motors that already faulted. They are skipped from then on, as the
+    /// vendor does, so a later fault on another motor still shows.
+    faulted: Vec<bool>,
 }
 
 impl HealthMonitor {
     pub fn new(config: &ArmConfig) -> HealthMonitor {
         HealthMonitor {
             bad_mode_ticks: vec![0; config.joints.len()],
+            faulted: vec![false; config.joints.len()],
         }
     }
 
+    /// The first failure among the motors that have not faulted yet. That
+    /// motor is marked faulted.
     pub fn check(&mut self, state: &ArmState, config: &ArmConfig) -> Option<FaultReason> {
-        let reply_timeout = 3.0 * config.fault_poll_interval;
         for (i, (m, j)) in state.motors.iter().zip(&config.joints).enumerate() {
-            let gripper = config.gripper.filter(|g| g.motor_id == j.motor_id);
-            if m.feedback_age > config.feedback_timeout {
-                return Some(FaultReason::FeedbackTimeout {
+            if self.faulted[i] {
+                continue;
+            }
+            if let Some(reason) = self.check_motor(i, m, j, config) {
+                self.faulted[i] = true;
+                return Some(reason);
+            }
+        }
+        None
+    }
+
+    /// True once motor slot `i` has faulted in this session.
+    pub(crate) fn faulted(&self, i: usize) -> bool {
+        self.faulted[i]
+    }
+
+    fn check_motor(
+        &mut self,
+        i: usize,
+        m: &MotorState,
+        j: &JointConfig,
+        config: &ArmConfig,
+    ) -> Option<FaultReason> {
+        let gripper = config.gripper.filter(|g| g.motor_id == j.motor_id);
+        if m.feedback_age > config.feedback_timeout {
+            return Some(FaultReason::FeedbackTimeout {
+                motor_id: j.motor_id,
+                age: m.feedback_age,
+            });
+        }
+        if m.fault_flag || m.fault_word != 0 {
+            return Some(FaultReason::MotorFault {
+                motor_id: j.motor_id,
+                word: m.fault_word,
+            });
+        }
+        if m.fault_reply_age > 3.0 * config.fault_poll_interval {
+            return Some(FaultReason::FaultReplyTimeout {
+                motor_id: j.motor_id,
+                age: m.fault_reply_age,
+            });
+        }
+        if m.temperature >= gripper.map_or(config.temp_hold_c, |g| g.max_temperature_c) {
+            return Some(FaultReason::OverTemperature {
+                motor_id: j.motor_id,
+                celsius: m.temperature,
+            });
+        }
+        if gripper.is_some() && m.warning_flag {
+            return Some(FaultReason::Warning {
+                motor_id: j.motor_id,
+            });
+        }
+        // Legacy firmware reports mode 0 even while enabled.
+        if m.params && m.mode != 2 {
+            self.bad_mode_ticks[i] += 1;
+            if self.bad_mode_ticks[i] >= config.mode_fault_ticks {
+                return Some(FaultReason::ModeNotMotor {
                     motor_id: j.motor_id,
-                    age: m.feedback_age,
+                    ticks: self.bad_mode_ticks[i],
                 });
             }
-            if m.fault_flag || m.fault_word != 0 {
-                return Some(FaultReason::MotorFault {
-                    motor_id: j.motor_id,
-                    word: m.fault_word,
-                });
-            }
-            if m.fault_reply_age > reply_timeout {
-                return Some(FaultReason::FaultReplyTimeout {
-                    motor_id: j.motor_id,
-                    age: m.fault_reply_age,
-                });
-            }
-            if m.temperature >= gripper.map_or(config.temp_hold_c, |g| g.max_temperature_c) {
-                return Some(FaultReason::OverTemperature {
-                    motor_id: j.motor_id,
-                    celsius: m.temperature,
-                });
-            }
-            if gripper.is_some() && m.warning_flag {
-                return Some(FaultReason::Warning {
-                    motor_id: j.motor_id,
-                });
-            }
-            // Legacy firmware reports mode 0 even while enabled.
-            if m.params && m.mode != 2 {
-                self.bad_mode_ticks[i] += 1;
-                if self.bad_mode_ticks[i] >= config.mode_fault_ticks {
-                    return Some(FaultReason::ModeNotMotor {
-                        motor_id: j.motor_id,
-                        ticks: self.bad_mode_ticks[i],
-                    });
-                }
-            } else {
-                self.bad_mode_ticks[i] = 0;
-            }
+        } else {
+            self.bad_mode_ticks[i] = 0;
         }
         None
     }
