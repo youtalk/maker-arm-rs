@@ -617,8 +617,7 @@ pub fn run(o: &ServeOptions, check: bool) -> Result<(), String> {
         "SERVE_READY {{\"socket\": {}, \"digest\": \"{digest:016x}\"}}",
         serde_json::json!(socket.display().to_string())
     ));
-    let mut fault_logged = false;
-    let mut later_logged = 0;
+    let (mut fault_logged, mut later_logged, mut stop_logged) = (false, 0, false);
     loop {
         if SIGNALED.swap(false, Ordering::Relaxed) {
             let mut st = d.lock();
@@ -660,22 +659,25 @@ pub fn run(o: &ServeOptions, check: bool) -> Result<(), String> {
             .saturating_add(u32::try_from(clamped).unwrap_or(u32::MAX));
         if st.faulted() {
             st.mode = Mode::Fault;
-            let snap = st.arm.as_ref().and_then(RunningArm::snapshot);
-            if !fault_logged {
+            let (first, later) = st
+                .arm
+                .as_ref()
+                .and_then(RunningArm::snapshot)
+                .map_or((None, vec![]), |s| (s.fault, s.later_faults));
+            if let Some(f) = first.filter(|_| !fault_logged) {
                 fault_logged = true;
-                log(&match snap.as_ref().and_then(|s| s.fault.as_ref()) {
-                    Some(f) => format!("FAULT: {f}; holding the measured pose"),
-                    None => "FAULT: the control loop stopped; the motors keep their last \
-                             command"
-                        .into(),
-                });
+                log(&format!("FAULT: {f}; holding the measured pose"));
             }
             // Each later fault during the hold, once.
-            let later = snap.map_or(vec![], |s| s.later_faults);
             for f in later.iter().skip(later_logged) {
                 log(&format!("FAULT (later, still holding): {f}"));
             }
             later_logged = later_logged.max(later.len());
+            // Also after a transport hold: errors that last end the loop.
+            if !stop_logged && st.arm.as_ref().is_none_or(RunningArm::loop_finished) {
+                stop_logged = true;
+                log("FAULT: the control loop stopped; the motors keep their last command");
+            }
         }
         if let Some(why) = st.exit {
             drop(st);
