@@ -22,11 +22,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: bring up vcan0
         run: |
-          # The kernel image may or may not ship vcan.ko in the base package.
-          uname -r
-          find /lib/modules/$(uname -r) -name 'vcan*'
-          apt-cache search linux-modules | head -20
-          sudo modprobe vcan
+          # The AWS kernel ships vcan.ko in the base image. Older Azure kernels need the extra package.
+          sudo modprobe vcan || {
+            sudo apt-get update
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+            sudo modprobe vcan
+          }
           sudo ip link add dev vcan0 type vcan
           sudo ip link set up vcan0
       - run: cargo test -p maker-arm-transport --features socketcan -- --ignored
