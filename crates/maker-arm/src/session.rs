@@ -35,8 +35,8 @@ pub enum SessionState {
 pub enum SessionError {
     Transport(TransportError),
     Clamp(ClampError),
-    /// A motor did not reply in time: to the probe, the preload, the enable
-    /// or the checked disable.
+    /// A motor did not reply in time: to the probe, the preload or the
+    /// enable.
     Probe {
         motor_id: u8,
     },
@@ -83,6 +83,19 @@ pub enum SessionError {
     },
     WrongState {
         expected: &'static str,
+    },
+    /// The checked disable could not confirm these motors off. They may
+    /// still hold torque. `cause` is the first other error of the sweep.
+    NotDisabled {
+        motors: Vec<u8>,
+        cause: Option<Box<SessionError>>,
+    },
+    /// The control loop had stopped on `error` before the release.
+    /// `release` is the checked disable's error, `None` when it
+    /// confirmed every motor off.
+    LoopStopped {
+        error: Box<SessionError>,
+        release: Option<Box<SessionError>>,
     },
 }
 
@@ -160,6 +173,21 @@ impl std::fmt::Display for SessionError {
             SessionError::WrongState { expected } => {
                 write!(f, "operation requires state {expected}")
             }
+            SessionError::NotDisabled { motors, cause } => {
+                let ids: Vec<String> = motors.iter().map(u8::to_string).collect();
+                write!(f, "motors {} did not confirm the disable", ids.join(", "))?;
+                if let Some(c) = cause {
+                    write!(f, " ({c})")?;
+                }
+                write!(f, " -- they may still hold torque")
+            }
+            SessionError::LoopStopped { error, release } => {
+                write!(f, "the control loop had stopped: {error}")?;
+                match release {
+                    Some(r) => write!(f, "; the release then failed: {r}"),
+                    None => write!(f, "; the release confirmed every motor off"),
+                }
+            }
         }
     }
 }
@@ -200,9 +228,16 @@ pub struct Session {
     pub(crate) tick: u64,
     pub(crate) health: HealthMonitor,
     pub(crate) fault: Option<FaultReason>,
+    /// Faults found after the first one while the arm holds, as the
+    /// vendor's `fault_reasons`.
+    pub(crate) later_faults: Vec<FaultReason>,
     pub(crate) fault_hold: Option<HoldController>,
     /// When the loop last sent the released gripper its disable.
     pub(crate) release_sent: Option<Instant>,
+    /// When the current run of transport errors in `tick` began.
+    pub(crate) failing_since: Option<Instant>,
+    /// The gripper's slot and the last target sent to it (joint rad).
+    pub(crate) grip_sent: Option<(usize, f64)>,
     /// The gripper's CAN_TIMEOUT from before enable, kept for the restore.
     watchdog_restore: Option<u32>,
 }
@@ -253,8 +288,11 @@ impl Session {
             tick: 0,
             health,
             fault: None,
+            later_faults: Vec::new(),
             fault_hold: None,
             release_sent: None,
+            failing_since: None,
+            grip_sent: None,
             watchdog_restore: None,
         };
         let motor_ids: Vec<u8> = s.config.joints.iter().map(|j| j.motor_id).collect();
@@ -404,9 +442,15 @@ impl Session {
     }
 
     /// Routes one raw frame into the right motor slot. Anything that is
-    /// not an MIT reply (a power-up announcement, say) is ignored.
+    /// not an MIT reply is ignored, except a frame on a motor's own id in
+    /// an enabled session: that is the motor's power-up announcement, so
+    /// it restarted with torque off. Legacy firmware gives no other sign.
     pub(crate) fn dispatch(&mut self, id: u32, data: &[u8; 8]) {
         let Some(idx) = mit::reply_motor_id(id, data).and_then(|m| self.index_of(m)) else {
+            let enabled = matches!(self.state, SessionState::Enabled | SessionState::Fault);
+            if let Some(i) = u8::try_from(id).ok().and_then(|m| self.index_of(m)) {
+                self.slots[i].state.restarted |= enabled;
+            }
             return;
         };
         let j = &self.config.joints[idx];
@@ -525,9 +569,15 @@ impl Session {
         // Cleared on the success path only, so a failed enable keeps the
         // fault reason a caller most wants to read.
         self.fault = None;
+        self.later_faults.clear();
         self.fault_hold = None;
         self.release_sent = None;
+        self.failing_since = None;
+        self.grip_sent = None;
         self.health = HealthMonitor::new(&self.config);
+        for slot in &mut self.slots {
+            slot.state.restarted = false;
+        }
         Ok(())
     }
 
@@ -605,8 +655,9 @@ impl Session {
     /// disable whose reply must come within `REPLY_TIMEOUT` and show mode 0
     /// where the firmware reports mode (3 tries). The gripper watchdog is
     /// restored only once the gripper is confirmed off. Every motor gets
-    /// its frames whatever failed before; the first error (a send, a drain,
-    /// or an unconfirmed motor as `Probe`) is returned after the sweep.
+    /// its frames whatever failed before. After the sweep, the motors that
+    /// did not confirm come back as `NotDisabled`; with none, the first
+    /// error (a send, a drain, the watchdog restore).
     ///
     /// Also resets `fault`/`fault_hold`/`health`: torque is off and the
     /// session is back at `Connected`, so the health monitor must start
@@ -644,6 +695,7 @@ impl Session {
             note(self.send_raw(f.id, &f.data));
         }
         let mut gripper_off = false;
+        let mut unconfirmed = Vec::new();
         for i in 0..n {
             let m = self.config.joints[i].motor_id;
             let mut off = false;
@@ -661,7 +713,7 @@ impl Session {
                 }
             }
             if !off {
-                note(Err(SessionError::Probe { motor_id: m }));
+                unconfirmed.push(m);
             }
             if self.config.gripper.is_some_and(|g| g.motor_id == m) {
                 gripper_off = off;
@@ -684,9 +736,17 @@ impl Session {
         }
         self.state = SessionState::Connected;
         self.fault = None;
+        self.later_faults.clear();
         self.fault_hold = None;
         self.release_sent = None;
         self.health = HealthMonitor::new(&self.config);
+        if !unconfirmed.is_empty() {
+            // It names every motor that may still hold torque, so it wins.
+            return Err(SessionError::NotDisabled {
+                motors: unconfirmed,
+                cause: first_err.map(Box::new),
+            });
+        }
         first_err.map_or(Ok(()), Err)
     }
 
@@ -806,22 +866,39 @@ mod tests {
     }
 
     #[test]
-    fn power_up_announcements_change_nothing() {
+    fn a_power_up_announcement_is_ignored_before_enable_and_holds_after() {
         let mut s = connected();
-        s.enable().expect("enable");
         let seen = |s: &Session| -> Vec<_> {
             s.slots
                 .iter()
                 .map(|m| (m.state, m.last_feedback, m.last_fault_reply))
                 .collect()
         };
-        let before = seen(&s);
         // A synthetic MCU id, never a real motor's.
-        s.backend_as_sim()
-            .unwrap()
-            .queue_raw(3, [0xA5, 0x5A, 0, 0, 0, 0, 0, 3]);
+        let announce = |s: &mut Session| {
+            s.backend_as_sim()
+                .unwrap()
+                .queue_raw(3, [0xA5, 0x5A, 0, 0, 0, 0, 0, 3])
+        };
+        // Before enable (connect, probe), it changes nothing.
+        let before = seen(&s);
+        announce(&mut s);
         s.drain().unwrap();
         assert_eq!(seen(&s), before);
+        // In an enabled session, motor 3 restarted with torque off: hold.
+        s.enable().expect("enable");
+        let position = s.positions()[2];
+        announce(&mut s);
+        let mut hold = HoldController::from_config(&s.config().clone());
+        s.tick(&mut hold).expect("tick");
+        assert_eq!(s.state(), SessionState::Fault);
+        assert_eq!(
+            s.fault(),
+            Some(&FaultReason::MotorRestarted { motor_id: 3 })
+        );
+        assert!((s.positions()[2] - position).abs() < 1e-3);
+        // No enable went out.
+        assert_eq!(s.backend_as_sim().unwrap().enables(3), 1);
     }
 
     #[test]

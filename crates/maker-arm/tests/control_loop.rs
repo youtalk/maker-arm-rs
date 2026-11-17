@@ -1,6 +1,6 @@
 use maker_arm::{
     ArmCommand, ArmConfig, ArmState, Controller, FaultReason, HoldController, JointCommand, LoopRt,
-    RtError, Session, SessionState, SimArm,
+    RtError, Session, SessionError, SessionState, SimArm,
 };
 use maker_arm_protocol::{mit, RS00};
 use maker_arm_transport::{CanBackend, TransportError};
@@ -821,11 +821,19 @@ fn a_gripper_fault_during_a_hold_still_releases_it() {
     let base = sim.disables(7);
     sim.set_temperature(7, 56.0);
     s.run(&mut hold, &stop, Some(200)).expect("run 1 s");
-    // The first fault stays the session's reason.
+    // The first fault stays the session's reason, and the later one is kept.
     assert!(matches!(
         s.fault(),
         Some(FaultReason::MotorFault { motor_id: 3, .. })
     ));
+    assert!(
+        matches!(
+            s.later_faults(),
+            [FaultReason::OverTemperature { motor_id: 7, .. }]
+        ),
+        "{:?}",
+        s.later_faults()
+    );
     let sim = s.backend_as_sim().unwrap();
     assert!(!sim.enabled(7));
     assert!((1..=6).all(|m| sim.enabled(m)));
@@ -862,4 +870,218 @@ fn power_loss_then_return_never_re_enables() {
     assert_eq!(s.state(), SessionState::Fault);
     let sim = s.backend_as_sim().unwrap();
     assert!((1..=7).all(|m| !sim.enabled(m)));
+}
+
+/// What the `Enobufs` bus does to the next sends.
+#[derive(Default)]
+struct Bus {
+    /// This many sends fail.
+    fail_next: u32,
+    /// Every send to this motor fails.
+    dead: Option<u8>,
+    /// Disable frames tried, failed or not.
+    disables_tried: u32,
+}
+
+/// A SimArm whose sends fail as a full CAN TX queue makes them fail on a
+/// candleLight adapter: with ENOBUFS.
+struct Enobufs {
+    sim: SimArm,
+    bus: Arc<Mutex<Bus>>,
+}
+
+impl Enobufs {
+    fn session(c: &ArmConfig) -> (Session, Arc<Mutex<Bus>>) {
+        let bus = Arc::new(Mutex::new(Bus::default()));
+        let b = Enobufs {
+            sim: SimArm::new(c),
+            bus: bus.clone(),
+        };
+        let mut s = Session::connect(Box::new(b), c.clone()).expect("connect");
+        s.enable().expect("enable");
+        (s, bus)
+    }
+}
+
+impl CanBackend for Enobufs {
+    fn send(&mut self, id: u32, data: &[u8; 8]) -> Result<(), TransportError> {
+        let mut bus = self.bus.lock().unwrap();
+        if *data == mit::encode_disable(id as u8).data {
+            bus.disables_tried += 1;
+        }
+        if bus.fail_next > 0 || bus.dead == Some(id as u8) {
+            bus.fail_next = bus.fail_next.saturating_sub(1);
+            return Err(TransportError::Io(
+                "No buffer space available (os error 105)".into(),
+            ));
+        }
+        self.sim.send(id, data)
+    }
+
+    fn recv(&mut self, timeout: Duration) -> Result<Option<(u32, [u8; 8])>, TransportError> {
+        self.sim.recv(timeout)
+    }
+
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(&mut self.sim)
+    }
+}
+
+#[test]
+fn one_failed_send_holds_and_the_loop_keeps_running() {
+    let c = fast(ArmConfig::maker_arm_v1());
+    let (mut s, bus) = Enobufs::session(&c);
+    let before = s.positions();
+    let mut hold = HoldController::from_config(&c);
+    let stop = AtomicBool::new(false);
+    s.run(&mut hold, &stop, Some(5)).expect("run");
+    bus.lock().unwrap().fail_next = 1;
+    s.run(&mut hold, &stop, Some(100))
+        .expect("one failed send does not end the loop");
+    assert_eq!(s.state(), SessionState::Fault);
+    assert!(
+        matches!(s.fault(), Some(FaultReason::Transport { .. })),
+        "{:?}",
+        s.fault()
+    );
+    let after = s.positions();
+    for i in 0..7 {
+        assert!((after[i] - before[i]).abs() < 1e-3, "joint {i} moved");
+    }
+    let sim = s.backend_as_sim().unwrap();
+    assert!((1..=7).all(|m| sim.enabled(m)));
+}
+
+#[test]
+fn a_release_after_the_loop_stopped_still_disables() {
+    let c = fast(ArmConfig::maker_arm_v1());
+    let (s, bus) = Enobufs::session(&c);
+    let running = s
+        .start(Box::new(HoldController::from_config(&c)), None)
+        .expect("start");
+    std::thread::sleep(Duration::from_millis(50));
+    let tried = bus.lock().unwrap().disables_tried;
+    bus.lock().unwrap().fail_next = u32::MAX;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !running.loop_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(running.loop_finished(), "errors that last end the loop");
+    // The loop never disables on its own.
+    assert_eq!(bus.lock().unwrap().disables_tried, tried);
+    // The bus works again, except for motor 4.
+    *bus.lock().unwrap() = Bus {
+        dead: Some(4),
+        ..Bus::default()
+    };
+    let (mut s, res) = running.stop_and_disable();
+    match res {
+        Err(SessionError::LoopStopped {
+            error,
+            release: Some(r),
+        }) => {
+            assert!(matches!(*error, SessionError::Transport(_)), "{error}");
+            assert!(
+                matches!(&*r, SessionError::NotDisabled { motors, .. } if motors == &[4]),
+                "{r}"
+            );
+        }
+        other => panic!("expected the loop error and motor 4, got {other:?}"),
+    }
+    let sim = s.backend_as_sim().unwrap();
+    for m in 1..=7 {
+        assert_eq!(sim.enabled(m), m == 4, "motor {m}");
+    }
+}
+
+#[test]
+fn a_motor_that_restarts_mid_session_holds_the_arm_and_stays_off() {
+    // Legacy firmware leaves mode and the fault bits at 0, and a restarted
+    // motor still answers every control frame. Only its power-up
+    // announcement tells.
+    let c = fast(ArmConfig::maker_arm_v1());
+    let mut sim = SimArm::new(&c);
+    sim.set_params_supported(false);
+    let mut s = Session::connect(Box::new(sim), c.clone()).expect("connect");
+    s.enable().expect("enable");
+    let mut hold = HoldController::from_config(&c);
+    let stop = AtomicBool::new(false);
+    s.run(&mut hold, &stop, Some(5)).expect("run");
+    // Motor 2 loses power for a moment: torque off, then it announces
+    // itself with a synthetic MCU id, never a real motor's.
+    let sim = s.backend_as_sim().unwrap();
+    let f = mit::encode_disable(2);
+    sim.send(f.id, &f.data).unwrap();
+    sim.queue_raw(2, [0xA5, 0x5A, 0, 0, 0, 0, 0, 2]);
+    s.run(&mut hold, &stop, Some(200)).expect("run 1 s");
+    assert_eq!(s.state(), SessionState::Fault);
+    assert_eq!(
+        s.fault(),
+        Some(&FaultReason::MotorRestarted { motor_id: 2 })
+    );
+    let sim = s.backend_as_sim().unwrap();
+    assert!(!sim.enabled(2));
+    assert_eq!(sim.enables(2), 1);
+    assert!([1, 3, 4, 5, 6, 7].iter().all(|&m| sim.enabled(m)));
+}
+
+/// A SimArm whose jaw is stopped by a held object: each gripper control
+/// frame reaches the motor at the jaw's own position, and the commanded
+/// position is logged.
+struct HeldObject {
+    sim: SimArm,
+    sent: Arc<Mutex<Vec<f64>>>,
+}
+
+impl CanBackend for HeldObject {
+    fn send(&mut self, id: u32, data: &[u8; 8]) -> Result<(), TransportError> {
+        if id == 7 && data[..6] != [0xFF; 6] {
+            let (pos, vel, kp, kd, tau) = mit::decode_control(data, &RS00).expect("control");
+            self.sent.lock().unwrap().push(pos);
+            let jaw = self.sim.position(7);
+            let f = mit::encode_control(7, jaw, vel, kp, kd, tau, &RS00).unwrap();
+            return self.sim.send(f.id, &f.data);
+        }
+        self.sim.send(id, data)
+    }
+
+    fn recv(&mut self, timeout: Duration) -> Result<Option<(u32, [u8; 8])>, TransportError> {
+        self.sim.recv(timeout)
+    }
+
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(&mut self.sim)
+    }
+}
+
+#[test]
+fn a_joint_fault_keeps_the_gripper_squeeze() {
+    let c = fast(ArmConfig::maker_arm_v1());
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let b = HeldObject {
+        sim: SimArm::new(&c),
+        sent: sent.clone(),
+    };
+    let mut s = Session::connect(Box::new(b), c.clone()).expect("connect");
+    s.enable().expect("enable");
+    // The target is 0.02 rad past the jaw: a squeeze within 0.5 Nm / kp 20.
+    let mut go = GoTo::new(&c, s.positions());
+    let squeeze = s.positions()[6] - 0.02;
+    go.targets[6] = squeeze;
+    for _ in 0..5 {
+        s.tick(&mut go).expect("tick");
+    }
+    s.backend_as_sim().unwrap().inject_fault(3, 1 << 14);
+    for _ in 0..10 {
+        s.tick(&mut go).expect("tick");
+    }
+    assert!(matches!(
+        s.fault(),
+        Some(FaultReason::MotorFault { motor_id: 3, .. })
+    ));
+    let last = *sent.lock().unwrap().last().unwrap();
+    assert!(
+        (last - squeeze).abs() < 1e-3,
+        "the hold sent {last}, the squeeze was {squeeze}"
+    );
 }
