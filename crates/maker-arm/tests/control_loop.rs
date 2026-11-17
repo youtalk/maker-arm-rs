@@ -1024,3 +1024,64 @@ fn a_motor_that_restarts_mid_session_holds_the_arm_and_stays_off() {
     assert_eq!(sim.enables(2), 1);
     assert!([1, 3, 4, 5, 6, 7].iter().all(|&m| sim.enabled(m)));
 }
+
+/// A SimArm whose jaw is stopped by a held object: each gripper control
+/// frame reaches the motor at the jaw's own position, and the commanded
+/// position is logged.
+struct HeldObject {
+    sim: SimArm,
+    sent: Arc<Mutex<Vec<f64>>>,
+}
+
+impl CanBackend for HeldObject {
+    fn send(&mut self, id: u32, data: &[u8; 8]) -> Result<(), TransportError> {
+        if id == 7 && data[..6] != [0xFF; 6] {
+            let (pos, vel, kp, kd, tau) = mit::decode_control(data, &RS00).expect("control");
+            self.sent.lock().unwrap().push(pos);
+            let jaw = self.sim.position(7);
+            let f = mit::encode_control(7, jaw, vel, kp, kd, tau, &RS00).unwrap();
+            return self.sim.send(f.id, &f.data);
+        }
+        self.sim.send(id, data)
+    }
+
+    fn recv(&mut self, timeout: Duration) -> Result<Option<(u32, [u8; 8])>, TransportError> {
+        self.sim.recv(timeout)
+    }
+
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(&mut self.sim)
+    }
+}
+
+#[test]
+fn a_joint_fault_keeps_the_gripper_squeeze() {
+    let c = fast(ArmConfig::maker_arm_v1());
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let b = HeldObject {
+        sim: SimArm::new(&c),
+        sent: sent.clone(),
+    };
+    let mut s = Session::connect(Box::new(b), c.clone()).expect("connect");
+    s.enable().expect("enable");
+    // The target is 0.02 rad past the jaw: a squeeze within 0.5 Nm / kp 20.
+    let mut go = GoTo::new(&c, s.positions());
+    let squeeze = s.positions()[6] - 0.02;
+    go.targets[6] = squeeze;
+    for _ in 0..5 {
+        s.tick(&mut go).expect("tick");
+    }
+    s.backend_as_sim().unwrap().inject_fault(3, 1 << 14);
+    for _ in 0..10 {
+        s.tick(&mut go).expect("tick");
+    }
+    assert!(matches!(
+        s.fault(),
+        Some(FaultReason::MotorFault { motor_id: 3, .. })
+    ));
+    let last = *sent.lock().unwrap().last().unwrap();
+    assert!(
+        (last - squeeze).abs() < 1e-3,
+        "the hold sent {last}, the squeeze was {squeeze}"
+    );
+}

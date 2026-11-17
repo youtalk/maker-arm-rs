@@ -275,7 +275,15 @@ impl Session {
             return Ok(());
         }
         if self.config().hold_on_fault {
-            let mut hold = HoldController::from_config(self.config());
+            // Joints 1-6 hold the measured pose. The gripper keeps its last
+            // sent target, within `0.5 Nm / kp` of the jaw under serve, so
+            // a held object keeps its squeeze, as the vendor keeps its
+            // gripper regulation in a fault hold.
+            let mut targets: Vec<f64> = at.motors.iter().map(|m| m.position).collect();
+            if let Some((i, pos)) = self.grip_sent {
+                targets[i] = pos;
+            }
+            let hold = HoldController::with_targets(self.config(), targets);
             // The hold target is the pose the arm was measured at, but it
             // still goes through `clamp_command` like any other command,
             // and the clamp pulls it back inside `q_lo..q_hi`. A pose that
@@ -286,7 +294,6 @@ impl Session {
             // exactly here". Deliberate -- the clamp is the single
             // enforcement point and must not be bypassed on the fault
             // path -- but it is operator-visible motion during a fault.
-            hold.retarget_to_state(at);
             self.fault_hold = Some(hold);
             self.fault = Some(reason);
             self.set_state(SessionState::Fault);
@@ -493,6 +500,7 @@ impl Session {
     fn send_mit_all(&mut self, cmd: &[JointCommand]) -> Result<Option<String>, SessionError> {
         let gripper = self.config().gripper.map(|g| g.motor_id);
         let mut released = false;
+        let mut grip = None;
         let resend = self
             .release_sent
             .is_none_or(|t| t.elapsed() >= RELEASE_RESEND);
@@ -531,6 +539,9 @@ impl Session {
                 )));
             };
             frames.push(f);
+            if gripper == Some(j.motor_id) {
+                grip = Some((i, c.pos));
+            }
         }
         if released && resend {
             self.release_sent = Some(Instant::now());
@@ -544,6 +555,9 @@ impl Session {
                     std::hint::spin_loop();
                 }
             }
+        }
+        if grip.is_some() {
+            self.grip_sent = grip;
         }
         Ok(None)
     }

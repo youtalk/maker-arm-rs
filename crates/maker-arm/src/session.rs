@@ -236,6 +236,8 @@ pub struct Session {
     pub(crate) release_sent: Option<Instant>,
     /// When the current run of transport errors in `tick` began.
     pub(crate) failing_since: Option<Instant>,
+    /// The gripper's slot and the last target sent to it (joint rad).
+    pub(crate) grip_sent: Option<(usize, f64)>,
     /// The gripper's CAN_TIMEOUT from before enable, kept for the restore.
     watchdog_restore: Option<u32>,
 }
@@ -290,6 +292,7 @@ impl Session {
             fault_hold: None,
             release_sent: None,
             failing_since: None,
+            grip_sent: None,
             watchdog_restore: None,
         };
         let motor_ids: Vec<u8> = s.config.joints.iter().map(|j| j.motor_id).collect();
@@ -570,6 +573,7 @@ impl Session {
         self.fault_hold = None;
         self.release_sent = None;
         self.failing_since = None;
+        self.grip_sent = None;
         self.health = HealthMonitor::new(&self.config);
         for slot in &mut self.slots {
             slot.state.restarted = false;
