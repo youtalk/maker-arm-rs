@@ -22,9 +22,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: bring up vcan0
         run: |
-          # GitHub's Azure kernel ships vcan in linux-modules-extra, not the base image.
-          sudo apt-get update
-          sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+          # The kernel image may or may not ship vcan.ko in the base package.
+          uname -r
+          find /lib/modules/$(uname -r) -name 'vcan*'
+          apt-cache search linux-modules | head -20
           sudo modprobe vcan
           sudo ip link add dev vcan0 type vcan
           sudo ip link set up vcan0
