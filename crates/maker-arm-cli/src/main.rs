@@ -275,13 +275,28 @@ fn main() -> Result<(), String> {
         } => {
             let (start, mut wraps) = (std::time::Instant::now(), None);
             let mut out = std::io::stdout().lock();
+            // The fault word last shown per motor.
+            let mut shown = [0u32; 7];
             for n in 0.. {
                 if count.is_some_and(|c| n >= c) {
                     break;
                 }
                 let t = start.elapsed();
-                let q = maker_arm_cli::watch_sweep(backend.as_mut(), &config, &grip, &mut wraps)
-                    .map_err(|e| e.to_string())?;
+                let (q, faults) =
+                    maker_arm_cli::watch_sweep(backend.as_mut(), &config, &grip, &mut wraps)
+                        .map_err(|e| e.to_string())?;
+                // A faulted motor reads nan like an absent one: name its fault once.
+                for ((j, &w), s) in config.joints.iter().zip(&faults).zip(&mut shown) {
+                    if w != 0 && w != *s {
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "motor {} reports a fault: {}",
+                            j.motor_id,
+                            fault(w)
+                        );
+                    }
+                    *s = w;
+                }
                 let vals: Vec<String> = q.iter().map(|v| v.to_string().to_lowercase()).collect();
                 // A closed stdout ends the watch.
                 if writeln!(out, "WATCH {:.3} {}", t.as_secs_f64(), vals.join(" ")).is_err() {

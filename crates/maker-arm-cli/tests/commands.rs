@@ -543,8 +543,8 @@ fn watch_applies_the_profile_direction() {
     // The same motors, read through the identity and through the flipped J5.
     let mut sim = SimArm::new(&c);
     let grip = GripMap::provisional();
-    let plain = watch_sweep(&mut sim, &c, &grip, &mut None).unwrap();
-    let flip = watch_sweep(&mut sim, &flipped, &grip, &mut None).unwrap();
+    let (plain, _) = watch_sweep(&mut sim, &c, &grip, &mut None).unwrap();
+    let (flip, _) = watch_sweep(&mut sim, &flipped, &grip, &mut None).unwrap();
     assert!((flip[4] + plain[4]).abs() < 1e-9, "{flip:?} {plain:?}");
     assert_eq!(flip[3], plain[3]);
 }
@@ -555,10 +555,21 @@ fn watch_never_enables() {
     let mut sim = SimArm::new(&c);
     let mut wraps = None;
     for _ in 0..3 {
-        let q = watch_sweep(&mut sim, &c, &GripMap::provisional(), &mut wraps).unwrap();
+        let (q, _) = watch_sweep(&mut sim, &c, &GripMap::provisional(), &mut wraps).unwrap();
         assert!(q.iter().all(|x| x.is_finite()));
     }
     for j in &c.joints {
         assert_eq!(sim.enables(j.motor_id), 0);
     }
+}
+
+#[test]
+fn watch_reports_the_fault_word_of_a_faulted_motor() {
+    let c = ArmConfig::maker_arm_v1();
+    let mut sim = SimArm::new(&c);
+    sim.inject_fault(3, 1 << 14);
+    let (q, faults) = watch_sweep(&mut sim, &c, &GripMap::provisional(), &mut None).unwrap();
+    // A faulted motor gets no state read, so it reads nan like an absent one.
+    assert!(q[2].is_nan());
+    assert_eq!(faults, [0, 0, 1 << 14, 0, 0, 0, 0]);
 }

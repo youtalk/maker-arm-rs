@@ -148,15 +148,19 @@ pub fn scan(
 /// a motor that gives no state. It probes like `scan`, so it never enables or commands a motor
 /// and never clears a reported fault. The first sweep that hears all six joints picks each
 /// joint's 2-pi wrap like `Session::connect` does and `wraps` keeps it for the later sweeps.
+/// Each motor's fault word comes back too, 0 for a clean or absent motor: a faulted motor reads
+/// NaN like an absent one.
 pub fn watch_sweep(
     backend: &mut dyn CanBackend,
     config: &ArmConfig,
     grip: &files::GripMap,
     wraps: &mut Option<[f64; 6]>,
-) -> Result<[f64; 7], TransportError> {
-    let mut raw = [f64::NAN; 7];
-    for (r, j) in raw.iter_mut().zip(&config.joints) {
-        if let Some(fb) = probe_one(backend, j)?.and_then(|pr| pr.feedback) {
+) -> Result<([f64; 7], [u32; 7]), TransportError> {
+    let (mut raw, mut faults) = ([f64::NAN; 7], [0; 7]);
+    for ((r, w), j) in raw.iter_mut().zip(&mut faults).zip(&config.joints) {
+        let probe = probe_one(backend, j)?;
+        *w = probe.as_ref().map_or(0, |pr| pr.fault_word);
+        if let Some(fb) = probe.and_then(|pr| pr.feedback) {
             *r = fb.position;
         }
     }
@@ -183,7 +187,7 @@ pub fn watch_sweep(
         q[i] = config.joints[i].to_joint(raw[i] + chosen[i]);
     }
     q[6] = grip.to_joint_m(config.joints[6].to_joint(raw[6]));
-    Ok(q)
+    Ok((q, faults))
 }
 
 #[derive(Debug, Clone)]
