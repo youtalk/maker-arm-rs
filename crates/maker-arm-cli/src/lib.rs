@@ -5,47 +5,117 @@ pub mod export;
 pub mod files;
 pub mod wire;
 
-use maker_arm::{ArmConfig, JointConfig};
-use maker_arm_protocol as p;
+use maker_arm::{ArmConfig, JointConfig, MotorModel};
+use maker_arm_protocol::{self as p, mit};
 use maker_arm_transport::{CanBackend, TransportError};
 use std::time::{Duration, Instant};
 
-const PROBE_TIMEOUT: Duration = Duration::from_millis(50);
+// The session's timing, which is the vendor's: tries, and the wait for each.
+const REPLY: (u32, Duration) = (3, Duration::from_millis(50));
+const PARAM: (u32, Duration) = (2, Duration::from_millis(120));
 
 #[derive(Debug, Clone)]
 pub struct ScanRow {
     pub motor_id: u8,
     pub name: String,
     pub model: String,
+    /// The motor answered the fault query.
     pub present: bool,
+    /// NaN without a state read (an absent or faulted motor), as is `temperature`.
     pub joint_pos: f64,
     pub mode: u8,
     pub temperature: f64,
-    pub fault_bits: u8,
+    pub fault_word: u32,
+    /// The firmware answers parameter reads (a `RUN_MODE` read).
+    pub params: bool,
 }
 
-/// Read-only probe of one motor: disable frame → one feedback frame (the
-/// RobStride probing convention; harmless while torque is off).
-fn probe_one(
+/// Sends `f` up to `tries` times and waits `timeout` each time for the first reply, decoded
+/// with `params`, that `pick` accepts. Frames already queued are dropped before each send.
+fn ask<T>(
     backend: &mut dyn CanBackend,
-    j: &JointConfig,
-    host_id: u8,
-) -> Result<Option<p::MotorFeedback>, TransportError> {
-    let f = p::encode_disable(j.motor_id, false, host_id);
-    backend.send(f.id, &f.data)?;
-    let deadline = Instant::now() + PROBE_TIMEOUT;
-    while Instant::now() < deadline {
-        if let Some((id, data)) = backend.recv(Duration::from_millis(2))? {
-            if ((id >> 8) & 0xFF) as u8 != j.motor_id {
-                continue; // stale frame from an earlier probe
-            }
-            if let Some(p::ParsedFrame::Feedback(fb)) = p::parse_frame(id, &data, j.model.params())
-            {
-                return Ok(Some(fb));
+    f: p::Frame,
+    (tries, timeout): (u32, Duration),
+    params: &p::MotorParams,
+    pick: impl Fn(mit::Parsed) -> Option<T>,
+) -> Result<Option<T>, TransportError> {
+    for _ in 0..tries {
+        while backend.recv(Duration::ZERO)?.is_some() {}
+        backend.send(f.id, &f.data)?;
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if let Some((id, data)) = backend.recv(Duration::from_millis(2))? {
+                if let Some(x) = mit::parse_frame(id, &data, params).and_then(&pick) {
+                    return Ok(Some(x));
+                }
             }
         }
     }
     Ok(None)
+}
+
+/// What one motor answered.
+struct Probe {
+    fault_word: u32,
+    /// The state read, sent only after a clean fault query.
+    feedback: Option<mit::Feedback>,
+}
+
+/// The session's probe order: a non-clearing fault query, then the clearing state read only
+/// after a clean answer, so a reported fault is never erased. Torque is never touched.
+/// `None` when the motor does not answer the fault query.
+fn probe_one(
+    backend: &mut dyn CanBackend,
+    j: &JointConfig,
+) -> Result<Option<Probe>, TransportError> {
+    let (m, params) = (j.motor_id, j.model.params());
+    let word = ask(
+        backend,
+        mit::encode_fault_query(m),
+        REPLY,
+        params,
+        |r| match r {
+            mit::Parsed::Fault(s) if s.motor_id == m => Some(s.word),
+            _ => None,
+        },
+    )?;
+    let Some(fault_word) = word else {
+        return Ok(None);
+    };
+    let feedback = if fault_word == 0 {
+        ask(
+            backend,
+            mit::encode_clear_fault(m),
+            REPLY,
+            params,
+            |r| match r {
+                mit::Parsed::Feedback(fb) if fb.motor_id == m => Some(fb),
+                _ => None,
+            },
+        )?
+    } else {
+        None
+    };
+    Ok(Some(Probe {
+        fault_word,
+        feedback,
+    }))
+}
+
+/// The MIT parameter read. `None` when no reply comes: the firmware has no parameter access.
+fn read_param(
+    backend: &mut dyn CanBackend,
+    motor_id: u8,
+    index: u16,
+) -> Result<Option<[u8; 4]>, TransportError> {
+    let f = mit::encode_read_param(motor_id, index);
+    // Parameter replies decode the same for every model.
+    ask(backend, f, PARAM, &p::RS00, |r| match r {
+        mit::Parsed::Param(r) if !r.write && r.motor_id == motor_id && r.index == index => {
+            Some(r.raw)
+        }
+        _ => None,
+    })
 }
 
 pub fn scan(
@@ -54,28 +124,20 @@ pub fn scan(
 ) -> Result<Vec<ScanRow>, TransportError> {
     let mut rows = Vec::new();
     for j in &config.joints {
-        let fb = probe_one(backend, j, config.host_id)?;
-        rows.push(match fb {
-            Some(fb) => ScanRow {
-                motor_id: j.motor_id,
-                name: j.name.to_string(),
-                model: j.model.name().to_string(),
-                present: true,
-                joint_pos: j.to_joint(fb.position),
-                mode: fb.mode,
-                temperature: fb.temperature,
-                fault_bits: fb.fault_bits,
-            },
-            None => ScanRow {
-                motor_id: j.motor_id,
-                name: j.name.to_string(),
-                model: j.model.name().to_string(),
-                present: false,
-                joint_pos: f64::NAN,
-                mode: 0,
-                temperature: f64::NAN,
-                fault_bits: 0,
-            },
+        let probe = probe_one(backend, j)?;
+        let params =
+            probe.is_some() && read_param(backend, j.motor_id, p::param_index::RUN_MODE)?.is_some();
+        let fb = probe.as_ref().and_then(|pr| pr.feedback);
+        rows.push(ScanRow {
+            motor_id: j.motor_id,
+            name: j.name.to_string(),
+            model: j.model.name().to_string(),
+            present: probe.is_some(),
+            joint_pos: fb.map_or(f64::NAN, |fb| j.to_joint(fb.position)),
+            mode: fb.map_or(0, |fb| fb.mode),
+            temperature: fb.map_or(f64::NAN, |fb| fb.temperature),
+            fault_word: probe.map_or(0, |pr| pr.fault_word),
+            params,
         });
     }
     Ok(rows)
@@ -91,7 +153,8 @@ pub struct DoctorRow {
     pub can_timeout: Option<u32>,
     pub vbus: Option<f32>,
     pub temperature: f64,
-    pub fault_bits: u8,
+    pub fault_word: u32,
+    pub params: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -100,28 +163,19 @@ pub struct DoctorReport {
     pub warnings: Vec<String>,
 }
 
-fn read_param(
-    backend: &mut dyn CanBackend,
-    motor_id: u8,
-    index: u16,
-    host_id: u8,
-) -> Result<Option<[u8; 4]>, TransportError> {
-    let f = p::encode_read_param(motor_id, index, host_id);
-    backend.send(f.id, &f.data)?;
-    let deadline = Instant::now() + PROBE_TIMEOUT;
-    while Instant::now() < deadline {
-        if let Some((id, data)) = backend.recv(Duration::from_millis(2))? {
-            // `parse_frame`'s ParamReply branch ignores `params` entirely
-            // (only the Feedback branch is model-dependent), so `&p::RS00`
-            // here is a deliberate placeholder, not a model mismatch bug.
-            if let Some(p::ParsedFrame::ParamReply(r)) = p::parse_frame(id, &data, &p::RS00) {
-                if r.motor_id == motor_id && r.index == index {
-                    return Ok(Some(r.raw));
-                }
-            }
-        }
+impl DoctorReport {
+    /// Every motor is present, in limits and fault-free.
+    pub fn passed(&self) -> bool {
+        self.rows
+            .iter()
+            .all(|r| r.present && r.in_limits && r.fault_word == 0)
     }
-    Ok(None)
+}
+
+/// "motors 2, 3" for the rows of motors 2 and 3.
+fn motor_list(rows: &[&DoctorRow]) -> String {
+    let ids: Vec<String> = rows.iter().map(|r| r.motor_id.to_string()).collect();
+    format!("motors {}", ids.join(", "))
 }
 
 pub fn doctor(
@@ -131,24 +185,12 @@ pub fn doctor(
     let scan_rows = scan(backend, config)?;
     let mut rows = Vec::new();
     for (row, j) in scan_rows.iter().zip(&config.joints) {
-        let (run_mode, can_timeout, vbus) = if row.present {
+        let (run_mode, can_timeout, vbus) = if row.params {
             (
-                read_param(
-                    backend,
-                    j.motor_id,
-                    p::param_index::RUN_MODE,
-                    config.host_id,
-                )?
-                .map(|raw| raw[0]),
-                read_param(
-                    backend,
-                    j.motor_id,
-                    p::param_index::CAN_TIMEOUT,
-                    config.host_id,
-                )?
-                .map(u32::from_le_bytes),
-                read_param(backend, j.motor_id, p::param_index::VBUS, config.host_id)?
-                    .map(f32::from_le_bytes),
+                read_param(backend, j.motor_id, p::param_index::RUN_MODE)?.map(|raw| raw[0]),
+                read_param(backend, j.motor_id, p::param_index::CAN_TIMEOUT)?
+                    .map(u32::from_le_bytes),
+                read_param(backend, j.motor_id, p::param_index::VBUS)?.map(f32::from_le_bytes),
             )
         } else {
             (None, None, None)
@@ -175,19 +217,40 @@ pub fn doctor(
             can_timeout,
             vbus,
             temperature: row.temperature,
-            fault_bits: row.fault_bits,
+            fault_word: row.fault_word,
+            params: row.params,
         });
     }
-    let warnings = vec![
-        "RS02 firmware <= 0.2.2.11 maps position to +/-12.5 rad (this SDK assumes \
-         +/-12.57). No READ_VERSION frame is pinnable yet (the official SDK ships \
-         none) -- verify motors 2 and 3 with the vendor tool BEFORE first motion (MA1)."
-            .to_string(),
-    ];
+    let mut warnings = Vec::new();
+    let no_params: Vec<&DoctorRow> = rows.iter().filter(|r| r.present && !r.params).collect();
+    let rs02: Vec<&DoctorRow> = no_params
+        .iter()
+        .copied()
+        .filter(|r| {
+            config
+                .joint_by_motor_id(r.motor_id)
+                .is_some_and(|j| j.model == MotorModel::Rs02)
+        })
+        .collect();
+    if !rs02.is_empty() {
+        warnings.push(format!(
+            "{} (RS02): no parameter access, so the firmware may be older than 0.2.3.32 and \
+             the position range is unknown (+/-12.5 or +/-12.57 rad). Check the firmware with \
+             the vendor tool before the first motion.",
+            motor_list(&rs02)
+        ));
+    }
+    if !no_params.is_empty() {
+        warnings.push(format!(
+            "{}: no parameter access, so no motor watchdog and no RUN_MODE or mode check.",
+            motor_list(&no_params)
+        ));
+    }
     Ok(DoctorReport { rows, warnings })
 }
 
-/// Zeroes one motor (torque-free operation) and re-probes to confirm.
+/// Zeroes one motor (torque-free operation) and re-probes to confirm. A motor that does not
+/// answer or reports a fault is not zeroed.
 pub fn zero_motor(
     backend: &mut dyn CanBackend,
     config: &ArmConfig,
@@ -195,16 +258,23 @@ pub fn zero_motor(
 ) -> Result<f64, String> {
     let j = config
         .joint_by_motor_id(motor_id)
-        .ok_or_else(|| format!("unknown motor id {motor_id}"))?
-        .clone();
-    let f = p::encode_set_zero(motor_id, config.host_id);
+        .ok_or_else(|| format!("unknown motor id {motor_id}"))?;
+    let probe = |backend: &mut dyn CanBackend| match probe_one(backend, j) {
+        Err(e) => Err(e.to_string()),
+        Ok(None) => Err(format!("motor {motor_id} did not answer")),
+        Ok(Some(pr)) if pr.fault_word != 0 => Err(format!(
+            "motor {motor_id} reports a fault: {}",
+            mit::fault_text(pr.fault_word)
+        )),
+        Ok(Some(pr)) => pr
+            .feedback
+            .map(|fb| j.to_joint(fb.position))
+            .ok_or_else(|| format!("motor {motor_id} did not answer the state read")),
+    };
+    probe(backend)?;
+    let f = mit::encode_set_zero(motor_id);
     backend.send(f.id, &f.data).map_err(|e| e.to_string())?;
-    // consume the set-zero feedback, then probe for a fresh reading
-    let _ = probe_one(backend, &j, config.host_id).map_err(|e| e.to_string())?;
-    match probe_one(backend, &j, config.host_id).map_err(|e| e.to_string())? {
-        Some(fb) => Ok(j.to_joint(fb.position)),
-        None => Err(format!("motor {motor_id} did not answer after set-zero")),
-    }
+    probe(backend)
 }
 
 /// The typed-RELEASE gate, mirroring the official SDK's cli/safety.py:

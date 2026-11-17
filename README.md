@@ -1,29 +1,33 @@
 # maker-arm-rs
 
 Rust SDK for the MakerMods Maker Arm (RobStride QDD actuators over CAN),
-with Python bindings. The protocol layer is a Rust port of the official
+with Python bindings. The motors use the RobStride MIT protocol: standard
+11-bit CAN ids at 1 Mbit/s. This code follows the vendor SDK
 [maker-arm-sdk](https://github.com/makermods-robotics/maker-arm-sdk)
-(Apache-2.0): it mirrors that project's frame layout, and its golden vectors
-are values copied from upstream's test suite, so the two agree byte for byte.
-See [NOTICE](NOTICE) for the attribution details.
+(Apache-2.0) at commit `0245316`. The protocol layer is a Rust port of its
+`maker_arm/protocol.py`. Its golden vectors come from that commit, so the two
+agree byte for byte. See [NOTICE](NOTICE) for the attribution details.
 
-- `crates/maker-arm-protocol` — pure encode/decode of the RobStride private
-  CAN protocol; ported from `maker_arm/protocol.py`.
-- `crates/maker-arm-transport` — `CanBackend` trait: mock, candump-log replay,
-  and SocketCAN (feature `socketcan`).
-- `bindings/maker-arm-py` — PyO3 bindings, Python module `maker_arm_rs`:
-  protocol-level `encode_mit`/`parse_frame`, plus the orchestration-mode
-  `Arm` class (connect, enable, hold, snapshot, stop) described below.
-- `crates/maker-arm` — arm session layer: the pinned `maker_arm_v1` profile,
-  single-point command clamp, `Controller` trait, health monitoring with
+- `crates/maker-arm-protocol`: pure encode and decode of the RobStride MIT
+  protocol, ported from `maker_arm/protocol.py`.
+- `crates/maker-arm-transport`: the `CanBackend` trait, with a mock,
+  candump-log replay and SocketCAN (feature `socketcan`).
+- `bindings/maker-arm-py`: PyO3 bindings, Python module `maker_arm_rs`. It has
+  the protocol-level `encode_control` and `parse_frame`, and the
+  orchestration-mode `Arm` class (connect, enable, hold, snapshot, stop)
+  described below.
+- `crates/maker-arm`: the arm session layer, with the pinned `maker_arm_v1`
+  profile, single-point command clamp, `Controller` trait, health monitoring with
   hold-on-fault, 200 Hz control loop, and `SimArm`, an in-memory 7-motor
   simulator for hardware-free development.
   Its `kinematics` module is the six-joint grasp-pose solver the lab's planner
   uses (forward kinematics over a caller-supplied URDF chain, central-difference
   Jacobian, Levenberg-Marquardt refine, multi-seed branch selection, and
   continuity-constrained paths), exposed to Python as `maker_arm_rs.Kinematics`.
-- `crates/maker-arm-cli` — `scan`, `doctor`, `zero`, and `hold` (typed-RELEASE
-  safety gate), against `--can <iface>` or `--sim`.
+- `crates/maker-arm-cli`: `scan`, `doctor`, `zero`, and `hold` (typed-RELEASE
+  safety gate), against `--can <iface>` or `--sim`. No command clears a motor
+  fault. To clear one, fix the cause, then press and release the emergency
+  stop, or run the vendor `maker-arm scan --clear-faults`.
 
 Status: MA1 prep (hardware-independent session layer) complete. **No physical
 arm has ever been driven by this code** — everything here is exercised against
@@ -113,7 +117,7 @@ Hold rules:
 
 - On a real interface, after `SERVE_READY`, the daemon does not disable the motors by itself. It holds the arm when the client leaves, on SIGINT and SIGTERM, and on a fault.
 - Before `SERVE_READY`, a start-up failure can disable the motors that the daemon just enabled. The arm can then drop.
-- If the control loop stops, or the daemon process is killed, nothing commands the motors. Each motor then falls back to its own CAN timeout watchdog, and the arm can drop.
+- If the control loop stops, or the daemon process is killed, nothing commands the motors. Each motor keeps its last command. Only a gripper whose firmware has parameter access has a watchdog. To stop the motors, support the arm and press the emergency stop.
 - After `SERVE_READY`, only `release` disables the motors. It asks you to type `RELEASE`. Until you do, the arm holds. Release the torque only when the arm is supported.
 - While the daemon runs, `scan`, `doctor`, `zero`, `hold` and the Python binding refuse to open the same interface. Each one names the bus lock `maker-arm-bus-<interface>`.
 - On `sim` or `vcan`, the daemon ends with its command client. Pass `--persist` to keep it running.
@@ -124,14 +128,15 @@ Hold rules:
 ```python
 import maker_arm_rs as m
 
-# MIT command: motor 1, pos/vel/tau 0, kp 10, kd 1.0 -> (0x1800001, b'\x80\x00\x80\x00\x05\x1f33')
-can_id, data = m.encode_mit(1, 0.0, 0.0, 10.0, 1.0, 0.0, "RS00")
-fb = m.parse_frame(0x028001FD, bytes.fromhex("8000800080000159"), "RS00")
-print(fb["kind"], fb["motor_id"], fb["temperature"])  # feedback 1 34.5
+# MIT control frame: motor 1, pos 1.0, vel 0, kp 60, kd 4, tau 0.5
+can_id, data = m.encode_control(1, 1.0, 0.0, 60.0, 4.0, 0.5, "RS00")
+print(can_id, data.hex())  # 1 8a2e8001ebccc849
+fb = m.parse_frame(0xFD, bytes.fromhex("01BE907FD7FF00F0"), "RS00")
+print(fb["kind"], fb["motor_id"], fb["temperature"])  # feedback 1 24.0
 ```
 
-The same functions in Rust are `maker_arm_protocol::{encode_mit, parse_frame}`;
-put the frames on a bus with `maker_arm_transport::SocketCanBackend::open("can0")`
+The same functions in Rust are `maker_arm_protocol::mit::{encode_control, parse_frame}`.
+Put the frames on a bus with `maker_arm_transport::SocketCanBackend::open("can0")`
 and its `CanBackend::{send, recv}`.
 
 That raw pairing is for frame-level work and tests only — it bypasses the
@@ -161,7 +166,7 @@ arm.stop()  # disable and join; also aliased as arm.estop()
 
 ## Profile and clamp from Python
 
-`maker_arm_rs.profile()` returns the pinned `maker_arm_v1` profile as a dict (7 joints: limits, gains, torque caps, direction/offset). `maker_arm_rs.clamp_command(cmds, profile)` applies the crate's single-point clamp to a list of 7 `(pos, vel, kp, kd, tau)` tuples and returns `(clamped_cmds, changed)`. The dict's numeric fields may be edited before the call (a simulator passes URDF joint limits this way); names, models, and motor ids are never read from Python. The control loop's own command path always runs commands through this clamp before they reach a motor; `encode_mit` is a separate low-level protocol encoder exposed for tests and tooling and is not itself clamped.
+`maker_arm_rs.profile()` returns the pinned `maker_arm_v1` profile as a dict (7 joints: limits, gains, torque caps, direction/offset). `maker_arm_rs.clamp_command(cmds, profile)` applies the crate's single-point clamp to a list of 7 `(pos, vel, kp, kd, tau)` tuples and returns `(clamped_cmds, changed)`. The dict's numeric fields may be edited before the call (a simulator passes URDF joint limits this way). Names, models, and motor ids are never read from Python. The control loop's own command path always runs commands through this clamp before they reach a motor. `encode_control` is a separate low-level protocol encoder for tests and tooling, and it is not clamped.
 
 Joint-coordinate contract: joint coordinates are the vendor URDF's
 (`maker-arm-sdk/urdf/maker_arm/robot.urdf` @ b30d05a), `link_002_joint`..`link_007_joint`

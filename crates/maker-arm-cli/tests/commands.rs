@@ -1,8 +1,34 @@
 use maker_arm::{ArmConfig, SimArm};
 use maker_arm_cli::{confirm_release, doctor, scan, zero_motor};
 use std::io::{Cursor, Write};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+const BIN: &str = env!("CARGO_BIN_EXE_maker-arm-cli");
+
+/// Runs `maker-arm-cli --sim <args>` with `stdin` typed in: its exit code and stdout.
+fn sim_cli(args: &[&str], stdin: &str) -> (Option<i32>, String) {
+    let mut child = Command::new(BIN)
+        .arg("--sim")
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
 
 #[test]
 fn scan_reports_all_seven_and_flags_a_missing_motor() {
@@ -34,17 +60,86 @@ fn doctor_reads_params_and_checks_limits() {
     assert!(r1.present && r1.in_limits);
     assert_eq!(r1.run_mode, Some(0));
     assert_eq!(r1.vbus, Some(24.0));
+    assert!(r1.params);
     let r4 = &report.rows[3];
     assert!(r4.present && !r4.in_limits);
-    // The RS02 firmware trap must be surfaced, not silently omitted:
-    // the official SDK ships no READ_VERSION, so doctor cannot check it.
+    assert!(!report.passed());
+    // Parameter access on every motor: nothing to warn about.
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+}
+
+#[test]
+fn scan_shows_parameter_access_and_fault_text() {
+    let c = ArmConfig::maker_arm_v1();
+    for r in scan(&mut SimArm::new(&c), &c).expect("scan") {
+        assert!(r.present && r.params, "motor {}", r.motor_id);
+        assert_eq!(r.fault_word, 0);
+    }
+    let (code, out) = sim_cli(&["scan"], "");
+    assert_eq!(code, Some(0), "{out}");
+    let rows: Vec<&str> = out.lines().skip(1).collect();
+    assert_eq!(rows.len(), 7, "{out}");
+    for row in rows {
+        let cols: Vec<&str> = row.split_whitespace().collect();
+        // present and params, then the decoded fault word
+        assert_eq!((cols[3], cols[7]), ("true", "true"), "{row}");
+        assert!(row.ends_with("no fault"), "{row}");
+    }
+}
+
+#[test]
+fn doctor_warns_about_rs02_range_without_parameter_access() {
+    let c = ArmConfig::maker_arm_v1();
+    let mut sim = SimArm::new(&c);
+    sim.set_params_supported(false);
+    let report = doctor(&mut sim, &c).expect("doctor");
+    for r in &report.rows {
+        assert!(r.present && !r.params, "motor {}", r.motor_id);
+        assert_eq!((r.run_mode, r.can_timeout, r.vbus), (None, None, None));
+    }
+    let rs02 = report
+        .warnings
+        .iter()
+        .find(|w| w.contains("RS02"))
+        .expect("an RS02 warning");
+    assert!(
+        rs02.contains("motors 2, 3") && rs02.contains("no parameter access"),
+        "{rs02}"
+    );
     assert!(
         report
             .warnings
             .iter()
-            .any(|w| w.contains("RS02") && w.contains("firmware")),
-        "warnings: {:?}",
+            .any(|w| w.contains("motors 1, 2, 3, 4, 5, 6, 7") && w.contains("watchdog")),
+        "{:?}",
         report.warnings
+    );
+    // Missing parameter access is a warning, not a failure.
+    assert!(report.passed());
+}
+
+#[test]
+fn doctor_fails_on_a_reported_fault() {
+    let c = ArmConfig::maker_arm_v1();
+    let mut sim = SimArm::new(&c);
+    assert!(doctor(&mut sim, &c).expect("doctor").passed());
+    sim.inject_fault(4, 1 << 9);
+    let report = doctor(&mut sim, &c).expect("doctor");
+    assert!(!report.passed());
+    let r = &report.rows[3];
+    assert!(r.present);
+    assert_eq!(r.fault_word, 1 << 9);
+    // No clearing frame went to the faulted motor: the fault is still there.
+    assert_eq!(scan(&mut sim, &c).expect("scan")[3].fault_word, 1 << 9);
+}
+
+#[test]
+fn zero_prompt_names_the_vendor_pose() {
+    let (code, out) = sim_cli(&["zero", "--motor", "5"], "no\n");
+    assert_eq!(code, Some(1), "{out}");
+    assert!(
+        out.contains("folded against the base, gripper fully closed"),
+        "{out}"
     );
 }
 
@@ -70,7 +165,7 @@ fn doctor_reports_absent_motor_as_not_in_limits_with_no_params() {
 }
 
 #[test]
-fn scan_and_doctor_report_fault_bits_and_temperature_on_the_right_rows() {
+fn scan_and_doctor_report_fault_word_and_temperature_on_the_right_rows() {
     let c = ArmConfig::maker_arm_v1();
     let mut sim = SimArm::new(&c);
     sim.inject_fault(2, 0x21);
@@ -78,15 +173,17 @@ fn scan_and_doctor_report_fault_bits_and_temperature_on_the_right_rows() {
 
     let rows = scan(&mut sim, &c).expect("scan");
     let faulted = rows.iter().find(|r| r.motor_id == 2).unwrap();
-    assert_eq!(faulted.fault_bits, 0x21);
-    assert!((faulted.temperature - 35.0).abs() < 1e-9); // unaffected motor stays at sim default
+    assert!(faulted.present);
+    assert_eq!(faulted.fault_word, 0x21);
+    // A faulted motor gets no state read, so it has no position or temperature.
+    assert!(faulted.joint_pos.is_nan() && faulted.temperature.is_nan());
     let hot = rows.iter().find(|r| r.motor_id == 5).unwrap();
     assert!((hot.temperature - 71.5).abs() < 1e-9);
-    assert_eq!(hot.fault_bits, 0); // unaffected motor stays clean
+    assert_eq!(hot.fault_word, 0); // unaffected motor stays clean
 
     let report = doctor(&mut sim, &c).expect("doctor");
     let faulted = report.rows.iter().find(|r| r.motor_id == 2).unwrap();
-    assert_eq!(faulted.fault_bits, 0x21);
+    assert_eq!(faulted.fault_word, 0x21);
     let hot = report.rows.iter().find(|r| r.motor_id == 5).unwrap();
     assert!((hot.temperature - 71.5).abs() < 1e-9);
 }
@@ -106,6 +203,17 @@ fn zero_motor_zeroes_and_reports() {
     // which runs later and would refuse to energize this joint at 0.0
     // rad). So this assertion is about what set-zero actually did to the
     // register, not a claim that 0.0 rad is a safe or reachable pose here.
+}
+
+#[test]
+fn zero_motor_refuses_a_faulted_motor() {
+    let c = ArmConfig::maker_arm_v1();
+    let mut sim = SimArm::new(&c);
+    sim.set_position(5, 2.0);
+    sim.inject_fault(5, 1 << 7);
+    let e = zero_motor(&mut sim, &c, 5).unwrap_err();
+    assert!(e.contains("encoder uncalibrated"), "{e}");
+    assert_eq!(sim.position(5), 2.0);
 }
 
 #[test]

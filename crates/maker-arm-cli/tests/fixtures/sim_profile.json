@@ -87,7 +87,7 @@
   ],
   "control_rate_hz": 200.0,
   "max_velocity": 5.0,
-  "feedback_timeout": 0.2,
+  "feedback_timeout": 0.25,
   "limit_margin": 0.0,
   "kp_max": 200.0,
   "kd_max": 5.0,

@@ -113,6 +113,8 @@ fn fault_code(f: &FaultReason) -> u32 {
         FaultReason::ModeNotMotor { .. } => 2,
         FaultReason::OverTemperature { .. } => 3,
         FaultReason::BadCommand { .. } => 4,
+        FaultReason::FaultReplyTimeout { .. } => 5,
+        FaultReason::Warning { .. } => 6,
     }
 }
 
@@ -285,8 +287,8 @@ impl Daemon {
         let _ = std::fs::remove_file(&self.socket);
         if let Some(e) = failed {
             log(&format!(
-                "release failed: disable: {e}. The motors may keep their last command until \
-                 their CAN timeout. Support the arm."
+                "release failed: disable: {e}. The motors may keep their last command. \
+                 Support the arm."
             ));
             say("SERVE_EXIT release failed");
             std::process::exit(1);
@@ -544,11 +546,11 @@ pub fn run(o: &ServeOptions, check: bool) -> Result<(), String> {
         _ => {}
     }
     // Ctrl-C must hold, never release. Without the handler, a signal kills the process and
-    // the motors' own CAN_TIMEOUT watchdog is the only backstop.
+    // the motors keep their last command.
     if let Err(e) = ctrlc::set_handler(|| SIGNALED.store(true, Ordering::Relaxed)) {
         log(&format!(
             "WARNING: no SIGINT/SIGTERM handler ({e}); a signal kills the daemon and leaves \
-             the motors to their CAN_TIMEOUT watchdog"
+             the motors on their last command"
         ));
     }
     let mut session = Session::connect(open(&o.interface, &config)?, config.clone())
@@ -646,8 +648,8 @@ pub fn run(o: &ServeOptions, check: bool) -> Result<(), String> {
                 let why = st.arm.as_ref().and_then(|a| a.snapshot()?.fault);
                 log(&match why {
                     Some(f) => format!("FAULT: {f}; holding the measured pose"),
-                    None => "FAULT: the control loop stopped; the motors' CAN_TIMEOUT \
-                             watchdog takes over"
+                    None => "FAULT: the control loop stopped; the motors keep their last \
+                             command"
                         .into(),
                 });
             }
@@ -675,6 +677,23 @@ mod tests {
         let ctrl = TrackingController::new(model, TrackingParams::default(), &c, None).unwrap();
         let shared = ctrl.shared();
         (s.start(Box::new(ctrl), None).unwrap(), shared)
+    }
+
+    #[test]
+    fn the_new_fault_reasons_have_their_own_codes() {
+        let age = 1.0;
+        assert_eq!(
+            fault_code(&FaultReason::FaultReplyTimeout { motor_id: 7, age }),
+            6
+        );
+        assert_eq!(fault_code(&FaultReason::Warning { motor_id: 7 }), 7);
+        // The existing codes are unchanged.
+        assert_eq!(
+            fault_code(&FaultReason::FeedbackTimeout { motor_id: 1, age }),
+            1
+        );
+        let detail = String::new();
+        assert_eq!(fault_code(&FaultReason::BadCommand { detail }), 5);
     }
 
     #[test]

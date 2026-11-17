@@ -13,7 +13,7 @@ mod tracking;
 use maker_arm::state::JointCommand;
 use maker_arm::{ArmConfig, HoldController, RunningArm, Session, SessionState, SimArm};
 use maker_arm::{Controller, LoopRt};
-use maker_arm_protocol as p;
+use maker_arm_protocol::{self as p, mit};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
@@ -24,12 +24,12 @@ fn params(model: &str) -> PyResult<&'static p::MotorParams> {
 }
 
 // The `py` token pushes the arity to 8; the remaining 7 mirror
-// `maker_arm_protocol::encode_mit` and the brief's documented Python
-// signature `encode_mit(motor_id, pos, vel, kp, kd, tau, model)`, so
+// `maker_arm_protocol::mit::encode_control` and the documented Python
+// signature `encode_control(motor_id, pos, vel, kp, kd, tau, model)`, so
 // grouping them into a struct would change the public binding API.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-fn encode_mit(
+fn encode_control(
     py: Python<'_>,
     motor_id: u8,
     pos: f64,
@@ -39,10 +39,15 @@ fn encode_mit(
     tau: f64,
     model: &str,
 ) -> PyResult<(u32, Py<PyBytes>)> {
-    let f = p::encode_mit(motor_id, pos, vel, kp, kd, tau, params(model)?);
+    let f =
+        mit::encode_control(motor_id, pos, vel, kp, kd, tau, params(model)?).ok_or_else(|| {
+            PyValueError::new_err("refused: a non-finite input, or bytes 0 to 5 all FF (a command)")
+        })?;
     Ok((f.id, PyBytes::new(py, &f.data).into()))
 }
 
+/// One received MIT frame as a dict with `kind` "feedback", "fault" or "param_reply", or None
+/// for any other frame. `data` up to 8 bytes is zero-padded, as the transport pads it.
 #[pyfunction]
 fn parse_frame(
     py: Python<'_>,
@@ -50,13 +55,17 @@ fn parse_frame(
     data: &[u8],
     model: &str,
 ) -> PyResult<Option<Py<PyDict>>> {
-    let parsed = match p::parse_frame(can_id, data, params(model)?) {
-        Some(x) => x,
-        None => return Ok(None),
+    if data.len() > 8 {
+        return Err(PyValueError::new_err("a CAN frame carries at most 8 bytes"));
+    }
+    let mut padded = [0u8; 8];
+    padded[..data.len()].copy_from_slice(data);
+    let Some(parsed) = mit::parse_frame(can_id, &padded, params(model)?) else {
+        return Ok(None);
     };
     let d = PyDict::new(py);
     match parsed {
-        p::ParsedFrame::Feedback(fb) => {
+        mit::Parsed::Feedback(fb) => {
             d.set_item("kind", "feedback")?;
             d.set_item("motor_id", fb.motor_id)?;
             d.set_item("position", fb.position)?;
@@ -64,18 +73,20 @@ fn parse_frame(
             d.set_item("torque", fb.torque)?;
             d.set_item("temperature", fb.temperature)?;
             d.set_item("mode", fb.mode)?;
-            d.set_item("fault_bits", fb.fault_bits)?;
+            d.set_item("fault", fb.fault)?;
+            d.set_item("warning", fb.warning)?;
         }
-        p::ParsedFrame::ParamReply(r) => {
+        mit::Parsed::Fault(fs) => {
+            d.set_item("kind", "fault")?;
+            d.set_item("motor_id", fs.motor_id)?;
+            d.set_item("word", fs.word)?;
+        }
+        mit::Parsed::Param(r) => {
             d.set_item("kind", "param_reply")?;
             d.set_item("motor_id", r.motor_id)?;
             d.set_item("index", r.index)?;
             d.set_item("raw", PyBytes::new(py, &r.raw))?;
-        }
-        p::ParsedFrame::Fault(fr) => {
-            d.set_item("kind", "fault")?;
-            d.set_item("motor_id", fr.motor_id)?;
-            d.set_item("raw", PyBytes::new(py, &fr.raw))?;
+            d.set_item("write", r.write)?;
         }
     }
     Ok(Some(d.into()))
@@ -110,6 +121,7 @@ fn config_to_dict(py: Python<'_>, c: &ArmConfig) -> PyResult<Py<PyDict>> {
     d.set_item("control_rate_hz", c.control_rate_hz)?;
     d.set_item("max_velocity", c.max_velocity)?;
     d.set_item("feedback_timeout", c.feedback_timeout)?;
+    d.set_item("fault_poll_interval", c.fault_poll_interval)?;
     d.set_item("limit_margin", c.limit_margin)?;
     d.set_item("kp_max", c.kp_max)?;
     d.set_item("kd_max", c.kd_max)?;
@@ -284,15 +296,16 @@ pub(crate) fn reduced_config(profile: &Bound<'_, PyDict>) -> PyResult<ArmConfig>
 
 /// Session path only: refuse a key `profile()` does not emit (a typo would otherwise be a
 /// silent no-op) and a key that cannot be overridden (motor_id, name, model, control_rate_hz,
-/// feedback_timeout, temp_hold_c) unless it still carries the v1 value.
+/// feedback_timeout, fault_poll_interval, temp_hold_c) unless it still carries the v1 value.
 fn check_known_keys(profile: &Bound<'_, PyDict>) -> PyResult<()> {
-    const TOP: [&str; 7] = [
+    const TOP: [&str; 8] = [
         "max_velocity",
         "kp_max",
         "kd_max",
         "limit_margin",
         "control_rate_hz",
         "feedback_timeout",
+        "fault_poll_interval",
         "temp_hold_c",
     ];
     const JOINT: [&str; 9] = [
@@ -377,7 +390,7 @@ fn check_known_keys(profile: &Bound<'_, PyDict>) -> PyResult<()> {
 /// 7 `(pos, vel, kp, kd, tau)` tuples in joint order; returns the clamped
 /// list and whether anything changed. The control loop's own command path
 /// always runs commands through this clamp before they reach a motor;
-/// `encode_mit` is a separate low-level protocol encoder exposed for tests
+/// `encode_control` is a separate low-level protocol encoder exposed for tests
 /// and tooling and is not itself clamped.
 // The 5-tuple mirrors JointCommand's fields one for one, and PyO3 maps it
 // straight to/from a Python tuple; a named wrapper type would just move
@@ -411,7 +424,7 @@ fn clamp_command(
 
 #[pymodule]
 fn maker_arm_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(encode_mit, m)?)?;
+    m.add_function(wrap_pyfunction!(encode_control, m)?)?;
     m.add_function(wrap_pyfunction!(parse_frame, m)?)?;
     m.add_function(wrap_pyfunction!(profile, m)?)?;
     m.add_function(wrap_pyfunction!(clamp_command, m)?)?;
@@ -475,9 +488,9 @@ const STARTING: &str = "starting";
 
 /// Reported once the control thread has exited without being joined. The
 /// loop is NOT commanding the motors any more; if it exited on an error it
-/// did not disable them either, so torque may still be on with only the
-/// motor-side CAN_TIMEOUT watchdog behind it. `stop()` joins the thread
-/// and surfaces the error.
+/// did not disable them either, so torque may still be on and the motors
+/// keep their last command. `stop()` joins the thread and surfaces the
+/// error.
 const LOOP_STOPPED: &str = "loop_stopped";
 
 impl Arm {
@@ -674,13 +687,13 @@ impl Arm {
                 .map(|m| m.temperature)
                 .collect::<Vec<_>>(),
         )?;
+        // The fault word of each motor's last fault status reply. The key keeps its old name.
         d.set_item(
             "fault_bits",
-            // as u16: a Vec<u8> would convert to Python bytes, not a list
             snap.arm
                 .motors
                 .iter()
-                .map(|m| m.fault_bits as u16)
+                .map(|m| m.fault_word)
                 .collect::<Vec<_>>(),
         )?;
         Ok(Some(d.into()))
@@ -689,8 +702,9 @@ impl Arm {
     /// The ticks since the last drain as columns, oldest first, or None if no loop is running.
     ///
     /// `t`, `tick` and `clamped` hold one entry per tick. `q`, `dq`, `tau`, `temp`,
-    /// `fault_bits` and `feedback_age` are what the controller read, and `cmd_pos`, `cmd_vel`,
-    /// `cmd_kp`, `cmd_kd` and `cmd_tau` are the command that went out after the clamp; each of
+    /// `fault_bits` (the fault word) and `feedback_age` are what the controller read, and
+    /// `cmd_pos`, `cmd_vel`, `cmd_kp`, `cmd_kd` and `cmd_tau` are the command that went out
+    /// after the clamp; each of
     /// those holds one list per tick, seven wide. `dropped` counts the ticks lost since the
     /// last drain because the ring held only 4000: a nonzero value marks a gap, never a
     /// silent one. Join with `Tracking.drain` on `t`, not on the index. Works after the loop died, so the last ticks before a fault stay readable.
@@ -718,11 +732,10 @@ impl Arm {
         d.set_item("temp", motor(&|m| m.temperature))?;
         d.set_item(
             "fault_bits",
-            // as u16: a Vec<u8> would convert to Python bytes, not a list
             records
                 .iter()
-                .map(|r| r.motors.iter().map(|m| m.fault_bits as u16).collect())
-                .collect::<Vec<Vec<u16>>>(),
+                .map(|r| r.motors.iter().map(|m| m.fault_word).collect())
+                .collect::<Vec<Vec<u32>>>(),
         )?;
         d.set_item("feedback_age", motor(&|m| m.feedback_age))?;
         let sent = |f: &dyn Fn(&maker_arm::JointCommand) -> f64| -> Vec<Vec<f64>> {
@@ -774,8 +787,8 @@ impl Arm {
     /// * "loop_stopped" -- the thread has exited and has not been joined.
     ///   It is no longer commanding the motors, and if it exited on an
     ///   error it did not disable them either, so torque may still be on
-    ///   with only the motor-side CAN_TIMEOUT watchdog behind it. Call
-    ///   stop() to join it and surface the error.
+    ///   and the motors keep their last command. Call stop() to join it
+    ///   and surface the error.
     ///
     /// This used to default to "enabled" whenever no snapshot was
     /// available, which reported a dead loop -- or an un-energized arm --

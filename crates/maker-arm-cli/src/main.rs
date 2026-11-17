@@ -115,8 +115,8 @@ enum Command {
 }
 
 /// A real bus comes with its lock, which the caller holds for the whole command: the probes of
-/// scan, doctor and zero and the connect of hold send disable frames, which would drop an arm
-/// that a serve daemon holds.
+/// scan, doctor and zero clear faults, zero moves a motor's zero and the enable of hold sends
+/// zero-gain frames, which would drop an arm that a serve daemon holds.
 fn open_backend(
     cli: &Cli,
     config: &ArmConfig,
@@ -138,6 +138,18 @@ fn open_backend(
         }
         (None, true) => Ok((None, Box::new(SimArm::new(config)))),
         _ => Err("pass exactly one of --can <iface> or --sim".into()),
+    }
+}
+
+/// Fault recovery is the operator's: this CLI never clears a fault.
+const FAULT_KEPT: &str = "A reported fault is kept. Fix the cause, then press and release the \
+                          emergency stop, or run the vendor `maker-arm scan --clear-faults`.";
+
+/// The decoded fault word, with the raw word when there is a fault.
+fn fault(word: u32) -> String {
+    match word {
+        0 => maker_arm_protocol::mit::fault_text(0),
+        w => format!("{w:#010x} {}", maker_arm_protocol::mit::fault_text(w)),
     }
 }
 
@@ -219,17 +231,12 @@ fn main() -> Result<(), String> {
         Command::Scan => {
             let rows = maker_arm_cli::scan(backend.as_mut(), &config).map_err(|e| e.to_string())?;
             println!(
-                "{:>3} {:>8} {:>5} {:>7} {:>9} {:>4} {:>6} {:>5}",
-                "id", "name", "model", "present", "pos(rad)", "mode", "temp", "fault"
+                "{:>3} {:>8} {:>5} {:>7} {:>9} {:>4} {:>6} {:>6} fault",
+                "id", "name", "model", "present", "pos(rad)", "mode", "temp", "params"
             );
-            for r in rows {
-                // `{:>5:#04x}` is not valid Rust format syntax (a spec takes
-                // at most one `:`-separated section); format the hex value
-                // as a string first and align that, per the brief's escape
-                // hatch.
-                let fault = format!("{:#04x}", r.fault_bits);
+            for r in &rows {
                 println!(
-                    "{:>3} {:>8} {:>5} {:>7} {:>9.3} {:>4} {:>6.1} {:>5}",
+                    "{:>3} {:>8} {:>5} {:>7} {:>9.3} {:>4} {:>6.1} {:>6} {}",
                     r.motor_id,
                     r.name,
                     r.model,
@@ -237,8 +244,12 @@ fn main() -> Result<(), String> {
                     r.joint_pos,
                     r.mode,
                     r.temperature,
-                    fault
+                    r.params,
+                    fault(r.fault_word)
                 );
+            }
+            if rows.iter().any(|r| r.fault_word != 0) {
+                println!("{FAULT_KEPT}");
             }
         }
         Command::Doctor => {
@@ -246,30 +257,36 @@ fn main() -> Result<(), String> {
                 maker_arm_cli::doctor(backend.as_mut(), &config).map_err(|e| e.to_string())?;
             for r in &report.rows {
                 println!(
-                    "motor {} present={} pos={:.3} in_limits={} run_mode={:?} \
-                     can_timeout={:?} vbus={:?} temp={:.1} fault={:#04x}",
+                    "motor {} present={} pos={:.3} in_limits={} params={} run_mode={:?} \
+                     can_timeout={:?} vbus={:?} temp={:.1} fault={}",
                     r.motor_id,
                     r.present,
                     r.joint_pos,
                     r.in_limits,
+                    r.params,
                     r.run_mode,
                     r.can_timeout,
                     r.vbus,
                     r.temperature,
-                    r.fault_bits
+                    fault(r.fault_word)
                 );
             }
             for w in &report.warnings {
                 println!("WARNING: {w}");
             }
-            if report.rows.iter().any(|r| !r.present || !r.in_limits) {
+            if report.rows.iter().any(|r| r.fault_word != 0) {
+                println!("{FAULT_KEPT}");
+            }
+            if !report.passed() {
                 return Err("doctor found problems (see rows above)".into());
             }
         }
         Command::Zero { motor, yes } => {
             if !yes {
                 println!(
-                    "zeroing motor {motor} overwrites its zero position. Type YES to continue."
+                    "zeroing motor {motor} overwrites its zero position. This command never \
+                     enables torque. Move the arm by hand to the vendor zero pose: folded \
+                     against the base, gripper fully closed. Then type YES to continue."
                 );
                 let mut line = String::new();
                 std::io::stdin()
@@ -330,14 +347,14 @@ fn main() -> Result<(), String> {
                     // Losing the Ctrl-C convenience is strictly better than
                     // dropping a live arm because a handler could not be
                     // installed. Without it, Ctrl-C terminates this process
-                    // outright and the motors' own CAN_TIMEOUT watchdog is
-                    // the only backstop -- so say so, and continue into the
-                    // gate, which is still the only way to release cleanly.
+                    // outright and the motors keep their last command -- so
+                    // say so, and continue into the gate, which is still the
+                    // only way to release cleanly.
                     let _ = writeln!(
                         std::io::stderr(),
                         "WARNING: could not install the Ctrl-C handler ({e}); Ctrl-C will \
-                         kill this process instead of holding, leaving the motors to their \
-                         own CAN_TIMEOUT watchdog. Type RELEASE to release cleanly."
+                         kill this process instead of holding, leaving the motors on their \
+                         last command. Type RELEASE to release cleanly."
                     );
                 }
             }

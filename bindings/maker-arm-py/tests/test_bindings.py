@@ -8,83 +8,71 @@ import time
 import maker_arm_rs as m
 
 
-def test_encode_mit_golden():
-    can_id, data = m.encode_mit(1, 0.0, 0.0, 10.0, 1.0, 0.0, "RS00")
-    assert can_id == 0x01800001
-    assert data == bytes.fromhex("80008000051F3333")
+def test_encode_control_matches_the_rust_vector():
+    # The vendor SDK's bytes at 0245316, as in crates/maker-arm-protocol/tests/mit_vectors.rs.
+    can_id, data = m.encode_control(1, 1.0, 0.0, 60.0, 4.0, 0.5, "RS00")
+    assert can_id == 1
+    assert data == bytes.fromhex("8a2e8001ebccc849")
 
 
-def test_encode_mit_rs02_scaling_differs():
-    # tau = 14.0 Nm is RS00's exact max (t_min/t_max = -14/+14) but only
-    # ~82% of RS02's range (t_min/t_max = -17/+17). encode_mit puts the
-    # feed-forward torque as a u16 in bits 23..8 of the CAN id (via
-    # make_can_id(COMM_MIT, tau_u16, motor_id)), computed by
-    # float_to_u16(tau, t_min, t_max) with round-half-to-even.
-    #
-    # RS00: x = clamp(14.0, -14, 14) = 14.0
-    #       tau_u16 = round_ties_even((14 - (-14)) * 65535 / 28)
-    #               = round_ties_even(65535.0) = 65535 = 0xFFFF
-    #       id = (COMM_MIT=1 << 24) | (0xFFFF << 8) | motor_id=1
-    #          = 0x01000000 | 0x00FFFF00 | 0x00000001 = 0x01FFFF01
-    #
-    # RS02: x = clamp(14.0, -17, 17) = 14.0
-    #       tau_u16 = round_ties_even((14 - (-17)) * 65535 / 34)
-    #               = round_ties_even(31 * 65535 / 34)
-    #               = round_ties_even(59752.5)
-    #       59752.5 is exactly halfway between 59752 (even) and 59753 (odd),
-    #       so round-half-to-even picks 59752 = 0xE968.
-    #       id = 0x01000000 | (0xE968 << 8) | 0x00000001 = 0x01E96801
-    rs00_id, rs00_data = m.encode_mit(1, 0.0, 0.0, 0.0, 0.0, 14.0, "RS00")
-    rs02_id, rs02_data = m.encode_mit(1, 0.0, 0.0, 0.0, 0.0, 14.0, "RS02")
-
-    assert rs00_id == 0x01FFFF01
-    assert rs02_id == 0x01E96801
-    assert rs00_id != rs02_id  # same torque, different mapping table
-
-    # The payload only carries pos/vel/kp/kd (tau lives in the CAN id).
-    # pos=vel=0.0 map to the midpoint of their respective ranges, and
-    # since P_MIN/P_MAX (both models) and V_MIN/V_MAX (per model, but each
-    # symmetric about 0) are all symmetric around zero, 0.0 always maps to
-    # the same u16 (32768) regardless of the range's width. kp=kd=0.0 map
-    # to 0 for both models too (KP/KD ranges don't vary by model). So the
-    # two payloads are expected to be identical even though the torque
-    # differs — the difference is confined entirely to the CAN id.
-    assert rs00_data == rs02_data == bytes.fromhex("8000800000000000")
+def test_encode_control_scales_by_model():
+    can_id, data = m.encode_control(2, -1.0, 0.0, 150.0, 4.5, 3.0, "RS02")
+    assert (can_id, data) == (2, bytes.fromhex("75d18004cce66969"))
 
 
-def test_parse_feedback_golden():
-    fb = m.parse_frame(0x028001FD, bytes.fromhex("8000800080000159"), "RS00")
+def test_encode_control_refuses_nan():
+    import pytest
+
+    with pytest.raises(ValueError):
+        m.encode_control(1, float("nan"), 0.0, 0.0, 0.0, 0.0, "RS00")
+
+
+def test_parse_frame_reads_the_p0_feedback():
+    # The real arm's motor 1 at rest, captured in P0.
+    fb = m.parse_frame(0xFD, bytes.fromhex("01BE907FD7FF00F0"), "RS00")
     assert fb["kind"] == "feedback"
     assert fb["motor_id"] == 1
-    assert fb["mode"] == 2
-    assert fb["fault_bits"] == 0
-    assert abs(fb["temperature"] - 34.5) < 1e-9
+    assert fb["temperature"] == 24.0
+    assert (fb["mode"], fb["fault"], fb["warning"]) == (0, False, False)
+    assert abs(fb["position"] - 6.144118562600138) < 1e-12
+
+
+def test_parse_frame_reads_a_fault_status():
+    # Bytes 1 to 4 hold the fault word, little-endian: bit 9 is a position initialization fault.
+    fs = m.parse_frame(0xFD, bytes.fromhex("0700020000000000"), "RS00")
+    assert fs == {"kind": "fault", "motor_id": 7, "word": 1 << 9}
+    # A 5-byte fault status reads the same: the transport pads it with zeros.
+    assert m.parse_frame(0xFD, bytes.fromhex("0700020000"), "RS00") == fs
+
+
+def test_parse_frame_reads_a_param_reply():
+    r = m.parse_frame(0x307, bytes.fromhex("2870000010270000"), "RS00")
+    assert r == {"kind": "param_reply", "motor_id": 7, "index": 0x7028, "raw": bytes.fromhex("10270000"), "write": False}
 
 
 def test_parse_unknown_returns_none():
-    # Contrast with test_parse_frame_unknown_model_raises below: an
-    # unrecognized *frame* (unknown comm type in the CAN id) is not an
-    # error — parse_frame just has nothing to report and returns None.
-    assert m.parse_frame((22 << 24) | 0xFD, bytes(8), "RS00") is None
+    # Contrast with test_parse_frame_unknown_model_raises below: a frame that is no MIT
+    # reply (here a power-up announcement) is not an error. parse_frame returns None.
+    assert m.parse_frame(0x7FFE, bytes(8), "RS00") is None
+    assert m.parse_frame(3, bytes(8), "RS00") is None
 
 
 def test_unknown_model_raises():
     import pytest
 
     with pytest.raises(ValueError):
-        m.encode_mit(1, 0, 0, 0, 0, 0, "RS99")
+        m.encode_control(1, 0, 0, 0, 0, 0, "RS99")
 
 
 def test_parse_frame_unknown_model_raises():
     # parse_frame resolves its `model` argument through the same params()
-    # helper as encode_mit, so an unknown *model* raises ValueError — unlike
+    # helper as encode_control, so an unknown *model* raises ValueError, unlike
     # an unknown *frame* (test_parse_unknown_returns_none above), which
-    # returns None. Use a well-known feedback frame (same id/data as
-    # test_parse_feedback_golden) so the only variable is the model name.
+    # returns None.
     import pytest
 
     with pytest.raises(ValueError):
-        m.parse_frame(0x028001FD, bytes.fromhex("8000800080000159"), "RS99")
+        m.parse_frame(0xFD, bytes.fromhex("01BE907FD7FF00F0"), "RS99")
 
 
 def test_arm_sim_orchestration_lifecycle():
@@ -185,7 +173,9 @@ def test_profile_pins_every_upstream_joint():
         assert j["direction"] == 1.0 and j["offset"] == 0.0
     assert p["control_rate_hz"] == 200.0
     assert p["max_velocity"] == 5.0
-    assert p["feedback_timeout"] == 0.2
+    assert p["feedback_timeout"] == 0.25
+    assert p["fault_poll_interval"] == 0.25
+    assert "motor_can_timeout_ms" not in p
     assert p["limit_margin"] == 0.0
     assert p["kp_max"] == 200.0
     assert p["temp_hold_c"] == 70.0
@@ -663,7 +653,7 @@ def test_start_tracking_requires_an_enabled_session():
 
 def test_a_stopped_loop_reads_as_not_running():
     # After stop() the loop no longer runs the controller: once the last tick is older than
-    # the motors' CAN_TIMEOUT (0.2 s), now() is None and push raises.
+    # the profile's feedback_timeout (0.25 s), now() is None and push raises.
     a = m.Arm.sim()
     a.enable()
     tr = m.Tracking(_planar_dynamics())

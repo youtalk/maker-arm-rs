@@ -52,7 +52,7 @@ pub trait CanBackend: Send {
     ///   deadline has to keep its own clock.
     /// * `Err(_)` — the transport itself failed.
     ///
-    /// Remote (RTR) frames, 29-bit extended-id frames and error frames are
+    /// Remote (RTR) frames, extended-id frames and error frames are
     /// never returned as motor data: an RTR frame has an empty payload that
     /// would zero-pad into a full-scale-negative feedback reading, and an
     /// extended id is indistinguishable from the same numeric standard id.

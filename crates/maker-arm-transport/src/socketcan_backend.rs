@@ -2,7 +2,7 @@ use crate::{CanBackend, TransportError};
 use socketcan::{CanFilter, CanFrame, CanSocket, EmbeddedFrame, Socket, SocketOptions, StandardId};
 use std::time::Duration;
 
-/// `can_id` bit the kernel sets on extended (29-bit) frames.
+/// `can_id` bit the kernel sets on extended-id frames.
 const CAN_EFF_FLAG: u32 = 0x8000_0000;
 /// `can_id` bit the kernel sets on remote-transmission-request frames.
 const CAN_RTR_FLAG: u32 = 0x4000_0000;
@@ -21,7 +21,7 @@ pub struct SocketCanBackend {
 /// Reduces one received frame to what the MIT protocol can carry, or
 /// `None` if the frame must not be presented as motor data.
 ///
-/// `CAN_RAW` sockets deliver remote (RTR) frames, 29-bit extended-id frames
+/// `CAN_RAW` sockets deliver remote (RTR) frames, extended-id frames
 /// and error frames alongside the traffic we want:
 ///
 /// * An RTR frame has an empty payload. Zero-padding it to `[0u8; 8]` would
