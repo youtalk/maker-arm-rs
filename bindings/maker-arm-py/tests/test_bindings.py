@@ -749,6 +749,9 @@ def test_tracking_drain_gives_one_row_per_tick_and_counts_the_drops():
     for col in ("r", "offset", "q_r", "tau_ff", "tau_dob", "tau_res"):
         assert len(d[col]) == len(d["tick_t"]) and len(d[col][0]) == 6
     assert len(d["gate"]) == len(d["tick_t"])
+    # A tick can land between the first drain and stop(). Flush it, then the loop is
+    # stopped and a drain must be empty.
+    tr.drain()
     assert tr.drain()["tick_t"] == []
 
 

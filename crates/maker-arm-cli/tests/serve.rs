@@ -331,7 +331,8 @@ fn client_cli(sub: &str, socket: &std::path::Path, stdin: &str) -> (Option<i32>,
         .stderr(std::process::Stdio::piped());
     let mut child = c.spawn().unwrap();
     let mut pipe = child.stdin.take().unwrap();
-    pipe.write_all(stdin.as_bytes()).unwrap();
+    // The child may exit before it reads stdin (EPIPE): that is the case under test.
+    let _ = pipe.write_all(stdin.as_bytes());
     // Keep the pipe open: EOF would make confirm_release retry, which is not under test.
     let out = child.wait_with_output().unwrap();
     drop(pipe);

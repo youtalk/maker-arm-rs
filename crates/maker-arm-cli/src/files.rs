@@ -708,8 +708,8 @@ mod tests {
     #[test]
     fn a_half_kp_profile_doubles_the_default_e_max() {
         let l = load(&half_kp_options(None)).unwrap();
-        for j in 0..ARM_DOF {
-            assert!((l.params.e_max[j] - 0.06).abs() < 1e-12);
+        for e in l.params.e_max {
+            assert!((e - 0.06).abs() < 1e-12);
         }
     }
 
