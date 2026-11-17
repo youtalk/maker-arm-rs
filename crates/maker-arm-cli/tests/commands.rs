@@ -1,5 +1,7 @@
 use maker_arm::{ArmConfig, SimArm};
 use maker_arm_cli::{confirm_release, doctor, scan, zero_motor};
+use maker_arm_protocol::mit;
+use maker_arm_transport::{CanBackend, TransportError};
 use std::io::{Cursor, Write};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -141,6 +143,7 @@ fn zero_prompt_names_the_vendor_pose() {
         out.contains("folded against the base, gripper fully closed"),
         "{out}"
     );
+    assert!(out.contains("support the arm"), "{out}");
 }
 
 #[test]
@@ -193,7 +196,7 @@ fn zero_motor_zeroes_and_reports() {
     let c = ArmConfig::maker_arm_v1();
     let mut sim = SimArm::new(&c);
     sim.set_position(5, 2.0);
-    let pos = zero_motor(&mut sim, &c, 5).expect("zero");
+    let pos = zero_motor(&mut sim, &c, 5, || true).expect("zero");
     assert!(pos.abs() < 1e-3);
     assert!(sim.position(5).abs() < 1e-3);
     // Note: J5's configured joint range is 0.577..3.641 -- it does not
@@ -211,8 +214,76 @@ fn zero_motor_refuses_a_faulted_motor() {
     let mut sim = SimArm::new(&c);
     sim.set_position(5, 2.0);
     sim.inject_fault(5, 1 << 7);
-    let e = zero_motor(&mut sim, &c, 5).unwrap_err();
+    let e = zero_motor(&mut sim, &c, 5, || true).unwrap_err();
     assert!(e.contains("encoder uncalibrated"), "{e}");
+    assert_eq!(sim.position(5), 2.0);
+}
+
+/// A SimArm that records every frame sent to it.
+struct Recorder {
+    sim: SimArm,
+    sent: Arc<Mutex<Vec<(u32, [u8; 8])>>>,
+}
+
+impl CanBackend for Recorder {
+    fn send(&mut self, id: u32, data: &[u8; 8]) -> Result<(), TransportError> {
+        self.sent.lock().unwrap().push((id, *data));
+        self.sim.send(id, data)
+    }
+
+    fn recv(&mut self, timeout: Duration) -> Result<Option<(u32, [u8; 8])>, TransportError> {
+        self.sim.recv(timeout)
+    }
+}
+
+#[test]
+fn zero_motor_disables_every_motor_before_the_prompt_and_set_zero() {
+    let c = ArmConfig::maker_arm_v1();
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let mut b = Recorder {
+        sim: SimArm::new(&c),
+        sent: sent.clone(),
+    };
+    // A dead daemon left every motor enabled on its last frame.
+    for j in &c.joints {
+        let f = mit::encode_enable(j.motor_id);
+        b.sim.send(f.id, &f.data).unwrap();
+        assert!(b.sim.enabled(j.motor_id));
+    }
+    let mut at_prompt = None;
+    zero_motor(&mut b, &c, 5, || {
+        at_prompt = Some(sent.lock().unwrap().len());
+        true
+    })
+    .expect("zero");
+    let at_prompt = at_prompt.expect("the prompt ran");
+    let sent = sent.lock().unwrap();
+    let at = |f: maker_arm_protocol::Frame| sent.iter().position(|s| *s == (f.id, f.data));
+    let zero_at = at(mit::encode_set_zero(5)).expect("set-zero sent");
+    assert!(at_prompt <= zero_at);
+    for j in &c.joints {
+        let off = at(mit::encode_disable(j.motor_id)).expect("disable sent");
+        assert!(
+            off < at_prompt,
+            "motor {} disabled after the prompt",
+            j.motor_id
+        );
+        assert!(!b.sim.enabled(j.motor_id), "motor {}", j.motor_id);
+    }
+}
+
+#[test]
+fn zero_motor_aborts_with_every_motor_disabled() {
+    let c = ArmConfig::maker_arm_v1();
+    let mut sim = SimArm::new(&c);
+    sim.set_position(5, 2.0);
+    let f = mit::encode_enable(5);
+    sim.send(f.id, &f.data).unwrap();
+    assert_eq!(
+        zero_motor(&mut sim, &c, 5, || false).unwrap_err(),
+        "aborted"
+    );
+    assert!(!sim.enabled(5));
     assert_eq!(sim.position(5), 2.0);
 }
 
@@ -220,7 +291,7 @@ fn zero_motor_refuses_a_faulted_motor() {
 fn zero_motor_rejects_unknown_id() {
     let c = ArmConfig::maker_arm_v1();
     let mut sim = SimArm::new(&c);
-    assert!(zero_motor(&mut sim, &c, 9).is_err());
+    assert!(zero_motor(&mut sim, &c, 9, || true).is_err());
 }
 
 #[test]

@@ -249,12 +249,16 @@ pub fn doctor(
     Ok(DoctorReport { rows, warnings })
 }
 
-/// Zeroes one motor (torque-free operation) and re-probes to confirm. A motor that does not
-/// answer or reports a fault is not zeroed.
+/// Zeroes one motor as the vendor does. Every motor is disabled first, so torque stays off for
+/// the whole procedure: a motor left enabled by a dead daemon must not drive toward its old
+/// target once the zero moves. Then `confirm` runs (the operator's prompt), then set-zero and
+/// a re-probe. A motor that does not answer or reports a fault is not zeroed, and nothing is
+/// disabled. `confirm` returning false aborts with every motor disabled.
 pub fn zero_motor(
     backend: &mut dyn CanBackend,
     config: &ArmConfig,
     motor_id: u8,
+    confirm: impl FnOnce() -> bool,
 ) -> Result<f64, String> {
     let j = config
         .joint_by_motor_id(motor_id)
@@ -272,8 +276,16 @@ pub fn zero_motor(
             .ok_or_else(|| format!("motor {motor_id} did not answer the state read")),
     };
     probe(backend)?;
+    let e = |e: TransportError| e.to_string();
+    for j in &config.joints {
+        let f = mit::encode_disable(j.motor_id);
+        backend.send(f.id, &f.data).map_err(e)?;
+    }
+    if !confirm() {
+        return Err("aborted".into());
+    }
     let f = mit::encode_set_zero(motor_id);
-    backend.send(f.id, &f.data).map_err(|e| e.to_string())?;
+    backend.send(f.id, &f.data).map_err(e)?;
     probe(backend)
 }
 

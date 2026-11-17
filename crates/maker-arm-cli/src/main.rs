@@ -115,7 +115,7 @@ enum Command {
 }
 
 /// A real bus comes with its lock, which the caller holds for the whole command: the probes of
-/// scan, doctor and zero clear faults, zero moves a motor's zero and the enable of hold sends
+/// scan, doctor and zero clear faults, zero disables every motor and the enable of hold sends
 /// zero-gain frames, which would drop an arm that a serve daemon holds.
 fn open_backend(
     cli: &Cli,
@@ -282,21 +282,21 @@ fn main() -> Result<(), String> {
             }
         }
         Command::Zero { motor, yes } => {
-            if !yes {
+            // Runs after every motor is disabled.
+            let confirm = || {
+                if yes {
+                    return true;
+                }
                 println!(
-                    "zeroing motor {motor} overwrites its zero position. This command never \
-                     enables torque. Move the arm by hand to the vendor zero pose: folded \
-                     against the base, gripper fully closed. Then type YES to continue."
+                    "every motor is disabled: support the arm. Zeroing motor {motor} \
+                     overwrites its zero position. Move the arm by hand to the vendor zero \
+                     pose: folded against the base, gripper fully closed. Then type YES to \
+                     continue."
                 );
                 let mut line = String::new();
-                std::io::stdin()
-                    .read_line(&mut line)
-                    .map_err(|e| e.to_string())?;
-                if line.trim() != "YES" {
-                    return Err("aborted".into());
-                }
-            }
-            let pos = maker_arm_cli::zero_motor(backend.as_mut(), &config, motor)?;
+                std::io::stdin().read_line(&mut line).is_ok() && line.trim() == "YES"
+            };
+            let pos = maker_arm_cli::zero_motor(backend.as_mut(), &config, motor, confirm)?;
             println!("motor {motor} zeroed; joint position now {pos:.4} rad");
             // Presentation only: `zero_motor` reports a true register
             // value, not a claim that it is a safe pose. Some joints'
