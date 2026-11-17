@@ -137,13 +137,36 @@ fn doctor_fails_on_a_reported_fault() {
 
 #[test]
 fn zero_prompt_names_the_vendor_pose() {
-    let (code, out) = sim_cli(&["zero", "--motor", "5"], "no\n");
+    let (code, out) = sim_cli(&["zero", "--motor", "5"], "\nno\n");
     assert_eq!(code, Some(1), "{out}");
     assert!(
         out.contains("folded against the base, gripper fully closed"),
         "{out}"
     );
     assert!(out.contains("support the arm"), "{out}");
+}
+
+#[test]
+fn zero_asks_before_it_disables_the_motors() {
+    // Input ends at the first prompt: zero stops before the disables, so
+    // the YES prompt, which comes after them, never shows.
+    let (code, out) = sim_cli(&["zero", "--motor", "5"], "");
+    assert_eq!(code, Some(1), "{out}");
+    assert!(
+        out.contains("every motor will be disabled: support the arm, then press ENTER"),
+        "{out}"
+    );
+    assert!(!out.contains("type YES"), "{out}");
+}
+
+#[test]
+fn zero_warns_only_outside_the_enable_window() {
+    // The gripper's zero is just past its range, inside the grace that
+    // enable accepts.
+    let (code, out) = sim_cli(&["zero", "--motor", "7", "--yes"], "");
+    assert_eq!(code, Some(0), "{out}");
+    assert!(out.contains("motor 7 zeroed"), "{out}");
+    assert!(!out.contains("WARNING"), "{out}");
 }
 
 #[test]
@@ -199,13 +222,10 @@ fn zero_motor_zeroes_and_reports() {
     let pos = zero_motor(&mut sim, &c, 5, || true).expect("zero");
     assert!(pos.abs() < 1e-3);
     assert!(sim.position(5).abs() < 1e-3);
-    // Note: J5's configured joint range is 0.577..3.641 -- it does not
-    // include zero. zero_motor reports whatever the motor's raw position
-    // maps to in joint coordinates; it does not validate that value
-    // against the joint's soft limits (that gate belongs to `enable()`,
-    // which runs later and would refuse to energize this joint at 0.0
-    // rad). So this assertion is about what set-zero actually did to the
-    // register, not a claim that 0.0 rad is a safe or reachable pose here.
+    // zero_motor reports the joint position that the new register value
+    // maps to. It does not check it against the joint's limits: `enable()`
+    // is that gate. So this assertion is about what set-zero did to the
+    // register, not a claim that 0.0 rad is a safe or reachable pose.
 }
 
 #[test]
