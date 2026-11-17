@@ -474,17 +474,20 @@ fn a_transport_error_during_enable_still_disables_every_motor() {
 fn connect_refuses_a_wrap_that_cannot_map_the_configured_range() {
     // Critical: `connect` picks the 2π wrap from wherever the arm HAPPENS
     // to be parked, but the control loop then sends `to_motor(q) - wrap`
-    // for every commanded q in `q_lo..q_hi`. J3's window is 3.882..7.955;
-    // park its raw angle at 11.0 rad -- physically reachable -- and the
-    // only wrap that lands the pose inside the grace window is -2π
-    // (11.0 - 6.283 = 4.717). But then q_hi maps to 7.955 + 6.283 =
-    // 14.238 rad, past the encoder's +12.57: `float_to_uint` would clamp
-    // that to the rail with no error, truncating a position command by
-    // 1.61 rad at kp 90 while reporting `clamped: false`. Refuse at
-    // connect instead, with an error that says what to DO about it.
-    let c = ArmConfig::maker_arm_v1();
+    // for every commanded q in `q_lo..q_hi`. J3 gets a motor-frame offset
+    // of 3.0 rad here, so its window is 3.049..7.121 rad in the motor
+    // frame. Park the raw angle at 11.283 rad -- physically reachable --
+    // and the only wrap that lands the pose inside the grace window is -2π
+    // (the joint reads 2.0 rad). But then q_hi maps to 7.121 + 6.283 =
+    // 13.404 rad, past the encoder's +12.57: `float_to_uint` would clamp
+    // that to the rail with no error, truncating a position command
+    // while reporting `clamped: false`. Refuse at connect instead, with
+    // an error that says what to DO about it.
+    let mut c = ArmConfig::maker_arm_v1();
+    c.joints[2].offset = 3.0;
+    let q_hi = c.joints[2].q_hi;
     let mut sim = SimArm::new(&c);
-    sim.set_position(3, 11.0);
+    sim.set_position(3, 3.0 + 2.0 + TAU);
     match Session::connect(Box::new(sim), c) {
         Err(SessionError::RangeNotMappable {
             motor_id: 3,
@@ -498,11 +501,11 @@ fn connect_refuses_a_wrap_that_cannot_map_the_configured_range() {
                 "expected the -2π wrap, got {wrap}"
             );
             assert!(
-                (joint_bound - 7.955).abs() < 1e-9,
+                (joint_bound - q_hi).abs() < 1e-9,
                 "expected J3's q_hi as the offending bound, got {joint_bound}"
             );
             assert!(
-                motor_pos > 14.0,
+                motor_pos > 13.0,
                 "expected the unmappable motor-frame position, got {motor_pos}"
             );
             assert!((encoder_limit - 12.57).abs() < 1e-9);
@@ -542,4 +545,22 @@ fn connect_accepts_a_negative_wrap_whose_whole_range_still_maps() {
         "expected {true_j4}, got {}",
         s.positions()[3]
     );
+}
+
+#[test]
+fn p0_rest_pose_connects_in_urdf_frame() {
+    // The vendor calibration: direction -1 on J5. Raw motor angles from the P0 rest pose.
+    let mut c = ArmConfig::maker_arm_v1();
+    c.joints[4].direction = -1.0;
+    let raw = [352.0, 0.0, 7.9, 335.5, -2.6, 356.8, -0.9];
+    let want = [-8.0, 0.0, 7.9, -24.5, 2.6, -3.2, -0.9];
+    let mut sim = SimArm::new(&c);
+    for (i, deg) in raw.iter().enumerate() {
+        sim.set_position(i as u8 + 1, f64::to_radians(*deg));
+    }
+    let s = Session::connect(Box::new(sim), c).expect("connect");
+    for (i, (q, deg)) in s.positions().iter().zip(want).enumerate() {
+        // The wire carries 16-bit positions, so a reading is exact to half a step (1.92e-4 rad).
+        assert!((q - f64::to_radians(deg)).abs() < 2e-4, "joint {i}: {q}");
+    }
 }

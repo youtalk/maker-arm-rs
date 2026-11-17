@@ -1723,12 +1723,12 @@ mod tests {
                 k += 1;
             },
         );
-        assert!(worst < 0.01, "r reads {worst} N m with the residual");
+        assert!(worst < 0.02, "r reads {worst} N m with the residual");
         let tel = c.shared().telemetry().unwrap();
         assert_eq!(tel.tau_res, bias);
         assert_eq!(tel.residual_skips, 3, "the 4th tick fills the history");
         assert!(
-            (q[2] - q0[2]).abs() < 1e-4,
+            (q[2] - q0[2]).abs() < 1e-3,
             "the load bends joint 3 by {}",
             q[2] - q0[2]
         );

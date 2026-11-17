@@ -104,12 +104,12 @@ mod tests {
             kd: 4.0,
             tau: 1.0,
         };
-        cmd[1].pos = 0.0; // J2: -2.024..0.979
-        cmd[2].pos = 4.0; // J3: 3.882..7.955
-        cmd[3].pos = 0.0; // J4: -0.832..2.122
-        cmd[4].pos = 1.0; // J5: 0.577..3.641
-        cmd[5].pos = 2.0; // J6: 0.966..6.292
-        cmd[6].pos = -1.0; // gripper range is negative
+        cmd[1].pos = -1.0; // J2: -175.3..-3.2 deg
+        cmd[2].pos = 4.0; // J3: 2.8..236.1 deg
+        cmd[3].pos = 0.0; // J4: -65.2..104.0 deg
+        cmd[4].pos = 1.0; // J5: -97.6..78.0 deg
+        cmd[5].pos = 2.0; // J6: -153.2..152.0 deg
+        cmd[6].pos = -1.0; // gripper range -96.0..-2.5 deg
         let (out, clamped) = clamp_command(&cmd, &c).unwrap();
         assert!(!clamped);
         assert_eq!(out[0].pos, 1.0);
@@ -120,7 +120,7 @@ mod tests {
     fn every_field_is_clamped() {
         let c = ArmConfig::maker_arm_v1();
         let mut cmd = zero_cmd(7);
-        // J1 soft limits -0.668..4.818, tau_max 4.0
+        // J1 soft limits -158.2..156.1 deg, tau_max 4.0
         cmd[0] = JointCommand {
             pos: 99.0,
             vel: -99.0,
@@ -128,15 +128,15 @@ mod tests {
             kd: 99.0,
             tau: -99.0,
         };
-        cmd[6].pos = 0.0; // above gripper q_hi = -0.039
+        cmd[6].pos = 0.0; // above the gripper q_hi, -2.5 deg
         let (out, clamped) = clamp_command(&cmd, &c).unwrap();
         assert!(clamped);
-        assert_eq!(out[0].pos, 4.818);
+        assert_eq!(out[0].pos, c.joints[0].q_hi);
         assert_eq!(out[0].vel, -5.0);
         assert_eq!(out[0].kp, c.kp_max);
         assert_eq!(out[0].kd, c.kd_max);
         assert_eq!(out[0].tau, -4.0);
-        assert_eq!(out[6].pos, -0.039);
+        assert_eq!(out[6].pos, c.joints[6].q_hi);
     }
 
     #[test]
@@ -144,11 +144,11 @@ mod tests {
         let mut c = ArmConfig::maker_arm_v1();
         c.limit_margin = 0.1;
         let mut cmd = zero_cmd(7);
-        cmd[0].pos = 4.818;
+        cmd[0].pos = c.joints[0].q_hi;
         cmd[6].pos = -1.0;
         let (out, clamped) = clamp_command(&cmd, &c).unwrap();
         assert!(clamped);
-        assert!((out[0].pos - (4.818 - 0.1)).abs() < 1e-12);
+        assert!((out[0].pos - (c.joints[0].q_hi - 0.1)).abs() < 1e-12);
     }
 
     #[test]

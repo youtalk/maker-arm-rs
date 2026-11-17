@@ -4,7 +4,6 @@
 mod common;
 
 use common::{run_to_exit, scratch_dir, serve_command, Client, Daemon};
-use maker_arm::ArmConfig;
 use maker_arm_cli::files::GripMap;
 use maker_arm_cli::wire::{Mode, Op, Role};
 use std::time::Duration;
@@ -197,9 +196,9 @@ fn a_monitor_can_poll_while_a_client_commands() {
 
 #[test]
 fn the_gripper_target_stays_within_the_squeeze_window() {
-    let grip = GripMap::provisional(&ArmConfig::maker_arm_v1());
+    let grip = GripMap::provisional();
     // GRIP_TAU_MAX_NM / kp of the gripper, in gripper_left_joint metres.
-    let window = 0.5 / 20.0 * grip.joint_m_per_rad();
+    let window = 0.5 / 20.0 * grip.joint_m_per_rad().abs();
     let d = Daemon::start(&[]);
     let (mut c, mut q) = activated(&d);
     q[6] = 0.0;
