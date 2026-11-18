@@ -308,7 +308,7 @@ impl Daemon {
             q: [0.0; ROW],
             dq: [0.0; ROW],
             effort: [0.0; ROW],
-            temp: [0.0; ROW],
+            temp: [f64::NAN; ROW],
             fault: 0,
             clamped: st.clamped,
             refused: st.refused,
@@ -1549,6 +1549,18 @@ mod tests {
         assert_eq!(v["temp_max_c"], serde_json::Value::Null);
         assert_eq!(v["temp_max_motor"], serde_json::Value::Null);
         assert_eq!(v["no_reply"], serde_json::json!([1, 2, 3, 4, 5, 6, 7]));
+    }
+
+    #[test]
+    fn a_frame_before_any_read_has_no_temperature() {
+        let (d, _) = daemon(true);
+        d.lock().arm = None;
+        let f = d.state_frame(&d.lock(), 1);
+        assert!(f.temp.iter().all(|t| t.is_nan()));
+        assert_eq!(
+            status_json(&f)["temp_c"],
+            serde_json::json!([null, null, null, null, null, null, null])
+        );
     }
 
     #[test]
