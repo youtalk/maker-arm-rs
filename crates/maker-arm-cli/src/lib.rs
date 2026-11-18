@@ -8,7 +8,7 @@ pub mod wire;
 use maker_arm::{ArmConfig, JointConfig, MotorModel};
 use maker_arm_protocol::{self as p, mit};
 use maker_arm_transport::{CanBackend, TransportError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 // The session's timing, which is the vendor's: tries, and the wait for each.
 const REPLY: (u32, Duration) = (3, Duration::from_millis(50));
@@ -32,6 +32,8 @@ pub struct ScanRow {
 
 /// Sends `f` up to `tries` times and waits `timeout` each time for the first reply, decoded
 /// with `params`, that `pick` accepts. Frames already queued are dropped before each send.
+/// The next frame goes out only after this reply or the timeout (`CanBackend::send_and_wait`):
+/// every motor replies on one CAN id, so two pending replies collide.
 fn ask<T>(
     backend: &mut dyn CanBackend,
     f: p::Frame,
@@ -41,14 +43,13 @@ fn ask<T>(
 ) -> Result<Option<T>, TransportError> {
     for _ in 0..tries {
         while backend.recv(Duration::ZERO)?.is_some() {}
-        backend.send(f.id, &f.data)?;
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            if let Some((id, data)) = backend.recv(Duration::from_millis(2))? {
-                if let Some(x) = mit::parse_frame(id, &data, params).and_then(&pick) {
-                    return Ok(Some(x));
-                }
-            }
+        let mut got = None;
+        backend.send_and_wait(f.id, &f.data, timeout, &mut |id, data| {
+            got = mit::parse_frame(id, data, params).and_then(&pick);
+            got.is_some()
+        })?;
+        if got.is_some() {
+            return Ok(got);
         }
     }
     Ok(None)
@@ -277,13 +278,26 @@ pub fn zero_motor(
     };
     probe(backend)?;
     let e = |e: TransportError| e.to_string();
+    let wait = (1, Duration::from_micros(config.reply_wait_us));
     for j in &config.joints {
-        let f = mit::encode_disable(j.motor_id);
-        backend.send(f.id, &f.data).map_err(e)?;
+        let m = j.motor_id;
+        ask(
+            backend,
+            mit::encode_disable(m),
+            wait,
+            j.model.params(),
+            |r| match r {
+                mit::Parsed::Feedback(fb) if fb.motor_id == m => Some(()),
+                _ => None,
+            },
+        )
+        .map_err(e)?;
     }
     if !confirm() {
         return Err("aborted".into());
     }
+    // One frame to one motor, and the probe asks the same motor next: no
+    // second motor can answer at the same time.
     let f = mit::encode_set_zero(motor_id);
     backend.send(f.id, &f.data).map_err(e)?;
     probe(backend)

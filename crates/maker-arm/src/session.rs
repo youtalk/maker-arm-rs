@@ -12,6 +12,16 @@
 //! `CanBackend`, which also resolves the SocketCAN loopback hazard from the
 //! MA0 report (a socket never receives its own sent frames; only OTHER
 //! sockets on the interface do).
+//!
+//! One frame on the bus at a time: every motor replies on the same CAN id,
+//! so two pending replies collide (P2 on the real arm: thousands of error
+//! frames and fault-reply timeouts). Every frame goes through `exchange`,
+//! which waits for the reply, or for a timeout, before the next frame. The
+//! fast sweeps (the control loop, the fault poll, the release's first two
+//! passes, the clearing frames) wait `reply_wait_us`; the checks that need
+//! an answer wait `REPLY_TIMEOUT`. A parameter frame to legacy firmware gets
+//! no reply: `read_param` still waits `PARAM_TIMEOUT` for one, because its
+//! silence is how the session tells that firmware apart.
 
 use crate::clamp::ClampError;
 use crate::config::ArmConfig;
@@ -217,6 +227,8 @@ struct MotorSlot {
     last_fault_reply: Option<Instant>,
     /// When `poll_fault` last sent this motor a fault query.
     last_fault_query: Option<Instant>,
+    /// The motor did not reply to its last frame in time.
+    missed: bool,
 }
 
 pub struct Session {
@@ -276,6 +288,7 @@ impl Session {
                 last_feedback: None,
                 last_fault_reply: None,
                 last_fault_query: None,
+                missed: false,
             })
             .collect();
         let health = HealthMonitor::new(&config);
@@ -396,9 +409,10 @@ impl Session {
         Ok(())
     }
 
-    /// Sends `f` up to `tries` times and waits `REPLY_TIMEOUT` each time
-    /// for a new reply in motor slot `idx`: a fault status when `fault`,
-    /// else feedback. False when none came.
+    /// Drains the queue, then sends `f` to motor slot `idx` and waits
+    /// `REPLY_TIMEOUT` for its reply, up to `tries` times. False when none
+    /// came. The drain comes first, so a late reply to an earlier frame
+    /// cannot pass for this one.
     fn ask(
         &mut self,
         idx: usize,
@@ -406,32 +420,59 @@ impl Session {
         fault: bool,
         tries: u32,
     ) -> Result<bool, SessionError> {
-        let last = |s: &MotorSlot| {
-            if fault {
-                s.last_fault_reply
-            } else {
-                s.last_feedback
-            }
-        };
         for _ in 0..tries {
             self.drain()?;
-            let before = last(&self.slots[idx]);
-            self.backend.send(f.id, &f.data)?;
-            let deadline = Instant::now() + REPLY_TIMEOUT;
-            loop {
-                if let Some((id, data)) = self.backend.recv(Duration::from_millis(2))? {
-                    self.dispatch(id, &data);
-                }
-                let now = last(&self.slots[idx]);
-                if now.is_some() && now != before {
-                    return Ok(true);
-                }
-                if Instant::now() >= deadline {
-                    break;
-                }
+            if self.send_to(idx, f, fault, REPLY_TIMEOUT)? {
+                return Ok(true);
             }
         }
         Ok(false)
+    }
+
+    /// Sends `f` to motor slot `idx`, then waits up to `timeout` for that
+    /// motor's reply: a fault status when `fault`, else feedback. Every
+    /// frame that arrives meanwhile is dispatched. False when no reply
+    /// came, which is not a fault by itself.
+    pub(crate) fn send_to(
+        &mut self,
+        idx: usize,
+        f: p::Frame,
+        fault: bool,
+        timeout: Duration,
+    ) -> Result<bool, SessionError> {
+        let j = &self.config.joints[idx];
+        let (m, params) = (j.motor_id, j.model.params());
+        let got = self.exchange(f, timeout, &mut |id, data| {
+            let parsed = mit::parse_frame(id, data, params);
+            match parsed {
+                Some(mit::Parsed::Feedback(fb)) => !fault && fb.motor_id == m,
+                Some(mit::Parsed::Fault(s)) => fault && s.motor_id == m,
+                _ => false,
+            }
+        })?;
+        self.slots[idx].missed = !got;
+        Ok(got)
+    }
+
+    /// `CanBackend::send_and_wait`, then every frame it saw is dispatched,
+    /// also after a receive error.
+    fn exchange(
+        &mut self,
+        f: p::Frame,
+        timeout: Duration,
+        reply: &mut dyn FnMut(u32, &[u8; 8]) -> bool,
+    ) -> Result<bool, SessionError> {
+        let mut seen = Vec::new();
+        let got = self
+            .backend
+            .send_and_wait(f.id, &f.data, timeout, &mut |id, data| {
+                seen.push((id, *data));
+                reply(id, data)
+            });
+        for (id, data) in seen {
+            self.dispatch(id, &data);
+        }
+        Ok(got?)
     }
 
     fn index_of(&self, motor_id: u8) -> Option<usize> {
@@ -492,24 +533,22 @@ impl Session {
     /// comes within `PARAM_TIMEOUT`.
     fn read_param(&mut self, motor_id: u8, index: u16) -> Result<Option<[u8; 4]>, SessionError> {
         let f = mit::encode_read_param(motor_id, index);
-        self.backend.send(f.id, &f.data)?;
-        let deadline = Instant::now() + PARAM_TIMEOUT;
-        while Instant::now() < deadline {
-            if let Some((id, data)) = self.backend.recv(Duration::from_millis(2))? {
-                match mit::parse_frame(id, &data, &p::RS00) {
-                    Some(mit::Parsed::Param(r))
-                        if !r.write && r.motor_id == motor_id && r.index == index =>
-                    {
-                        return Ok(Some(r.raw));
-                    }
-                    _ => self.dispatch(id, &data),
+        let mut value = None;
+        self.exchange(f, PARAM_TIMEOUT, &mut |id, data| {
+            match mit::parse_frame(id, data, &p::RS00) {
+                Some(mit::Parsed::Param(r))
+                    if !r.write && r.motor_id == motor_id && r.index == index =>
+                {
+                    value = Some(r.raw);
                 }
+                _ => {}
             }
-        }
-        Ok(None)
+            value.is_some()
+        })?;
+        Ok(value)
     }
 
-    /// Writes a u32 parameter and reads it back.
+    /// Writes a u32 parameter and reads it back `PARAM_SPACING` later.
     fn write_param(
         &mut self,
         motor_id: u8,
@@ -517,8 +556,7 @@ impl Session {
         value: u32,
     ) -> Result<Option<u32>, SessionError> {
         let f = mit::encode_write_param(motor_id, index, p::ParamValue::U32(value));
-        self.backend.send(f.id, &f.data)?;
-        std::thread::sleep(PARAM_SPACING);
+        self.exchange(f, PARAM_SPACING, &mut |_, _| false)?;
         Ok(self.read_param(motor_id, index)?.map(u32::from_le_bytes))
     }
 
@@ -651,7 +689,8 @@ impl Session {
 
     /// The vendor's checked disable, best effort across every motor: a
     /// zero-gain frame at the measured pose (so a later enable cannot
-    /// resume the old setpoint), a disable to every motor, then per motor a
+    /// resume the old setpoint), a disable to every motor (each of these
+    /// waits up to `reply_wait_us` for its reply), then per motor a
     /// disable whose reply must come within `REPLY_TIMEOUT` and show mode 0
     /// where the firmware reports mode (3 tries). The gripper watchdog is
     /// restored only once the gripper is confirmed off. Every motor gets
@@ -670,12 +709,15 @@ impl Session {
     /// went dark.
     fn disable_all(&mut self) -> Result<(), SessionError> {
         let n = self.config.joints.len();
+        let wait = Duration::from_micros(self.config.reply_wait_us);
         let mut first_err: Option<SessionError> = None;
-        let mut note = |r: Result<(), SessionError>| {
+        let mut note = |r: Result<bool, SessionError>| {
             if let Err(e) = r {
                 first_err.get_or_insert(e);
             }
         };
+        // No drain before these sends: a broken receive must not keep a
+        // disable off the bus.
         for i in 0..n {
             let j = &self.config.joints[i];
             let f = mit::encode_control(
@@ -688,11 +730,11 @@ impl Session {
                 j.model.params(),
             )
             .expect("a measured position always encodes");
-            note(self.send_raw(f.id, &f.data));
+            note(self.send_to(i, f, false, wait));
         }
         for i in 0..n {
             let f = mit::encode_disable(self.config.joints[i].motor_id);
-            note(self.send_raw(f.id, &f.data));
+            note(self.send_to(i, f, false, wait));
         }
         let mut gripper_off = false;
         let mut unconfirmed = Vec::new();
@@ -760,12 +802,13 @@ impl Session {
     }
 
     /// Operator action, as the vendor's: the checked disable, then the
-    /// clearing frame to each motor, 10 ms apart.
+    /// clearing frame to each motor, 10 ms apart after its reply.
     pub fn clear_faults(&mut self) -> Result<(), SessionError> {
         let mut result = self.disable_all();
+        let wait = Duration::from_micros(self.config.reply_wait_us);
         for i in 0..self.config.joints.len() {
             let f = mit::encode_clear_fault(self.config.joints[i].motor_id);
-            if let Err(e) = self.send_raw(f.id, &f.data) {
+            if let Err(e) = self.send_to(i, f, false, wait) {
                 result = result.and(Err(e));
             }
             std::thread::sleep(MOTOR_SPACING);
@@ -778,7 +821,10 @@ impl Session {
     /// once `fault_poll_interval` has passed since that query, as the
     /// vendor does. Paced by the query sent, not the reply: a motor that
     /// never answers is still asked only once per interval, so it cannot
-    /// starve the others.
+    /// starve the others. The query waits up to `reply_wait_us` for its
+    /// reply, except to a motor that missed its last reply: it is most
+    /// likely silent, and a second timeout in one tick would only make the
+    /// tick late.
     pub fn poll_fault(&mut self) -> Result<(), SessionError> {
         let Some((i, slot)) = self
             .slots
@@ -796,7 +842,12 @@ impl Session {
         }
         self.slots[i].last_fault_query = Some(Instant::now());
         let f = mit::encode_fault_query(self.config.joints[i].motor_id);
-        self.send_raw(f.id, &f.data)
+        let wait = if self.slots[i].missed {
+            Duration::ZERO
+        } else {
+            Duration::from_micros(self.config.reply_wait_us)
+        };
+        self.send_to(i, f, true, wait).map(drop)
     }
 
     pub fn state(&self) -> SessionState {
@@ -846,13 +897,6 @@ impl Session {
     /// converting a commanded joint position to the raw motor frame.
     pub(crate) fn wrap_of(&self, idx: usize) -> f64 {
         self.slots[idx].wrap
-    }
-
-    /// Forwards one raw frame to the backend; the control loop's only way
-    /// to put a MIT frame on the wire.
-    pub(crate) fn send_raw(&mut self, id: u32, data: &[u8; 8]) -> Result<(), SessionError> {
-        self.backend.send(id, data)?;
-        Ok(())
     }
 }
 

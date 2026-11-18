@@ -20,6 +20,9 @@ agree byte for byte. See [NOTICE](NOTICE) for the attribution details.
   profile, single-point command clamp, `Controller` trait, health monitoring with
   hold-on-fault, 200 Hz control loop, and `SimArm`, an in-memory 7-motor
   simulator for hardware-free development.
+  Every motor replies on the same CAN id, so the session has one frame on the
+  bus at a time: each frame waits for its motor's reply, or for
+  `reply_wait_us` (3 ms), before the next frame goes out.
   Its `kinematics` module is the six-joint grasp-pose solver the lab's planner
   uses (forward kinematics over a caller-supplied URDF chain, central-difference
   Jacobian, Levenberg-Marquardt refine, multi-seed branch selection, and

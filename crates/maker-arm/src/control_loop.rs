@@ -314,7 +314,7 @@ impl Session {
     /// One control cycle. Runs in `Enabled` (controller drives) and in
     /// `Fault` when holding (internal hold drives; the controller is not
     /// consulted). Every tick also sends at most one fault query
-    /// (`Session::poll_fault`).
+    /// (`Session::poll_fault`), after the last motor's reply.
     ///
     /// # Health checks keep running in `Fault`
     ///
@@ -373,8 +373,8 @@ impl Session {
         // Health checks below run on whatever's cached: a motor's state
         // only updates when a feedback frame is dispatched, so a fault
         // that appears between ticks is visible starting from the tick
-        // after its own MIT round trip lands (drained at the end of THIS
-        // tick, below) -- one tick (one control period) of detection
+        // after its own MIT round trip lands (dispatched while THIS tick
+        // waits for it, below) -- one tick (one control period) of detection
         // latency, same as on real hardware.
         let snapshot = self.arm_state();
         // Owned copy: `self.health.check(&mut ...)` and `self.config()`
@@ -461,9 +461,10 @@ impl Session {
             cmd = hold_cmd;
         }
         self.poll_fault()?;
-        // Drain this tick's own MIT replies now: a caller reading
-        // `arm_state()` right after `tick()` returns must see the ACTUAL
-        // (clamped) values just sent, not a stale cache.
+        // The waits already dispatched each motor's reply. Drain what came
+        // late too: a caller reading `arm_state()` right after `tick()`
+        // returns must see the ACTUAL (clamped) values just sent, not a
+        // stale cache.
         self.drain()?;
         self.tick += 1;
         let record = TickRecord {
@@ -480,7 +481,10 @@ impl Session {
         })
     }
 
-    /// Encodes and sends one MIT frame per motor. A gripper that faulted
+    /// Encodes and sends one MIT frame per motor. Each frame waits up to
+    /// `reply_wait_us` for its motor's reply before the next goes out
+    /// (`Session::send_to`); a silent motor costs that timeout and the
+    /// others still get their frames. A gripper that faulted
     /// itself is released instead, as the vendor's `release_on_fault`: it
     /// gets a disable at once and then every `RELEASE_RESEND`, and no
     /// control frame. A fault on any other motor keeps the gripper held.
@@ -510,7 +514,7 @@ impl Session {
             if gripper == Some(j.motor_id) && self.health.faulted(i) {
                 released = true;
                 if resend {
-                    frames.push(mit::encode_disable(j.motor_id));
+                    frames.push((i, mit::encode_disable(j.motor_id)));
                 }
                 continue;
             }
@@ -538,7 +542,7 @@ impl Session {
                     j.motor_id
                 )));
             };
-            frames.push(f);
+            frames.push((i, f));
             if gripper == Some(j.motor_id) {
                 grip = Some((i, c.pos));
             }
@@ -546,15 +550,9 @@ impl Session {
         if released && resend {
             self.release_sent = Some(Instant::now());
         }
-        let spacing = self.config().inter_frame_us;
-        for f in frames {
-            self.send_raw(f.id, &f.data)?;
-            if spacing > 0 {
-                let until = Instant::now() + Duration::from_micros(spacing);
-                while Instant::now() < until {
-                    std::hint::spin_loop();
-                }
-            }
+        let wait = Duration::from_micros(self.config().reply_wait_us);
+        for (i, f) in frames {
+            self.send_to(i, f, false, wait)?;
         }
         if grip.is_some() {
             self.grip_sent = grip;
@@ -863,8 +861,7 @@ mod tests {
 
     #[test]
     fn a_reader_holding_the_snapshot_lock_does_not_stall_the_loop() {
-        let mut c = ArmConfig::maker_arm_v1();
-        c.inter_frame_us = 0;
+        let c = ArmConfig::maker_arm_v1();
         let mut s = Session::connect(Box::new(SimArm::new(&c)), c.clone()).expect("connect");
         s.enable().expect("enable");
         let running = s
@@ -885,8 +882,7 @@ mod tests {
     }
 
     fn sim_session() -> (ArmConfig, Session) {
-        let mut c = ArmConfig::maker_arm_v1();
-        c.inter_frame_us = 0;
+        let c = ArmConfig::maker_arm_v1();
         let mut s = Session::connect(Box::new(SimArm::new(&c)), c.clone()).expect("connect");
         s.enable().expect("enable");
         (c, s)

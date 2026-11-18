@@ -15,7 +15,11 @@ pub use socketcan_backend::SocketCanBackend;
 use std::io::ErrorKind;
 use std::os::linux::net::SocketAddrExt;
 use std::os::unix::net::{SocketAddr, UnixListener};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// One read inside `send_and_wait`. A wait can end up to this much after
+/// its timeout.
+const RECV_SLICE: Duration = Duration::from_micros(500);
 
 #[derive(Debug)]
 pub enum TransportError {
@@ -66,6 +70,35 @@ pub trait CanBackend: Send {
     /// `SO_RCVTIMEO` reads an all-zero `timeval` as *no* timeout and would
     /// otherwise block forever.)
     fn recv(&mut self, timeout: Duration) -> Result<Option<(u32, [u8; 8])>, TransportError>;
+
+    /// Sends one frame, then gives each frame that arrives to `reply` until
+    /// `reply` returns true or `timeout` has passed. Returns true when
+    /// `reply` did. A zero `timeout` sends and does not read.
+    ///
+    /// Every RobStride motor replies on the same CAN id, so two replies on
+    /// the bus at once collide. Each sender that addresses motors one after
+    /// another uses this, and sends the next frame only after the reply or
+    /// the timeout.
+    fn send_and_wait(
+        &mut self,
+        id: u32,
+        data: &[u8; 8],
+        timeout: Duration,
+        reply: &mut dyn FnMut(u32, &[u8; 8]) -> bool,
+    ) -> Result<bool, TransportError> {
+        self.send(id, data)?;
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            // A fixed slice, never the time left: SocketCAN reads a timeout
+            // under 1 us as no timeout at all.
+            if let Some((id, data)) = self.recv(RECV_SLICE)? {
+                if reply(id, &data) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
 
     /// Test support: downcast access to the concrete backend.
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
