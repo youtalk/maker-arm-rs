@@ -135,7 +135,7 @@ Hold rules:
 - On `sim` or `vcan`, a release ends the daemon.
 - While the daemon runs, `scan`, `doctor`, `zero`, `hold` and the Python binding refuse to open the same interface. Each one names the bus lock `maker-arm-bus-<interface>`.
 - On `sim` or `vcan`, the daemon ends with its command client. Pass `--persist` to keep it running.
-- A command more than 0.05 rad from the last target is refused. The daemon holds until the client sends Deactivate and then Activate.
+- The daemon clamps each arm joint of a command into its limits, as the control loop does, and Activate takes the measured pose clamped the same way. A clamped command more than 0.05 rad from the last target is refused. Thus the first command at the measured pose is accepted, also for a joint that rests outside its limit. After a refusal the daemon holds until the client sends Deactivate and then Activate.
 
 ## Quick start
 
