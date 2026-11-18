@@ -4,8 +4,6 @@
 mod common;
 
 use common::{run_to_exit, scratch_dir, serve_command, Client, Daemon};
-use maker_arm::ArmConfig;
-use maker_arm_cli::files::GripMap;
 use maker_arm_cli::wire::{Mode, Op, Role};
 use std::time::Duration;
 
@@ -195,25 +193,34 @@ fn a_monitor_can_poll_while_a_client_commands() {
     assert_eq!(c.command(q).mode, Mode::Following);
 }
 
+/// The vendor's direction: the jaw gap grows as the gripper angle falls, and closing is the
+/// positive angle direction. The provisional map has the opposite sign, so the tests pass this.
+const VENDOR_GRIP_MAP: &str = "--gripper_map=-0.051059,-0.001991";
+
 #[test]
-fn the_gripper_target_stays_within_the_squeeze_window() {
-    let grip = GripMap::provisional(&ArmConfig::maker_arm_v1());
-    // GRIP_TAU_MAX_NM / kp of the gripper, in gripper_left_joint metres.
-    let window = 0.5 / 20.0 * grip.joint_m_per_rad();
-    let d = Daemon::start(&[]);
+fn the_gripper_closing_target_stays_within_the_squeeze_window_and_opening_is_free() {
+    let d = Daemon::start(&[VENDOR_GRIP_MAP]);
+    // GRIP_TAU_MAX_NM / kp of the gripper (closing only), in gripper_left_joint metres.
+    let window = 1.0 / 20.0 * 0.051059 / 2.0;
     let (mut c, mut q) = activated(&d);
     q[6] = 0.0;
     for _ in 0..3 {
         let before = c.poll().q[6];
-        assert!(before > 10.0 * window, "the jaw starts open: {before}");
         c.command(q);
         sleep_ms(60);
         let moved = before - c.poll().q[6];
         assert!(
             (moved - window).abs() < 0.2 * window,
-            "moved {moved} m, window {window} m"
+            "closed {moved} m, window {window} m"
         );
     }
+    // Opening far from the jaw goes through whole, not a window at a time.
+    let before = c.poll().q[6];
+    q[6] = 0.04;
+    c.command(q);
+    sleep_ms(60);
+    let moved = c.poll().q[6] - before;
+    assert!(moved > 5.0 * window, "opened {moved} m, window {window} m");
 }
 
 #[test]
