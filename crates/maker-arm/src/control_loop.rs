@@ -577,9 +577,9 @@ impl Session {
     /// `encode_control`'s `float_to_uint` would clamp such a
     /// value to the rail and report nothing, so a truncated position at
     /// full kp would go out as if it were the commanded pose. The
-    /// connect-time `RangeNotMappable` check should make this unreachable;
-    /// it is kept as a backstop because silently saturating a torque
-    /// command is exactly the failure being eliminated, and two
+    /// `RangeNotMappable` check at connect and at enable should make this
+    /// unreachable; it is kept as a backstop because silently saturating a
+    /// torque command is exactly the failure being eliminated, and two
     /// comparisons per joint are cheap insurance. The whole command is
     /// validated BEFORE the first frame goes out, so a refusal never
     /// leaves a partially-commanded arm.

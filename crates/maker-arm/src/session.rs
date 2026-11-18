@@ -2,9 +2,9 @@
 //! following the vendor SDK's arm.py (maker-arm-sdk 0245316, spec 6.2).
 //! Connect sends each motor a non-clearing fault query and reads its state
 //! only after a clean answer, infers parameter access from a RUN_MODE read,
-//! and applies the 2π wrap correction once. Enable refuses a reported fault,
-//! a pose outside the grace window, a hot gripper and a joint at its health
-//! limit, arms the gripper
+//! and chooses the 2π wrap correction. Enable chooses the wrap again from
+//! fresh positions, then refuses a reported fault, a pose outside the grace
+//! window, a hot gripper and a joint at its health limit, arms the gripper
 //! watchdog where parameters work, then preloads each motor with a
 //! zero-gain frame before it enables it. Disable is checked per motor, then
 //! the gripper watchdog is restored.
@@ -80,8 +80,9 @@ pub enum SessionError {
         motor_id: u8,
         joint_pos: f64,
     },
-    /// The 2π wrap chosen at connect maps part of the joint's CONFIGURED
-    /// range outside the encoder's `[p_min, p_max]` window. Distinct from
+    /// The 2π wrap chosen for the motor's position (at connect, or again
+    /// before an enable) maps part of the joint's CONFIGURED range outside
+    /// the encoder's `[p_min, p_max]` window. Distinct from
     /// [`SessionError::PositionOutOfRange`] on purpose: the arm's current
     /// pose is fine, but commands near this limit would silently saturate
     /// in `float_to_uint`, so the operator's action is different (re-zero
@@ -175,7 +176,7 @@ impl std::fmt::Display for SessionError {
             } => {
                 write!(
                     f,
-                    "motor {motor_id}: with the {wrap:+.3} rad wrap chosen at connect, its \
+                    "motor {motor_id}: with the {wrap:+.3} rad wrap its position needs, its \
                      configured limit {joint_bound:.3} rad maps to {motor_pos:.3} rad in the \
                      motor frame, past the encoder limit {encoder_limit:.3} rad -- commands \
                      near that limit would saturate silently. Re-zero this motor, or rotate \
@@ -224,7 +225,8 @@ struct MotorSlot {
     state: MotorState,
     /// Raw motor position of the last feedback (before wrap/offset).
     raw_position: f64,
-    /// 2π correction added to the raw motor position (0, +2π, or -2π).
+    /// 2π correction added to the raw motor position (0, +2π, or -2π), from
+    /// `Session::choose_wraps`.
     wrap: f64,
     last_feedback: Option<Instant>,
     last_fault_reply: Option<Instant>,
@@ -344,24 +346,35 @@ impl Session {
                 }
             }
         }
-        // 2π wrap correction, once, at connect (upstream convention).
-        for i in 0..s.config.joints.len() {
-            let j = &s.config.joints[i];
-            let (lo, hi) = (
-                j.q_lo - s.config.enable_limit_grace,
-                j.q_hi + s.config.enable_limit_grace,
-            );
-            let raw = s.slots[i].raw_position;
-            let wrap = [0.0, TAU, -TAU]
-                .into_iter()
-                .find(|w| {
-                    let q = j.to_joint(raw + w);
-                    q.is_finite() && q >= lo && q <= hi
-                })
-                .ok_or(SessionError::PositionOutOfRange {
+        s.choose_wraps()?;
+        Ok(s)
+    }
+
+    /// The 2π wrap correction (upstream convention), from each motor's last
+    /// raw position: the first of 0, +2π and -2π that puts the joint inside
+    /// its limits widened by `enable_limit_grace`. Connect calls it, enable
+    /// calls it again with fresh positions, and so does each released read:
+    /// a motor that restarted, as after the emergency stop, can report its
+    /// position one turn away. A motor that fits no wrap
+    /// (`PositionOutOfRange`) or whose wrap cannot map its configured range
+    /// (`RangeNotMappable`) keeps its old wrap. Every motor is tried, and
+    /// the first error comes back.
+    fn choose_wraps(&mut self) -> Result<(), SessionError> {
+        let grace = self.config.enable_limit_grace;
+        let mut first_err = None;
+        for (j, slot) in self.config.joints.iter().zip(&mut self.slots) {
+            let (lo, hi) = (j.q_lo - grace, j.q_hi + grace);
+            let raw = slot.raw_position;
+            let Some(wrap) = [0.0, TAU, -TAU].into_iter().find(|w| {
+                let q = j.to_joint(raw + w);
+                q.is_finite() && q >= lo && q <= hi
+            }) else {
+                first_err.get_or_insert(SessionError::PositionOutOfRange {
                     motor_id: j.motor_id,
-                    joint_pos: j.to_joint(raw),
-                })?;
+                    joint_pos: j.to_joint(raw + slot.wrap),
+                });
+                continue;
+            };
             // The wrap is chosen from where the arm HAPPENS to be parked,
             // but the control loop's output stage sends
             // `to_motor(q) - wrap` for every commanded q in
@@ -370,31 +383,33 @@ impl Session {
             // `float_to_uint` would clamp it to the rail with no error --
             // a silently truncated position command at full kp (the
             // reviewer measured 1.61 rad of truncation on J3 with
-            // `clamped: false` reported). Refuse to connect instead: the
-            // motor needs re-zeroing or a full turn before it can be
-            // driven safely. Checked against BOTH bounds, since a
-            // negative `direction` swaps which joint bound maps highest.
+            // `clamped: false` reported). Refuse instead: the motor needs
+            // re-zeroing or a full turn before it can be driven safely.
+            // Checked against BOTH bounds, since a negative `direction`
+            // swaps which joint bound maps highest.
             let params = j.model.params();
-            for joint_bound in [j.q_lo, j.q_hi] {
-                let motor_pos = j.to_motor(joint_bound) - wrap;
-                if !(motor_pos >= params.p_min && motor_pos <= params.p_max) {
-                    return Err(SessionError::RangeNotMappable {
-                        motor_id: j.motor_id,
-                        wrap,
-                        joint_bound,
-                        motor_pos,
-                        encoder_limit: if motor_pos > params.p_max {
-                            params.p_max
-                        } else {
-                            params.p_min
-                        },
-                    });
-                }
+            let unmappable = [j.q_lo, j.q_hi]
+                .into_iter()
+                .map(|bound| (bound, j.to_motor(bound) - wrap))
+                .find(|&(_, m)| !(m >= params.p_min && m <= params.p_max));
+            if let Some((joint_bound, motor_pos)) = unmappable {
+                first_err.get_or_insert(SessionError::RangeNotMappable {
+                    motor_id: j.motor_id,
+                    wrap,
+                    joint_bound,
+                    motor_pos,
+                    encoder_limit: if motor_pos > params.p_max {
+                        params.p_max
+                    } else {
+                        params.p_min
+                    },
+                });
+                continue;
             }
-            s.slots[i].wrap = wrap;
-            s.slots[i].state.position = j.to_joint(raw + wrap);
+            slot.wrap = wrap;
+            slot.state.position = j.to_joint(raw + wrap);
         }
-        Ok(s)
+        first_err.map_or(Ok(()), Err)
     }
 
     /// The vendor's order: a non-clearing fault query first, then the
@@ -587,18 +602,12 @@ impl Session {
         for &m in &motor_ids {
             self.probe(m)?;
         }
+        // The limit window: the wrap is chosen again from these fresh
+        // positions, so a motor that restarted a turn away since connect
+        // still enables, and one that fits no wrap is refused.
+        self.choose_wraps()?;
         for (i, j) in self.config.joints.iter().enumerate() {
             let st = &self.slots[i].state;
-            let (lo, hi) = (
-                j.q_lo - self.config.enable_limit_grace,
-                j.q_hi + self.config.enable_limit_grace,
-            );
-            if !st.position.is_finite() || st.position < lo || st.position > hi {
-                return Err(SessionError::PositionOutOfRange {
-                    motor_id: j.motor_id,
-                    joint_pos: st.position,
-                });
-            }
             let limit = self
                 .config
                 .gripper
@@ -873,7 +882,9 @@ impl Session {
     /// Reads every motor with torque off, in `scan`'s order: a non-clearing fault query, then
     /// the clearing state read only after a clean answer, so a reported fault is never erased.
     /// Each frame waits up to `reply_wait_us` for its motor's reply. Never enables or
-    /// commands a motor; only in `Connected`. The result is in `arm_state`.
+    /// commands a motor; only in `Connected`. Then the 2π wrap is chosen again
+    /// (`choose_wraps`): a motor that fits no wrap keeps its old one, and the
+    /// enable refuses it. The result is in `arm_state`.
     pub fn read_motors(&mut self) -> Result<(), SessionError> {
         if self.state != SessionState::Connected {
             return Err(SessionError::WrongState {
@@ -890,6 +901,8 @@ impl Session {
                 self.send_to(i, mit::encode_clear_fault(m), false, wait)?;
             }
         }
+        // Not a read error: the enable reports it.
+        let _ = self.choose_wraps();
         Ok(())
     }
 
@@ -935,7 +948,7 @@ impl Session {
         self.state = s;
     }
 
-    /// The 2π wrap correction recorded for motor slot `idx` at connect —
+    /// The 2π wrap correction chosen for motor slot `idx` at the enable —
     /// the control loop's output stage subtracts it back out when
     /// converting a commanded joint position to the raw motor frame.
     pub(crate) fn wrap_of(&self, idx: usize) -> f64 {
