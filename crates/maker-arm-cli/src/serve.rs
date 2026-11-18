@@ -480,8 +480,8 @@ impl Daemon {
         self.state_frame(&st, seq)
     }
 
-    /// Released: one read of every motor, with torque off. Skipped while a release or an
-    /// enable holds the session.
+    /// Released: one read of every motor, with torque off, which also chooses the 2π wrap
+    /// again (`Session::read_motors`). Skipped while a release or an enable holds the session.
     fn read_parked(&self) -> Result<(), String> {
         let mut parked = match self.session.try_lock() {
             Ok(p) => p,
@@ -1343,6 +1343,24 @@ mod tests {
             sim.set_temperature(3, 35.0);
         });
         assert_eq!(d.enable(&mut a, 4).mode, Mode::Holding);
+    }
+
+    #[test]
+    fn a_motor_that_restarted_a_turn_away_reads_right_and_enables() {
+        // The real arm, 2026-11-18: released, the emergency stop restarted every motor, and
+        // motor 1 then reported its position one turn lower. The enable refused it at -6.293 rad.
+        let (d, _) = daemon(true);
+        release_now(&d);
+        d.read_parked().unwrap();
+        let before = d.state_frame(&d.lock(), 1).q;
+        on_sim(&d, |sim| {
+            sim.set_position(1, sim.position(1) - std::f64::consts::TAU)
+        });
+        d.read_parked().unwrap();
+        let after = d.state_frame(&d.lock(), 2).q;
+        assert!((after[0] - before[0]).abs() < 1e-3, "{after:?}");
+        let (mut a, _b) = UnixStream::pair().unwrap();
+        assert_eq!(d.enable(&mut a, 3).mode, Mode::Holding);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use maker_arm::{ArmConfig, Session, SessionError, SessionState, SimArm};
+use maker_arm::{ArmConfig, HoldController, Session, SessionError, SessionState, SimArm};
 use maker_arm_protocol::{mit, param_index, ParamValue};
 use maker_arm_transport::{CanBackend, TransportError};
 use std::f64::consts::TAU;
@@ -569,6 +569,61 @@ fn connect_accepts_a_negative_wrap_whose_whole_range_still_maps() {
         "expected {true_j4}, got {}",
         s.positions()[3]
     );
+}
+
+#[test]
+fn the_enable_chooses_the_wrap_again_after_a_motor_restart() {
+    // The real arm, 2026-11-18: after the emergency stop, motor 1 reported
+    // its position one turn lower. With the wrap chosen at connect it read
+    // -6.293 rad, and the enable refused it.
+    let c = ArmConfig::maker_arm_v1();
+    let mut s = Session::connect(Box::new(SimArm::new(&c)), c.clone()).expect("connect");
+    let true_j1 = s.positions()[0];
+    let sim = s.backend_as_sim().unwrap();
+    let raw = sim.position(1) - TAU;
+    sim.set_position(1, raw);
+    s.enable().expect("enable a turn away");
+    assert!((s.positions()[0] - true_j1).abs() < 1e-3);
+    // The output stage sends the hold with the new wrap: the motor stays.
+    let mut hold = HoldController::from_config(&c);
+    s.tick(&mut hold).expect("tick");
+    assert!((s.backend_as_sim().unwrap().position(1) - raw).abs() < 1e-3);
+}
+
+#[test]
+fn a_released_read_chooses_the_wrap_again_or_keeps_it() {
+    let c = ArmConfig::maker_arm_v1();
+    let mut s = Session::connect(Box::new(SimArm::new(&c)), c.clone()).expect("connect");
+    let true_j1 = s.positions()[0];
+    let sim = s.backend_as_sim().unwrap();
+    sim.set_position(1, sim.position(1) - TAU);
+    // J4's window is -1.488..2.165 with the grace: 3.5 rad fits no wrap.
+    sim.set_position(4, 3.5);
+    s.read_motors().expect("read");
+    assert!((s.positions()[0] - true_j1).abs() < 1e-3);
+    assert!((s.positions()[3] - 3.5).abs() < 1e-3, "the old wrap stays");
+    match s.enable() {
+        Err(SessionError::PositionOutOfRange { motor_id: 4, .. }) => {}
+        other => panic!("expected PositionOutOfRange(4), got {other:?}"),
+    }
+    let sim = s.backend_as_sim().unwrap();
+    assert!((1..=7).all(|m| sim.enables(m) == 0));
+}
+
+#[test]
+fn the_enable_refuses_a_wrap_that_cannot_map_the_configured_range() {
+    // As `connect_refuses_a_wrap_that_cannot_map_the_configured_range`, but
+    // the motor comes to that position after the connect.
+    let mut c = ArmConfig::maker_arm_v1();
+    c.joints[2].offset = 3.0;
+    let mut s = Session::connect(Box::new(SimArm::new(&c)), c).expect("connect");
+    s.backend_as_sim().unwrap().set_position(3, 3.0 + 2.0 + TAU);
+    match s.enable() {
+        Err(SessionError::RangeNotMappable { motor_id: 3, .. }) => {}
+        other => panic!("expected RangeNotMappable(3), got {other:?}"),
+    }
+    let sim = s.backend_as_sim().unwrap();
+    assert!((1..=7).all(|m| sim.enables(m) == 0));
 }
 
 #[test]
