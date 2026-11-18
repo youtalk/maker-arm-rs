@@ -619,7 +619,6 @@ fn start(
         Ok(()) => {
             let shared = ctrl.shared();
             match session.start(Box::new(ctrl), rt) {
-                // The first tick's health check is the joints' temperature gate.
                 Ok(arm) => match first_tick(&arm, &shared, &SIGNALED, FIRST_TICK) {
                     Ok(()) => return Ok((arm, shared)),
                     Err(e) => {
@@ -1014,12 +1013,12 @@ mod tests {
             .map_err(|e| e.to_string())
     }
 
-    /// A tracking loop on a sim arm, with `hook` applied to the sim before enable.
+    /// A tracking loop on a sim arm, with `hook` applied to the sim after enable.
     fn started(hook: impl FnOnce(&mut SimArm)) -> (RunningArm, Arc<TrackingShared>) {
         let c = ArmConfig::maker_arm_v1();
         let mut s = Session::connect(Box::new(SimArm::new(&c)), c.clone()).unwrap();
-        hook(s.backend_as_sim().unwrap());
         s.enable().unwrap();
+        hook(s.backend_as_sim().unwrap());
         let ctrl = tracking().unwrap();
         let shared = ctrl.shared();
         (s.start(Box::new(ctrl), None).unwrap(), shared)
@@ -1180,12 +1179,12 @@ mod tests {
         on_sim(&d, |sim| {
             assert!((1..=7).all(|m| !sim.enabled(m) && sim.enables(m) == 1));
             sim.set_position(2, at);
-            // The joints' temperature gate is the first tick's health check.
-            sim.set_temperature(3, 80.0);
+            // Ruling R31: a joint at its 70 C health limit, refused before any torque.
+            sim.set_temperature(3, 70.0);
         });
         assert_eq!(d.enable(&mut a, 3).mode, Mode::Released);
         on_sim(&d, |sim| {
-            assert!((1..=7).all(|m| !sim.enabled(m)));
+            assert!((1..=7).all(|m| !sim.enabled(m) && sim.enables(m) == 1));
             sim.set_temperature(3, 35.0);
         });
         assert_eq!(d.enable(&mut a, 4).mode, Mode::Holding);
@@ -1231,6 +1230,22 @@ mod tests {
         // At the start a dead daemon may have left motor 3 on, and it does not confirm off.
         let e = fail(true);
         assert!(e.torque && e.why.contains("; disable: "), "{}", e.why);
+    }
+
+    #[test]
+    fn the_first_enable_refuses_a_joint_at_its_health_limit() {
+        // Ruling R31, through the start path of `run`: no torque, and the reason names it.
+        let c = ArmConfig::maker_arm_v1();
+        let mut s = Session::connect(Box::new(SimArm::new(&c)), c).unwrap();
+        s.backend_as_sim().unwrap().set_temperature(3, 70.0);
+        let Err(e) = start(s, tracking().unwrap(), None, true) else {
+            panic!("a hot joint enabled");
+        };
+        assert!(!e.torque);
+        assert_eq!(e.why, "enable: motor 3 is 70.0 degC, too hot to enable");
+        let mut s = e.session;
+        let sim = s.backend_as_sim().unwrap();
+        assert!((1..=7).all(|m| sim.enables(m) == 0));
     }
 
     #[test]
@@ -1314,22 +1329,27 @@ mod tests {
         assert!(shared.clock().is_some());
     }
 
+    /// No feedback after enable for longer than the feedback timeout, so the first tick's
+    /// health check faults.
+    fn stale(_: &mut SimArm) {
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
     #[test]
     fn a_fault_at_the_first_tick_ends_the_wait_with_its_reason() {
-        // Enable checks no temperature. The first tick's health check does, and the fault hold
-        // never calls the controller, so the tracking clock never starts.
-        let (arm, shared) = started(|sim| sim.set_temperature(3, 80.0));
+        // The fault hold never calls the controller, so the tracking clock never starts.
+        let (arm, shared) = started(stale);
         let quiet = AtomicBool::new(false);
         let t = Instant::now();
         let e = first_tick(&arm, &shared, &quiet, Duration::from_secs(5)).unwrap_err();
-        assert!(e.contains("over temperature"), "{e}");
+        assert!(e.contains("feedback timeout"), "{e}");
         assert!(t.elapsed() < Duration::from_secs(1));
         assert!(shared.clock().is_none());
     }
 
     #[test]
     fn a_signal_ends_the_first_tick_wait() {
-        let (arm, shared) = started(|sim| sim.set_temperature(3, 80.0));
+        let (arm, shared) = started(stale);
         let e = first_tick(
             &arm,
             &shared,
