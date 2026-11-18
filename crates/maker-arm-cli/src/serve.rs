@@ -786,7 +786,8 @@ mod tests {
         let mut st = d.lock();
         d.activate(&mut st);
         assert!(st.active);
-        assert_eq!(st.target[1], lo);
+        // The loop may already have moved the sim a little toward the limit.
+        assert!((st.target[1] - lo).abs() < 1e-3, "{}", st.target[1]);
         let mut q = [0.0; ROW];
         q[..ARM_DOF].copy_from_slice(&st.target);
         d.command(&mut st, &q);
