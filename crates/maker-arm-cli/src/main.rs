@@ -69,6 +69,21 @@ enum Command {
         /// Default: $XDG_RUNTIME_DIR/maker-arm-<interface>.sock
         #[arg(long)]
         socket: Option<PathBuf>,
+        /// Skip the typed RELEASE, for a script that has checked the arm is supported
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Ask a released serve daemon to enable the motors at the measured pose, after a typed
+    /// ENABLE
+    Enable {
+        #[arg(long)]
+        interface: String,
+        /// Default: $XDG_RUNTIME_DIR/maker-arm-<interface>.sock
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        /// Skip the typed ENABLE
+        #[arg(long)]
+        yes: bool,
     },
     /// Print one STATUS line from a running serve daemon
     Status {
@@ -216,8 +231,19 @@ fn main() -> Result<(), String> {
         return Ok(());
     }
     match &cli.command {
-        Command::Release { interface, socket } => {
-            return serve::release(interface, socket.as_deref());
+        Command::Release {
+            interface,
+            socket,
+            yes,
+        } => {
+            return serve::release(interface, socket.as_deref(), *yes);
+        }
+        Command::Enable {
+            interface,
+            socket,
+            yes,
+        } => {
+            return serve::enable(interface, socket.as_deref(), *yes);
         }
         Command::Status { interface, socket } => {
             return serve::status(interface, socket.as_deref());
@@ -383,6 +409,7 @@ fn main() -> Result<(), String> {
         Command::Serve { .. }
         | Command::Export { .. }
         | Command::Release { .. }
+        | Command::Enable { .. }
         | Command::Status { .. } => {
             unreachable!("handled above")
         }

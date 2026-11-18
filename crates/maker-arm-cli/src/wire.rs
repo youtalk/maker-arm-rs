@@ -23,6 +23,8 @@ pub enum Op {
     Deactivate = 2,
     Poll = 3,
     Release = 4,
+    /// Role Release only: enable a released arm again at the measured pose.
+    Enable = 5,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +33,7 @@ pub enum Mode {
     Following = 1,
     Refused = 2,
     Fault = 3,
+    /// Torque off: the reply to a Release, and on a real interface the mode until an Enable.
     Released = 4,
 }
 
@@ -210,6 +213,7 @@ pub fn read_client(r: &mut impl Read) -> Result<ClientFrame, WireError> {
                 2 => Op::Deactivate,
                 3 => Op::Poll,
                 4 => Op::Release,
+                5 => Op::Enable,
                 x => return Err(WireError::Op(x)),
             };
             Ok(ClientFrame::Control {
@@ -302,6 +306,12 @@ mod tests {
             })),
             CONTROL_HEX
         );
+        // Enable is op 5, after the four older ops.
+        let enable = encode_client(&ClientFrame::Control {
+            seq: 7,
+            op: Op::Enable,
+        });
+        assert_eq!(enable[12], 5);
         assert_eq!(
             hex(&encode_client(&ClientFrame::Command { seq: 42, q: Q })),
             COMMAND_HEX
@@ -311,6 +321,10 @@ mod tests {
             ClientFrame::Control {
                 seq: 9,
                 op: Op::Release,
+            },
+            ClientFrame::Control {
+                seq: 9,
+                op: Op::Enable,
             },
             ClientFrame::Command { seq: 1, q: Q },
         ] {

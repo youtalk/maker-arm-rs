@@ -370,6 +370,8 @@ pub struct TrackingController {
     res_fresh: bool,
     /// A gap restarted the history and it is refilling: `tau_res` holds its last value.
     res_refill: bool,
+    /// The gravity torque in the last command (N m), `Controller::gravity`.
+    gravity: Joints,
     telemetry: Telemetry,
     ring: RingWriter<Telemetry>,
 }
@@ -426,6 +428,7 @@ impl TrackingController {
             quiet: 0.0,
             residual,
             tau_res: zero,
+            gravity: zero,
             res_fresh: true,
             res_refill: false,
             telemetry: Telemetry::default(),
@@ -748,6 +751,7 @@ impl Controller for TrackingController {
             dq_r[j] = self.dq_d[j] + self.offset_rate[j];
         }
         let g_r = self.dynamics.gravity(&q_r);
+        self.gravity = g_r;
         let full = self.dynamics.inverse(&q_r, &dq_r, &self.ddq_d);
         let fr = self.dynamics.friction(&dq_r);
         let mut tau_ff = [0.0; ARM_DOF];
@@ -800,6 +804,11 @@ impl Controller for TrackingController {
         }
         self.ring.record(self.telemetry, &self.shared.ring);
         cmd
+    }
+
+    /// The model's gravity at the reference pose, the `g_r` in `tau_ff`. The gripper has none.
+    fn gravity(&self) -> Vec<f64> {
+        self.gravity.to_vec()
     }
 }
 

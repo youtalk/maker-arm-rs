@@ -278,12 +278,15 @@ impl Session {
             // Joints 1-6 hold the measured pose. The gripper keeps its last
             // sent target, within `1.0 Nm / kp` of the jaw under serve, so
             // a held object keeps its squeeze, as the vendor keeps its
-            // gripper regulation in a fault hold.
+            // gripper regulation in a fault hold. Every joint keeps the
+            // gravity torque of the last command: without it, J3 sagged
+            // 50 mrad on the real arm.
             let mut targets: Vec<f64> = at.motors.iter().map(|m| m.position).collect();
             if let Some((i, pos)) = self.grip_sent {
                 targets[i] = pos;
             }
-            let hold = HoldController::with_targets(self.config(), targets);
+            let mut hold = HoldController::with_targets(self.config(), targets);
+            hold.tau = self.gravity.clone();
             // The hold target is the pose the arm was measured at, but it
             // still goes through `clamp_command` like any other command,
             // and the clamp pulls it back inside `q_lo..q_hi`. A pose that
@@ -459,6 +462,13 @@ impl Session {
             // on firmware without parameter access no motor has one.
             let _refused_again = self.send_mit_all(&hold_cmd)?;
             cmd = hold_cmd;
+        } else if self.state() == SessionState::Enabled {
+            // Only a finite torque: a NaN in the hold would fail its clamp and end the loop.
+            self.gravity = controller
+                .gravity()
+                .into_iter()
+                .map(|t| if t.is_finite() { t } else { 0.0 })
+                .collect();
         }
         self.poll_fault()?;
         // The waits already dispatched each motor's reply. Drain what came

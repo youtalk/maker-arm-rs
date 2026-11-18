@@ -76,6 +76,60 @@ impl Controller for GoesNan {
     }
 }
 
+/// Test controller: holds `inner`'s targets and sends a gravity torque that changes every tick.
+struct Heavy {
+    inner: GoTo,
+    ticks: u32,
+}
+
+impl Controller for Heavy {
+    fn update(&mut self, state: &ArmState, dt: f64) -> ArmCommand {
+        self.ticks += 1;
+        let g = self.gravity();
+        let mut cmd = self.inner.update(state, dt);
+        for (c, g) in cmd.iter_mut().zip(g) {
+            c.tau = g;
+        }
+        cmd
+    }
+
+    fn gravity(&self) -> Vec<f64> {
+        (0..6)
+            .map(|j| 0.1 * f64::from(self.ticks) + 0.01 * j as f64)
+            .collect()
+    }
+}
+
+#[test]
+fn a_fault_hold_keeps_the_gravity_of_the_tick_before() {
+    let c = fast(ArmConfig::maker_arm_v1());
+    let mut s = enabled_session(&c);
+    let mut heavy = Heavy {
+        inner: GoTo::new(&c, s.positions()),
+        ticks: 0,
+    };
+    for _ in 0..3 {
+        s.tick(&mut heavy).expect("tick");
+    }
+    s.backend_as_sim().unwrap().set_temperature(3, 80.0);
+    // This tick's reply carries the heat; the next tick sees it.
+    assert!(s.tick(&mut heavy).expect("tick").fault.is_none());
+    let before = heavy.gravity();
+    for _ in 0..3 {
+        let out = s.tick(&mut heavy).expect("hold");
+        assert!(matches!(
+            out.fault,
+            Some(FaultReason::OverTemperature { motor_id: 3, .. })
+        ));
+        let sent = out.record.expect("the hold sends").sent;
+        for j in 0..6 {
+            assert_eq!(sent[j].tau, before[j], "joint {j}");
+        }
+        assert_eq!(sent[6].tau, 0.0, "the gripper has no gravity");
+    }
+    assert_eq!(heavy.ticks, 4, "the hold never asks the controller");
+}
+
 #[test]
 fn hold_keeps_the_pose() {
     let c = fast(ArmConfig::maker_arm_v1());

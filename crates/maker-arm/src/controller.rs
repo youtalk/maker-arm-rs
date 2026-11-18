@@ -10,6 +10,12 @@ pub trait Controller: Send {
     /// Called once per tick with the latest state; returns the desired
     /// command in joint coordinates. `dt` is the nominal tick period (s).
     fn update(&mut self, state: &ArmState, dt: f64) -> ArmCommand;
+
+    /// The gravity torque in the last command, per joint (N m). A fault hold keeps sending
+    /// it, as the vendor's loop sends `gravity[i]` every tick. Empty: no model, no torque.
+    fn gravity(&self) -> Vec<f64> {
+        Vec::new()
+    }
 }
 
 /// Holds a pose with the profile's per-joint kp/kd. The first production
@@ -17,6 +23,8 @@ pub trait Controller: Send {
 pub struct HoldController {
     gains: Vec<(f64, f64)>,
     targets: Option<Vec<f64>>,
+    /// Feed-forward per joint (N m), 0 past its end: the fault hold's gravity.
+    pub(crate) tau: Vec<f64>,
 }
 
 impl HoldController {
@@ -25,6 +33,7 @@ impl HoldController {
         HoldController {
             gains: config.joints.iter().map(|j| (j.kp, j.kd)).collect(),
             targets: None,
+            tau: Vec::new(),
         }
     }
 
@@ -32,6 +41,7 @@ impl HoldController {
         HoldController {
             gains: config.joints.iter().map(|j| (j.kp, j.kd)).collect(),
             targets: Some(targets),
+            tau: Vec::new(),
         }
     }
 
@@ -50,12 +60,13 @@ impl Controller for HoldController {
         targets
             .iter()
             .zip(&self.gains)
-            .map(|(&pos, &(kp, kd))| JointCommand {
+            .enumerate()
+            .map(|(i, (&pos, &(kp, kd)))| JointCommand {
                 pos,
                 vel: 0.0,
                 kp,
                 kd,
-                tau: 0.0,
+                tau: self.tau.get(i).copied().unwrap_or(0.0),
             })
             .collect()
     }

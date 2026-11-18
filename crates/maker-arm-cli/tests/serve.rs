@@ -328,11 +328,16 @@ fn doctor_on_a_held_bus_exits_before_it_opens_the_bus() {
     );
 }
 
-/// Runs `maker-arm-cli <sub>` against `socket` with `stdin` typed in.
-fn client_cli(sub: &str, socket: &std::path::Path, stdin: &str) -> (Option<i32>, String, String) {
+/// Runs `maker-arm-cli <sub...>` against `socket` with `stdin` typed in.
+fn client_cli(
+    sub: &[&str],
+    socket: &std::path::Path,
+    stdin: &str,
+) -> (Option<i32>, String, String) {
     use std::io::Write;
     let mut c = std::process::Command::new(common::BIN);
-    c.args([sub, "--interface", "sim", "--socket"])
+    c.args(sub)
+        .args(["--interface", "sim", "--socket"])
         .arg(socket)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -355,7 +360,7 @@ fn client_cli(sub: &str, socket: &std::path::Path, stdin: &str) -> (Option<i32>,
 fn release_needs_the_typed_word_and_then_disables_and_exits() {
     let mut d = Daemon::start(&["--persist"]);
     let (mut c, _) = activated(&d);
-    let (code, out, err) = client_cli("release", &d.socket, "no\nRELEASE\n");
+    let (code, out, err) = client_cli(&["release"], &d.socket, "no\nRELEASE\n");
     assert_eq!(code, Some(0), "{out}{err}");
     assert!(out.contains("torque remains enabled"), "{out}");
     assert!(out.contains("torque released."), "{out}");
@@ -366,6 +371,41 @@ fn release_needs_the_typed_word_and_then_disables_and_exits() {
         .is_some());
     assert!(!d.socket.exists());
     assert!(c.control(Op::Poll).is_err(), "the Command client reads EOF");
+}
+
+#[test]
+fn release_yes_skips_the_typed_word() {
+    let mut d = Daemon::start(&["--persist"]);
+    let (code, out, err) = client_cli(&["release", "--yes"], &d.socket, "");
+    assert_eq!(code, Some(0), "{out}{err}");
+    assert!(!out.contains("Type RELEASE"), "{out}");
+    assert!(out.contains("torque released."), "{out}");
+    // On sim, a release still ends the daemon.
+    assert_eq!(
+        d.exit_within(Duration::from_secs(2)).unwrap().code(),
+        Some(0)
+    );
+}
+
+#[test]
+fn enable_is_refused_unless_the_daemon_is_released() {
+    let d = Daemon::start(&["--persist"]);
+    for sub in [&["enable", "--yes"][..], &["enable"]] {
+        let (code, out, err) = client_cli(sub, &d.socket, "ENABLE\n");
+        assert_eq!(code, Some(1), "{out}{err}");
+        assert!(err.contains("holding, not released"), "{err}");
+        assert!(!out.contains("type ENABLE"), "no prompt: {out}");
+    }
+    // On the wire: a Release client's Enable answers the mode it changed nothing in.
+    let mut r = d.connect(Role::Release);
+    assert_eq!(r.control(Op::Enable).unwrap().mode, Mode::Holding);
+    // Enable is the Release role's only: a Command or Monitor client is closed.
+    for role in [Role::Command, Role::Monitor] {
+        let mut c = d.connect(role);
+        c.poll();
+        assert!(c.control(Op::Enable).is_err(), "{role:?}");
+    }
+    assert_eq!(d.connect(Role::Monitor).poll().mode, Mode::Holding);
 }
 
 #[test]
@@ -395,10 +435,10 @@ fn release_without_the_word_leaves_the_arm_holding() {
 fn release_without_a_daemon_names_the_socket() {
     let dir = scratch_dir();
     let socket = dir.join("none.sock");
-    let (code, _, err) = client_cli("release", &socket, "RELEASE\n");
+    let (code, _, err) = client_cli(&["release"], &socket, "RELEASE\n");
     assert_eq!(code, Some(1));
     assert!(err.contains(&socket.display().to_string()), "{err}");
-    let (code, _, err) = client_cli("status", &socket, "");
+    let (code, _, err) = client_cli(&["status"], &socket, "");
     assert_eq!(code, Some(1));
     assert!(err.contains(&socket.display().to_string()), "{err}");
     let _ = std::fs::remove_dir_all(dir);
@@ -407,7 +447,7 @@ fn release_without_a_daemon_names_the_socket() {
 #[test]
 fn status_prints_one_status_line() {
     let d = Daemon::start(&[]);
-    let (code, out, err) = client_cli("status", &d.socket, "");
+    let (code, out, err) = client_cli(&["status"], &d.socket, "");
     assert_eq!(code, Some(0), "{err}");
     let line = out.trim_end();
     assert_eq!(line.lines().count(), 1, "{out}");
@@ -420,6 +460,9 @@ fn status_prints_one_status_line() {
         (Some(0), Some(0))
     );
     assert_eq!(v["fault"].as_u64(), Some(0));
+    // The sim's motors are all at 35 C.
+    assert_eq!(v["temp_max_c"].as_f64(), Some(35.0));
+    assert!((1..=7).contains(&v["temp_max_motor"].as_u64().unwrap()));
     assert!(v["t"].as_f64().is_some());
     assert_eq!(v["digest"].as_str().unwrap().len(), 16);
     // A status poll is a Monitor: the daemon still runs.
