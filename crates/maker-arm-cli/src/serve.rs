@@ -364,7 +364,8 @@ impl Daemon {
     /// ignored. A fault during the ramp ends it: the arm holds, and the reply says Fault. Else
     /// the reply goes out only after the motors are disabled. On a real interface the daemon
     /// stays up, released, and returns the reply. Else, and after a failed disable, it exits
-    /// holding the state lock.
+    /// holding the state lock. With no arm, the reply says Released only in mode Released:
+    /// after a disable that panicked, it says Fault.
     fn release(&self, stream: &mut UnixStream, seq: u32) -> StateFrame {
         // An enable in flight finishes first, and a signal, an enable or a second release waits
         // for this one.
@@ -393,8 +394,16 @@ impl Daemon {
         }
         let mut frame = self.state_frame(&st, seq);
         frame.mode = Mode::Released;
-        // No arm: released already.
         let Some(arm) = st.arm.take() else {
+            // No arm: released already, or a disable that panicked left none and confirmed
+            // nothing. Never claim a release that did not happen.
+            if st.mode != Mode::Released {
+                log(
+                    "release refused: no control loop, and no disable confirmed the motors off. \
+                     They may keep their last command. Support the arm.",
+                );
+                frame.mode = Mode::Fault;
+            }
             return frame;
         };
         // The disable waits for each motor's answer over CAN: about 30 ms on the real arm, too
@@ -1429,6 +1438,8 @@ mod tests {
         };
         let f = d.handle(Role::Monitor, poll).unwrap();
         assert_eq!(f.mode, Mode::Fault);
+        // A second release finds no arm, and must not answer Released.
+        assert_eq!(d.release(&mut a, 3).mode, Mode::Fault);
     }
 
     #[test]
