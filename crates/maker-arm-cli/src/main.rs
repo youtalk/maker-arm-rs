@@ -28,7 +28,23 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Probe motors 1..=7 read-only and print what answers
-    Scan,
+    Scan {
+        /// Print live joint values forever (or --count sweeps) and never enable a motor
+        #[arg(long)]
+        watch: bool,
+        /// With --watch: a profile JSON for direction, offset and limits
+        #[arg(long, requires = "watch")]
+        profile: Option<PathBuf>,
+        /// With --watch: the jaw map, two numbers "a,b"
+        #[arg(long = "gripper_map", value_name = "A,B", requires = "watch")]
+        gripper_map: Option<String>,
+        /// With --watch: sweeps per second
+        #[arg(long, default_value_t = 5.0, requires = "watch")]
+        hz: f64,
+        /// With --watch: stop after this many sweeps
+        #[arg(long, requires = "watch")]
+        count: Option<u64>,
+    },
     /// Scan plus param reads, limit checks, and known-trap warnings
     Doctor,
     /// Zero one motor's position register (torque-free; confirm required)
@@ -252,11 +268,74 @@ fn main() -> Result<(), String> {
         }
         _ => {}
     }
-    let config = ArmConfig::maker_arm_v1();
+    let mut config = ArmConfig::maker_arm_v1();
+    let mut grip = maker_arm_cli::files::GripMap::provisional();
+    if let Command::Scan {
+        watch: true,
+        profile,
+        gripper_map,
+        hz,
+        ..
+    } = &cli.command
+    {
+        if !(hz.is_finite() && *hz > 0.0) {
+            return Err("--hz must be a positive number".into());
+        }
+        if let Some(p) = profile {
+            let text = std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()))?;
+            let v = serde_json::from_slice(&text).map_err(|e| format!("{}: {e}", p.display()))?;
+            let iface = cli.can.as_deref().unwrap_or("sim");
+            config = maker_arm_cli::files::profile_from_json(&v, iface)
+                .map_err(|e| format!("{}: {e}", p.display()))?;
+        }
+        if let Some(t) = gripper_map {
+            grip = maker_arm_cli::files::GripMap::parse(t)?;
+        }
+    }
     // Declared before anything that can hold the arm, so it drops last.
     let (_bus, mut backend) = open_backend(&cli, &config)?;
     match cli.command {
-        Command::Scan => {
+        Command::Scan {
+            watch: true,
+            hz,
+            count,
+            ..
+        } => {
+            let (start, mut wraps) = (std::time::Instant::now(), None);
+            let mut out = std::io::stdout().lock();
+            // The fault word last shown per motor.
+            let mut shown = [0u32; 7];
+            for n in 0.. {
+                if count.is_some_and(|c| n >= c) {
+                    break;
+                }
+                let t = start.elapsed();
+                let (q, faults) =
+                    maker_arm_cli::watch_sweep(backend.as_mut(), &config, &grip, &mut wraps)
+                        .map_err(|e| e.to_string())?;
+                // A faulted motor reads nan like an absent one: name its fault once.
+                for ((j, &w), s) in config.joints.iter().zip(&faults).zip(&mut shown) {
+                    if w != 0 && w != *s {
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "motor {} reports a fault: {}",
+                            j.motor_id,
+                            fault(w)
+                        );
+                    }
+                    *s = w;
+                }
+                let vals: Vec<String> = q.iter().map(|v| v.to_string().to_lowercase()).collect();
+                // A closed stdout ends the watch.
+                if writeln!(out, "WATCH {:.3} {}", t.as_secs_f64(), vals.join(" ")).is_err() {
+                    break;
+                }
+                let _ = out.flush();
+                let next = t + std::time::Duration::from_secs_f64(1.0 / hz);
+                std::thread::sleep(next.saturating_sub(start.elapsed()));
+            }
+        }
+        Command::Scan { .. } => {
             let rows = maker_arm_cli::scan(backend.as_mut(), &config).map_err(|e| e.to_string())?;
             println!(
                 "{:>3} {:>8} {:>5} {:>7} {:>9} {:>4} {:>6} {:>6} fault",

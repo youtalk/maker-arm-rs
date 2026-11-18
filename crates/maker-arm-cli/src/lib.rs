@@ -8,6 +8,7 @@ pub mod wire;
 use maker_arm::{ArmConfig, JointConfig, MotorModel};
 use maker_arm_protocol::{self as p, mit};
 use maker_arm_transport::{CanBackend, TransportError};
+use std::f64::consts::TAU;
 use std::time::Duration;
 
 // The session's timing, which is the vendor's: tries, and the wait for each.
@@ -142,6 +143,52 @@ pub fn scan(
         });
     }
     Ok(rows)
+}
+
+/// One `scan --watch` sweep: J1 to J6 in URDF-frame radians and the jaw in metres per jaw, NaN for
+/// a motor that gives no state. It probes like `scan`, so it never enables or commands a motor
+/// and never clears a reported fault. The first sweep that hears all six joints picks each
+/// joint's 2-pi wrap like `Session::connect` does and `wraps` keeps it for the later sweeps.
+/// Each motor's fault word comes back too, 0 for a clean or absent motor: a faulted motor reads
+/// NaN like an absent one.
+pub fn watch_sweep(
+    backend: &mut dyn CanBackend,
+    config: &ArmConfig,
+    grip: &files::GripMap,
+    wraps: &mut Option<[f64; 6]>,
+) -> Result<([f64; 7], [u32; 7]), TransportError> {
+    let (mut raw, mut faults) = ([f64::NAN; 7], [0; 7]);
+    for ((r, w), j) in raw.iter_mut().zip(&mut faults).zip(&config.joints) {
+        let probe = probe_one(backend, j)?;
+        *w = probe.as_ref().map_or(0, |pr| pr.fault_word);
+        if let Some(fb) = probe.and_then(|pr| pr.feedback) {
+            *r = fb.position;
+        }
+    }
+    let chosen = wraps.unwrap_or_else(|| {
+        let mut w = [0.0; 6];
+        for (w, (j, r)) in w.iter_mut().zip(config.joints.iter().zip(raw)) {
+            let (lo, hi) = (
+                j.q_lo - config.enable_limit_grace,
+                j.q_hi + config.enable_limit_grace,
+            );
+            // No wrap inside the limits: show the plain reading.
+            *w = [0.0, TAU, -TAU]
+                .into_iter()
+                .find(|w| (lo..=hi).contains(&j.to_joint(r + w)))
+                .unwrap_or(0.0);
+        }
+        w
+    });
+    if raw[..6].iter().all(|r| r.is_finite()) {
+        *wraps = Some(chosen);
+    }
+    let mut q = [f64::NAN; 7];
+    for i in 0..6 {
+        q[i] = config.joints[i].to_joint(raw[i] + chosen[i]);
+    }
+    q[6] = grip.to_joint_m(config.joints[6].to_joint(raw[6]));
+    Ok((q, faults))
 }
 
 #[derive(Debug, Clone)]

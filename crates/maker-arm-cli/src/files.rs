@@ -64,7 +64,7 @@ impl GripMap {
         GripMap::from_points(0.006713, -2.078984)
     }
 
-    fn parse(text: &str) -> Result<GripMap, String> {
+    pub fn parse(text: &str) -> Result<GripMap, String> {
         let nums: Vec<f64> = text
             .split(',')
             .filter_map(|s| s.trim().parse().ok())
