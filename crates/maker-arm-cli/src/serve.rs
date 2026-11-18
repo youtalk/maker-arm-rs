@@ -5,7 +5,10 @@
 
 use maker_arm::kinematics::ARM_DOF;
 use maker_arm::tracking::{Push, Row, TrackingController, TrackingShared, ROW};
-use maker_arm::{ArmConfig, FaultReason, LoopRt, RunningArm, Session, SessionError, SimArm};
+use maker_arm::{
+    clamp_command, ArmConfig, FaultReason, JointCommand, LoopRt, RunningArm, Session, SessionError,
+    SimArm,
+};
 use maker_arm_cli::files::{self, GripMap, Loaded, ServeOptions};
 use maker_arm_cli::wire::{self, ClientFrame, Mode, Op, Role, StateFrame, WireError};
 use maker_arm_transport::CanBackend;
@@ -82,6 +85,8 @@ impl State {
 }
 
 struct Daemon {
+    /// The limits the loop clamps commands into; Activate clamps the measured pose the same way.
+    config: ArmConfig,
     state: Mutex<State>,
     shared: Arc<TrackingShared>,
     grip: GripMap,
@@ -158,9 +163,26 @@ impl Daemon {
         let Some(snap) = st.arm.as_ref().and_then(RunningArm::snapshot) else {
             return;
         };
+        // The loop pulls a joint that rests outside its limits to the clamped pose. Take that
+        // pose as the jump reference, or the client's first command after the pull-in is refused.
+        let pose: Vec<JointCommand> = snap
+            .arm
+            .motors
+            .iter()
+            .map(|m| JointCommand {
+                pos: m.position,
+                vel: 0.0,
+                kp: 0.0,
+                kd: 0.0,
+                tau: 0.0,
+            })
+            .collect();
+        let Ok((clamped, _)) = clamp_command(&pose, &self.config) else {
+            return;
+        };
         let mut row = [0.0; ROW];
-        for (r, m) in row.iter_mut().zip(&snap.arm.motors) {
-            *r = m.position;
+        for (r, c) in row.iter_mut().zip(&clamped) {
+            *r = c.pos;
         }
         if self.push(row) {
             st.target.copy_from_slice(&row[..ARM_DOF]);
@@ -627,6 +649,7 @@ pub fn run(o: &ServeOptions, check: bool) -> Result<(), String> {
             command: None,
             exit: None,
         }),
+        config: config.clone(),
         shared,
         grip,
         grip_window,
@@ -723,6 +746,54 @@ mod tests {
         let ctrl = TrackingController::new(model, TrackingParams::default(), &c, None).unwrap();
         let shared = ctrl.shared();
         (s.start(Box::new(ctrl), None).unwrap(), shared)
+    }
+
+    #[test]
+    fn activate_takes_the_jump_reference_from_inside_the_limits() {
+        let c = ArmConfig::maker_arm_v1();
+        let (arm, shared) = started(|sim| {
+            let j = &c.joints[1];
+            sim.set_position(j.motor_id, j.q_lo - 0.3);
+        });
+        first_tick(
+            &arm,
+            &shared,
+            &AtomicBool::new(false),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let d = Daemon {
+            config: c.clone(),
+            state: Mutex::new(State {
+                arm: Some(arm),
+                mode: Mode::Holding,
+                active: false,
+                target: [0.0; ARM_DOF],
+                last_command: Instant::now(),
+                clamped: 0,
+                refused: 0,
+                command: None,
+                exit: None,
+            }),
+            shared,
+            grip: GripMap::new(1.0, 0.0).unwrap(),
+            grip_window: 0.1,
+            digest: 0,
+            exit_with_client: false,
+            socket: PathBuf::new(),
+        };
+        let lo = c.joints[1].q_lo + c.limit_margin;
+        let mut st = d.lock();
+        d.activate(&mut st);
+        assert!(st.active);
+        assert_eq!(st.target[1], lo);
+        let mut q = [0.0; ROW];
+        q[..ARM_DOF].copy_from_slice(&st.target);
+        d.command(&mut st, &q);
+        assert_eq!(st.mode, Mode::Following);
+        q[1] = lo - 0.06;
+        d.command(&mut st, &q);
+        assert_eq!(st.mode, Mode::Refused);
     }
 
     #[test]
