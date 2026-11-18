@@ -185,6 +185,26 @@ fn enable_refuses_a_hot_gripper() {
 }
 
 #[test]
+fn enable_refuses_a_joint_at_its_health_limit() {
+    // Ruling R31: before any torque, not after a first tick at kp.
+    let c = ArmConfig::maker_arm_v1();
+    let mut s = Session::connect(Box::new(SimArm::new(&c)), c.clone()).expect("connect");
+    s.backend_as_sim()
+        .unwrap()
+        .set_temperature(3, c.temp_hold_c);
+    let e = s.enable().unwrap_err();
+    assert!(
+        matches!(e, SessionError::TooHot { motor_id: 3, celsius } if celsius == c.temp_hold_c),
+        "{e:?}"
+    );
+    assert_eq!(e.to_string(), "motor 3 is 70.0 degC, too hot to enable");
+    let sim = s.backend_as_sim().unwrap();
+    assert!((1..=7).all(|m| sim.enables(m) == 0));
+    sim.set_temperature(3, c.temp_hold_c - 0.1);
+    s.enable().expect("enable below the limit");
+}
+
+#[test]
 fn enable_preloads_a_zero_gain_frame_at_the_measured_pose() {
     let c = ArmConfig::maker_arm_v1();
     let mut s = Session::connect(Box::new(SimArm::new(&c)), c.clone()).expect("connect");

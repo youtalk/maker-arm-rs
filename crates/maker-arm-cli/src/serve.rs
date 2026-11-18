@@ -380,8 +380,9 @@ impl Daemon {
 
     /// Enables a released arm at the measured pose behind every gate of the first enable, and
     /// starts a new loop: mode Holding, and the client must Activate again. In any other mode
-    /// nothing is sent. A failed gate disables every motor and stays released; a disable that
-    /// does not confirm every motor ends the daemon, as a failed release does.
+    /// nothing is sent. A failed gate sends nothing more and stays released. A motor that got
+    /// an enable frame and does not confirm its disable ends the daemon, as a failed release
+    /// does.
     fn enable(&self, stream: &mut UnixStream, seq: u32) -> StateFrame {
         let mut parked = self.lock_session();
         let session = {
@@ -395,11 +396,11 @@ impl Daemon {
         // Off the state lock: the gates, the enable and the first tick take longer than a
         // client's poll may wait. Meanwhile the replies show the last read, released.
         let started = session.map(|session| match (self.tracking)() {
-            Ok(ctrl) => start(session, ctrl, self.rt),
+            Ok(ctrl) => start(session, ctrl, self.rt, false),
             Err(why) => Err(Box::new(NotStarted {
                 session,
                 why,
-                disable: Ok(()),
+                torque: false,
             })),
         });
         let mut st = self.lock();
@@ -415,12 +416,12 @@ impl Daemon {
                 let NotStarted {
                     session,
                     why,
-                    disable,
+                    torque,
                 } = *e;
-                if let Err(d) = disable {
+                if torque {
                     log(&format!(
-                        "enable refused: {why}; disable: {d}. The motors may keep their last \
-                         command. Support the arm."
+                        "enable refused: {why}. The motors may keep their last command. \
+                         Support the arm."
                     ));
                     let mut frame = self.state_frame(&st, seq);
                     frame.mode = Mode::Fault;
@@ -579,26 +580,45 @@ fn first_tick(
     }
 }
 
-/// Why a loop did not start, with the session back after a disable to every motor.
+/// Why a loop did not start, with the session back.
 struct NotStarted {
     session: Session,
     why: String,
-    /// An error names a motor that may still hold torque.
-    disable: Result<(), SessionError>,
+    /// A disable did not confirm every motor off: one may still hold torque.
+    torque: bool,
 }
 
 /// A started loop and its tracking half.
 type Started = Result<(RunningArm, Arc<TrackingShared>), Box<NotStarted>>;
 
 /// Enables `session` behind every enable gate, starts the loop on `ctrl` and waits for its
-/// first tick. The first enable and every later `Enable` take this one path.
-fn start(mut session: Session, ctrl: TrackingController, rt: Option<LoopRt>) -> Started {
+/// first tick. The first enable and every later `Enable` take this one path. With `sweep`,
+/// a failed enable also disables every motor: at the start, a dead daemon may have left one
+/// on.
+fn start(
+    mut session: Session,
+    ctrl: TrackingController,
+    rt: Option<LoopRt>,
+    sweep: bool,
+) -> Started {
     let why = match session.enable() {
+        // Released, every motor confirmed off at the release. After any frame that can enable
+        // a motor, `Session::enable` disables every motor itself, and only its `NotDisabled`
+        // names one that may hold torque. A failed gate sent no such frame, and a disable
+        // here would only fail on a silent motor.
+        Err(e) if !sweep => {
+            let torque = matches!(e, SessionError::NotDisabled { .. });
+            let why = format!("enable: {e}");
+            return Err(Box::new(NotStarted {
+                session,
+                why,
+                torque,
+            }));
+        }
         Err(e) => format!("enable: {e}"),
         Ok(()) => {
             let shared = ctrl.shared();
             match session.start(Box::new(ctrl), rt) {
-                // The first tick's health check is the joints' temperature gate.
                 Ok(arm) => match first_tick(&arm, &shared, &SIGNALED, FIRST_TICK) {
                     Ok(()) => return Ok((arm, shared)),
                     Err(e) => {
@@ -614,11 +634,14 @@ fn start(mut session: Session, ctrl: TrackingController, rt: Option<LoopRt>) -> 
         }
     };
     // Leave torque off on every motor, also on one that a dead daemon left on.
-    let disable = session.disable();
+    let (why, torque) = match session.disable() {
+        Ok(()) => (why, false),
+        Err(d) => (format!("{why}; disable: {d}"), true),
+    };
     Err(Box::new(NotStarted {
         session,
         why,
-        disable,
+        torque,
     }))
 }
 
@@ -847,12 +870,13 @@ pub fn run(o: &ServeOptions, check: bool) -> Result<(), String> {
         return Err("interrupted before the motors were enabled".into());
     }
     let rt = o.rt.then_some(RT);
-    let (arm, shared) = start(session, ctrl, rt).map_err(|e| match e.disable {
-        Ok(()) => format!("{}: {}", o.interface, e.why),
-        Err(d) => format!(
-            "{}: {}; disable: {d}. The motors may keep their last command. Support the arm.",
-            o.interface, e.why
-        ),
+    let (arm, shared) = start(session, ctrl, rt, true).map_err(|e| {
+        let support = if e.torque {
+            ". The motors may keep their last command. Support the arm."
+        } else {
+            ""
+        };
+        format!("{}: {}{support}", o.interface, e.why)
     })?;
     // A failure from here to the bind comes before any client: dropping `arm` disables it,
     // as it was a moment before the start.
@@ -989,12 +1013,12 @@ mod tests {
             .map_err(|e| e.to_string())
     }
 
-    /// A tracking loop on a sim arm, with `hook` applied to the sim before enable.
+    /// A tracking loop on a sim arm, with `hook` applied to the sim after enable.
     fn started(hook: impl FnOnce(&mut SimArm)) -> (RunningArm, Arc<TrackingShared>) {
         let c = ArmConfig::maker_arm_v1();
         let mut s = Session::connect(Box::new(SimArm::new(&c)), c.clone()).unwrap();
-        hook(s.backend_as_sim().unwrap());
         s.enable().unwrap();
+        hook(s.backend_as_sim().unwrap());
         let ctrl = tracking().unwrap();
         let shared = ctrl.shared();
         (s.start(Box::new(ctrl), None).unwrap(), shared)
@@ -1155,15 +1179,73 @@ mod tests {
         on_sim(&d, |sim| {
             assert!((1..=7).all(|m| !sim.enabled(m) && sim.enables(m) == 1));
             sim.set_position(2, at);
-            // The joints' temperature gate is the first tick's health check.
-            sim.set_temperature(3, 80.0);
+            // Ruling R31: a joint at its 70 C health limit, refused before any torque.
+            sim.set_temperature(3, 70.0);
         });
         assert_eq!(d.enable(&mut a, 3).mode, Mode::Released);
         on_sim(&d, |sim| {
-            assert!((1..=7).all(|m| !sim.enabled(m)));
+            assert!((1..=7).all(|m| !sim.enabled(m) && sim.enables(m) == 1));
             sim.set_temperature(3, 35.0);
         });
         assert_eq!(d.enable(&mut a, 4).mode, Mode::Holding);
+    }
+
+    #[test]
+    fn a_silent_motor_at_enable_stays_released_and_sends_no_disable() {
+        // As with the emergency stop pressed while parked: the fault query gets no reply.
+        let (d, _) = daemon(true);
+        release_now(&d);
+        let disables = |sim: &mut SimArm| (1..=7).map(|m| sim.disables(m)).collect::<Vec<_>>();
+        let before = on_sim(&d, |sim| {
+            sim.set_muted(3, true);
+            disables(sim)
+        });
+        let (mut a, _b) = UnixStream::pair().unwrap();
+        // An exit here would end the test binary.
+        assert_eq!(d.enable(&mut a, 2).mode, Mode::Released);
+        on_sim(&d, |sim| {
+            assert!((1..=7).all(|m| !sim.enabled(m) && sim.enables(m) == 1));
+            assert_eq!(disables(sim), before, "no disable after a failed gate");
+            sim.set_muted(3, false);
+        });
+        assert_eq!(d.enable(&mut a, 3).mode, Mode::Holding);
+    }
+
+    #[test]
+    fn only_a_disable_that_fails_claims_torque() {
+        let muted = || {
+            let c = ArmConfig::maker_arm_v1();
+            let mut s = Session::connect(Box::new(SimArm::new(&c)), c).unwrap();
+            s.backend_as_sim().unwrap().set_muted(3, true);
+            s
+        };
+        // Released: the gate failed before any enable frame. The log line says torque off.
+        let fail = |sweep| match start(muted(), tracking().unwrap(), None, sweep) {
+            Ok(_) => panic!("a silent motor enabled"),
+            Err(e) => e,
+        };
+        let e = fail(false);
+        assert!(!e.torque);
+        assert_eq!(e.why, "enable: motor 3 did not reply -- check bus/power");
+        // At the start a dead daemon may have left motor 3 on, and it does not confirm off.
+        let e = fail(true);
+        assert!(e.torque && e.why.contains("; disable: "), "{}", e.why);
+    }
+
+    #[test]
+    fn the_first_enable_refuses_a_joint_at_its_health_limit() {
+        // Ruling R31, through the start path of `run`: no torque, and the reason names it.
+        let c = ArmConfig::maker_arm_v1();
+        let mut s = Session::connect(Box::new(SimArm::new(&c)), c).unwrap();
+        s.backend_as_sim().unwrap().set_temperature(3, 70.0);
+        let Err(e) = start(s, tracking().unwrap(), None, true) else {
+            panic!("a hot joint enabled");
+        };
+        assert!(!e.torque);
+        assert_eq!(e.why, "enable: motor 3 is 70.0 degC, too hot to enable");
+        let mut s = e.session;
+        let sim = s.backend_as_sim().unwrap();
+        assert!((1..=7).all(|m| sim.enables(m) == 0));
     }
 
     #[test]
@@ -1247,22 +1329,27 @@ mod tests {
         assert!(shared.clock().is_some());
     }
 
+    /// No feedback after enable for longer than the feedback timeout, so the first tick's
+    /// health check faults.
+    fn stale(_: &mut SimArm) {
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
     #[test]
     fn a_fault_at_the_first_tick_ends_the_wait_with_its_reason() {
-        // Enable checks no temperature. The first tick's health check does, and the fault hold
-        // never calls the controller, so the tracking clock never starts.
-        let (arm, shared) = started(|sim| sim.set_temperature(3, 80.0));
+        // The fault hold never calls the controller, so the tracking clock never starts.
+        let (arm, shared) = started(stale);
         let quiet = AtomicBool::new(false);
         let t = Instant::now();
         let e = first_tick(&arm, &shared, &quiet, Duration::from_secs(5)).unwrap_err();
-        assert!(e.contains("over temperature"), "{e}");
+        assert!(e.contains("feedback timeout"), "{e}");
         assert!(t.elapsed() < Duration::from_secs(1));
         assert!(shared.clock().is_none());
     }
 
     #[test]
     fn a_signal_ends_the_first_tick_wait() {
-        let (arm, shared) = started(|sim| sim.set_temperature(3, 80.0));
+        let (arm, shared) = started(stale);
         let e = first_tick(
             &arm,
             &shared,
