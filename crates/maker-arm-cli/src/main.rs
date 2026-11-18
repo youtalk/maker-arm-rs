@@ -39,7 +39,8 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Connect, enable, and hold the current pose until a typed RELEASE
+    /// Connect, enable, and hold the current pose until a typed RELEASE, then ramp the torque
+    /// down over 2 s and disable
     Hold,
     /// Write the profile and dynamics files that serve loads: --sim, --calibration or --ident
     Export {
@@ -62,7 +63,8 @@ enum Command {
         #[arg(long = "out_dir")]
         out_dir: Option<PathBuf>,
     },
-    /// Ask a running serve daemon to disable the motors, after a typed RELEASE
+    /// Ask a running serve daemon to ramp the torque down over 2 s and disable the motors,
+    /// after a typed RELEASE
     Release {
         #[arg(long)]
         interface: String,
@@ -356,7 +358,7 @@ fn main() -> Result<(), String> {
             let mut session =
                 Session::connect(backend, config.clone()).map_err(|e| e.to_string())?;
             session.enable().map_err(|e| e.to_string())?;
-            let running = session
+            let mut running = session
                 .start(Box::new(HoldController::from_config(&config)), None)
                 .expect("a start without rt cannot fail");
             // EVERYTHING from here to `confirm_release` runs with a live,
@@ -399,10 +401,24 @@ fn main() -> Result<(), String> {
             let stdin = std::io::stdin();
             let mut input = stdin.lock();
             let mut output = std::io::stdout();
-            maker_arm_cli::confirm_release(&mut input, &mut output);
-            // Past the gate: torque is commanded off before anything below
-            // can fail, so `?` is safe again from here on.
-            let (_session, res) = running.stop_and_disable();
+            // Past the gate, the torque ramps down and then goes off.
+            // A fault during the ramp holds the arm, as any fault does:
+            // back to the gate.
+            let (_session, res) = loop {
+                maker_arm_cli::confirm_release(&mut input, &mut output);
+                match running.release() {
+                    Ok(released) => break released,
+                    Err(held) => {
+                        running = held;
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "a fault ended the torque ramp: torque remains enabled, holding \
+                             the measured pose"
+                        );
+                    }
+                }
+            };
+            // Torque is commanded off, so `?` is safe again from here on.
             res.map_err(|e| e.to_string())?;
             let _ = writeln!(std::io::stdout(), "torque released.");
         }

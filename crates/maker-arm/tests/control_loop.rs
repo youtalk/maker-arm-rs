@@ -1,6 +1,6 @@
 use maker_arm::{
     ArmCommand, ArmConfig, ArmState, Controller, FaultReason, HoldController, JointCommand, LoopRt,
-    RtError, Session, SessionError, SessionState, SimArm,
+    RtError, RunningArm, Session, SessionError, SessionState, SimArm, RELEASE_RAMP_S,
 };
 use maker_arm_protocol::{mit, RS00};
 use maker_arm_transport::{CanBackend, TransportError};
@@ -1246,4 +1246,201 @@ fn a_silent_motor_costs_one_reply_wait_per_tick() {
         "{:?}",
         s.fault()
     );
+}
+
+/// A `SimArm` and every frame sent to it, in order.
+struct Bench {
+    sim: SimArm,
+    sent: Vec<(u32, [u8; 8])>,
+}
+
+/// A `Bench` the test reaches while the loop thread owns the session.
+#[derive(Clone)]
+struct Shared(Arc<Mutex<Bench>>);
+
+impl CanBackend for Shared {
+    fn send(&mut self, id: u32, data: &[u8; 8]) -> Result<(), TransportError> {
+        let mut g = self.0.lock().unwrap();
+        g.sent.push((id, *data));
+        g.sim.send(id, data)
+    }
+
+    fn recv(&mut self, timeout: Duration) -> Result<Option<(u32, [u8; 8])>, TransportError> {
+        self.0.lock().unwrap().sim.recv(timeout)
+    }
+}
+
+/// A loop at the measured pose on a shared sim, with 0.3 N m of feed-forward on every joint.
+fn shared_loop(c: &ArmConfig) -> (Shared, RunningArm) {
+    let sim = Shared(Arc::new(Mutex::new(Bench {
+        sim: SimArm::new(c),
+        sent: Vec::new(),
+    })));
+    let mut s = Session::connect(Box::new(sim.clone()), c.clone()).expect("connect");
+    s.enable().expect("enable");
+    let mut ctrl = GoTo::new(c, s.positions());
+    ctrl.tau = 0.3;
+    let arm = s.start(Box::new(ctrl), None).expect("start");
+    std::thread::sleep(Duration::from_millis(50));
+    (sim, arm)
+}
+
+fn wait_for(what: &str, done: impl Fn() -> bool) {
+    let end = Instant::now() + Duration::from_secs(5);
+    while !done() {
+        assert!(Instant::now() < end, "no {what} within 5 s");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn ramp_ticks(c: &ArmConfig) -> usize {
+    (RELEASE_RAMP_S * c.control_rate_hz).round() as usize
+}
+
+#[test]
+fn a_release_ramps_kp_and_the_feed_forward_to_zero_then_disables() {
+    // Ruling R36.
+    let c = fast(ArmConfig::maker_arm_v1());
+    let (sim, running) = shared_loop(&c);
+    let disable = |m: u8| mit::encode_disable(m).data;
+    let start = sim.0.lock().unwrap().sent.len();
+    let t = Instant::now();
+    running.ramp_down();
+    wait_for("end of the ramp", || running.loop_finished());
+    assert!(t.elapsed() >= Duration::from_secs_f64(RELEASE_RAMP_S * 0.95));
+    assert!(running.ramp_done() && !running.ramp_held());
+    let (records, dropped) = running.drain();
+    assert_eq!(dropped, 0);
+    assert!(records.windows(2).all(|w| w[1].tick == w[0].tick + 1));
+    let n = ramp_ticks(&c);
+    let (before, ramp) = records.split_at(records.len() - n);
+    let from = &before.last().expect("a tick before the ramp").sent;
+    assert_eq!(from[2].kp, c.joints[2].kp);
+    assert_eq!(from[2].tau, 0.3);
+    for (k, r) in ramp.iter().enumerate() {
+        let s = 1.0 - (k + 1) as f64 / n as f64;
+        for (j, (got, was)) in r.sent.iter().zip(from).enumerate() {
+            assert_eq!(
+                (got.pos, got.vel, got.kd),
+                (was.pos, 0.0, was.kd),
+                "tick {k}"
+            );
+            assert!((got.kp - was.kp * s).abs() < 1e-12, "tick {k} joint {j}");
+            assert!((got.tau - was.tau * s).abs() < 1e-12, "tick {k} joint {j}");
+        }
+    }
+    let last = &ramp.last().unwrap().sent;
+    assert!(last
+        .iter()
+        .all(|c| c.kp == 0.0 && c.tau == 0.0 && c.kd > 0.0));
+    // The loop has ended after the last ramp tick, and no motor has had a disable yet.
+    let end = {
+        let g = sim.0.lock().unwrap();
+        assert!((1..=7).all(|m| g.sim.enabled(m)));
+        assert!(!g.sent[start..].iter().any(|f| f.1 == disable(f.0 as u8)));
+        g.sent.len()
+    };
+    let (_, res) = running.stop_and_disable();
+    res.expect("every motor confirmed off");
+    let g = sim.0.lock().unwrap();
+    assert!((1..=7).all(|m| !g.sim.enabled(m)));
+    assert!((1..=7u8).all(|m| g.sent[end..].contains(&(m.into(), disable(m)))));
+}
+
+#[test]
+fn a_fault_during_the_ramp_holds_and_disables_nothing() {
+    let c = fast(ArmConfig::maker_arm_v1());
+    let (sim, running) = shared_loop(&c);
+    let disables = |sim: &Shared| -> Vec<u32> {
+        let g = sim.0.lock().unwrap();
+        (1..=7).map(|m| g.sim.disables(m)).collect()
+    };
+    // Motor `m` gets hot `after` from now, in the ramp.
+    let heat = |m: u8, after: u64| {
+        let sim = sim.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(after));
+            sim.0.lock().unwrap().sim.set_temperature(m, 80.0);
+        })
+    };
+    let before = disables(&sim);
+    let hot = heat(3, 300);
+    let Err(running) = running.release() else {
+        panic!("released through a fault");
+    };
+    hot.join().unwrap();
+    assert!(running.ramp_held());
+    let snap = running.snapshot().unwrap();
+    assert_eq!(snap.state, SessionState::Fault);
+    assert!(matches!(
+        snap.fault,
+        Some(FaultReason::OverTemperature { motor_id: 3, .. })
+    ));
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(!running.loop_finished(), "the loop holds");
+    assert!((1..=7).all(|m| sim.0.lock().unwrap().sim.enabled(m)));
+    assert_eq!(disables(&sim), before);
+    // The hold is back at full kp.
+    let (records, _) = running.drain();
+    assert_eq!(records.last().unwrap().sent[0].kp, c.joints[0].kp);
+    // A release from the fault hold ramps the hold down, and a later fault does not end it.
+    let hot = heat(4, 500);
+    running.ramp_down();
+    wait_for("later fault", || {
+        running
+            .snapshot()
+            .unwrap()
+            .later_faults
+            .iter()
+            .any(|f| matches!(f, FaultReason::OverTemperature { motor_id: 4, .. }))
+    });
+    hot.join().unwrap();
+    assert!(!running.ramp_held() && !running.loop_finished());
+    wait_for("end of the ramp", || running.loop_finished());
+    assert!(running.ramp_done());
+    let (s, res) = running.stop_and_disable();
+    res.expect("every motor confirmed off");
+    assert_eq!(s.state(), SessionState::Connected);
+    assert!((1..=7).all(|m| !sim.0.lock().unwrap().sim.enabled(m)));
+}
+
+#[test]
+fn a_gripper_released_on_its_own_fault_gets_no_ramp_frames() {
+    let c = fast(ArmConfig::maker_arm_v1());
+    let (sim, running) = shared_loop(&c);
+    sim.0.lock().unwrap().sim.inject_fault(7, 1 << 14);
+    wait_for("gripper fault", || {
+        running
+            .snapshot()
+            .is_some_and(|s| matches!(s.fault, Some(FaultReason::MotorFault { motor_id: 7, .. })))
+    });
+    std::thread::sleep(Duration::from_millis(50));
+    let start = sim.0.lock().unwrap().sent.len();
+    running.ramp_down();
+    wait_for("end of the ramp", || running.loop_finished());
+    assert!(running.ramp_done());
+    {
+        let g = sim.0.lock().unwrap();
+        let frames = &g.sent[start..];
+        let control = |m: u32| {
+            frames
+                .iter()
+                .filter(|f| f.0 == m && f.1[..6] != [0xFF; 6])
+                .count()
+        };
+        assert_eq!(
+            control(7),
+            0,
+            "a control frame reached the released gripper"
+        );
+        assert!((1..=6).all(|m| control(m) >= ramp_ticks(&c)));
+        let resent = frames
+            .iter()
+            .filter(|f| **f == (7, mit::encode_disable(7).data))
+            .count();
+        assert!(resent >= 15, "{resent} gripper disables in the ramp");
+        assert!(!g.sim.enabled(7) && (1..=6).all(|m| g.sim.enabled(m)));
+    }
+    let (_, res) = running.stop_and_disable();
+    res.expect("every motor confirmed off");
 }

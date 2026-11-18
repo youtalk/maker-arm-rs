@@ -3,7 +3,8 @@
 //! enforcement point (design §2). On any health fault or rejected command
 //! the loop swaps to an internal hold at the last-good pose
 //! (hold_on_fault, the vendor's semantics) or disables outright. A gripper
-//! that faulted itself is released instead of held.
+//! that faulted itself is released instead of held. A release ramps the
+//! torque down inside the loop before the checked disable (ruling R36).
 
 use crate::clamp::clamp_command;
 use crate::controller::{Controller, HoldController};
@@ -13,7 +14,7 @@ use crate::state::{ArmCommand, ArmState, JointCommand, MotorState};
 use maker_arm_protocol::mit;
 use maker_arm_transport::TransportError;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
@@ -51,6 +52,52 @@ const RELEASE_RESEND: Duration = Duration::from_millis(100);
 
 /// `later_faults` keeps at most this many, as the vendor caps its list.
 const LATER_FAULTS_MAX: usize = 100;
+
+/// A release ramps `kp` and the feed-forward torque down to 0 over this long before the
+/// checked disable, so a joint that rests above its stop does not fall onto it (ruling R36).
+pub const RELEASE_RAMP_S: f64 = 2.0; // INITIAL: the owner checks the forearm's fold on the real arm
+
+/// `LoopShared::ramp`. No release asked.
+const RAMP_OFF: u8 = 0;
+/// `RunningArm::ramp_down` asked: the ramp starts after the next tick.
+const RAMP_ASKED: u8 = 1;
+const RAMP_ON: u8 = 2;
+/// A fault ended the ramp: the loop holds, torque on.
+const RAMP_HELD: u8 = 3;
+/// The last ramp tick went out and the loop ended. The disable is the caller's.
+const RAMP_DONE: u8 = 4;
+
+/// The release ramp (ruling R36): the last command sent, with `kp` and `tau` times `s`, which
+/// falls linearly from 1 to 0 over the ramp's ticks. `kd` stays, so the fall is damped. The
+/// position target stays, and the velocity target is 0.
+#[derive(Debug)]
+pub(crate) struct Ramp {
+    from: ArmCommand,
+    tick: u32,
+    ticks: u32,
+}
+
+impl Ramp {
+    /// The next tick's command. Not called once `done`.
+    fn next(&mut self) -> ArmCommand {
+        self.tick += 1;
+        let s = 1.0 - f64::from(self.tick) / f64::from(self.ticks);
+        self.from
+            .iter()
+            .map(|c| JointCommand {
+                pos: c.pos,
+                vel: 0.0,
+                kp: c.kp * s,
+                kd: c.kd,
+                tau: c.tau * s,
+            })
+            .collect()
+    }
+
+    fn done(&self) -> bool {
+        self.tick >= self.ticks
+    }
+}
 
 /// A bounded ring of records and the number it dropped since the last `take`.
 #[derive(Debug)]
@@ -264,6 +311,23 @@ impl Session {
         &self.later_faults
     }
 
+    /// Starts the release ramp from the last command sent. With none sent, this loop
+    /// commanded no torque, and the ramp is done at once.
+    fn start_ramp(&mut self) {
+        let ticks = if self.sent.is_empty() {
+            0
+        } else {
+            (RELEASE_RAMP_S * self.config().control_rate_hz)
+                .round()
+                .max(1.0) as u32
+        };
+        self.ramp = Some(Ramp {
+            from: self.sent.clone(),
+            tick: 0,
+            ticks,
+        });
+    }
+
     fn enter_fault(&mut self, reason: FaultReason, at: &ArmState) -> Result<(), SessionError> {
         if self.fault.is_some() {
             // A later fault while the arm holds is kept, as the vendor's
@@ -274,6 +338,8 @@ impl Session {
             }
             return Ok(());
         }
+        // The first fault ends a release ramp: the arm holds, or disables, as on any fault.
+        self.ramp = None;
         if self.config().hold_on_fault {
             // Joints 1-6 hold the measured pose. The gripper keeps its last
             // sent target, within `1.0 Nm / kp` of the jaw under serve, so
@@ -316,7 +382,8 @@ impl Session {
 
     /// One control cycle. Runs in `Enabled` (controller drives) and in
     /// `Fault` when holding (internal hold drives; the controller is not
-    /// consulted). Every tick also sends at most one fault query
+    /// consulted). During a release ramp the ramp drives, in either state.
+    /// Every tick also sends at most one fault query
     /// (`Session::poll_fault`), after the last motor's reply.
     ///
     /// # Health checks keep running in `Fault`
@@ -397,7 +464,9 @@ impl Session {
             }
         }
 
-        let raw_cmd = if self.state() == SessionState::Fault {
+        let raw_cmd = if let Some(ramp) = self.ramp.as_mut() {
+            ramp.next()
+        } else if self.state() == SessionState::Fault {
             self.fault_hold
                 .as_mut()
                 .expect("fault state implies fault_hold")
@@ -462,14 +531,17 @@ impl Session {
             // on firmware without parameter access no motor has one.
             let _refused_again = self.send_mit_all(&hold_cmd)?;
             cmd = hold_cmd;
-        } else if self.state() == SessionState::Enabled {
+        } else if self.state() == SessionState::Enabled && self.ramp.is_none() {
             // Only a finite torque: a NaN in the hold would fail its clamp and end the loop.
+            // A ramp tick keeps the controller's: a fault during the ramp holds at full kp,
+            // so it needs the full gravity torque.
             self.gravity = controller
                 .gravity()
                 .into_iter()
                 .map(|t| if t.is_finite() { t } else { 0.0 })
                 .collect();
         }
+        self.sent.clone_from(&cmd);
         self.poll_fault()?;
         // The waits already dispatched each motor's reply. Drain what came
         // late too: a caller reading `arm_state()` right after `tick()`
@@ -624,6 +696,7 @@ impl Session {
         let shared = Arc::new(LoopShared {
             stop: AtomicBool::new(false),
             hold_now: AtomicBool::new(false),
+            ramp: AtomicU8::new(RAMP_OFF),
             snapshot: Mutex::new(None),
             ring: Mutex::new(TickRing::default()),
         });
@@ -685,6 +758,24 @@ impl Session {
                 if self.state() == SessionState::Connected {
                     break; // disabled by hold_on_fault=false
                 }
+                // The ramp starts from the command this tick sent.
+                if sh
+                    .ramp
+                    .compare_exchange(RAMP_ASKED, RAMP_ON, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    self.start_ramp();
+                }
+                match &self.ramp {
+                    Some(r) if r.done() => {
+                        sh.ramp.store(RAMP_DONE, Ordering::Relaxed);
+                        break;
+                    }
+                    None if sh.ramp.load(Ordering::Relaxed) == RAMP_ON => {
+                        sh.ramp.store(RAMP_HELD, Ordering::Relaxed);
+                    }
+                    _ => {}
+                }
                 let now = Instant::now();
                 if next > now {
                     std::thread::sleep(next - now);
@@ -699,8 +790,8 @@ impl Session {
                 *sh.snapshot.lock().unwrap_or_else(|e| e.into_inner()) = Some(snap);
             }
             // No disable here: only the owner's release disables
-            // (`stop_and_disable`, `Drop`), so a loop that stopped on an
-            // error never drops the arm.
+            // (`stop_and_disable`, `release`, `Drop`), so a loop that
+            // stopped on an error never drops the arm.
             (self, result)
         });
         match ready_rx
@@ -741,6 +832,8 @@ impl Session {
 pub struct LoopShared {
     stop: AtomicBool,
     hold_now: AtomicBool,
+    /// The release ramp: `RAMP_OFF` and the other `RAMP_` values.
+    ramp: AtomicU8,
     snapshot: Mutex<Option<Snapshot>>,
     ring: Mutex<TickRing<TickRecord>>,
 }
@@ -810,9 +903,50 @@ impl RunningArm {
         self.shared.hold_now.store(true, Ordering::Relaxed);
     }
 
+    /// Asks for the release ramp (ruling R36) and returns at once. After its
+    /// next tick, the loop sends the command of that tick for
+    /// `RELEASE_RAMP_S` at the loop rate, with `kp` and the feed-forward
+    /// torque falling linearly to 0, `kd` kept, the position target held
+    /// and the velocity target 0. Then the loop ends (`ramp_done`), and
+    /// `stop_and_disable` runs the checked disable. The health checks and
+    /// the reply pacing keep running. A first fault during the ramp ends it,
+    /// and the loop holds as on any fault (`ramp_held`). A ramp asked in
+    /// `Fault` ramps the fault hold down, and a later fault does not end it.
+    /// A gripper released on its own fault stays released.
+    pub fn ramp_down(&self) {
+        self.shared.ramp.store(RAMP_ASKED, Ordering::Relaxed);
+    }
+
+    /// True once a fault ended the ramp: the loop holds the arm, torque on.
+    pub fn ramp_held(&self) -> bool {
+        self.shared.ramp.load(Ordering::Relaxed) == RAMP_HELD
+    }
+
+    /// True once the last ramp tick went out. The loop then ends, and the
+    /// motors wait for the disable at that tick's command: `kd` only.
+    pub fn ramp_done(&self) -> bool {
+        self.shared.ramp.load(Ordering::Relaxed) == RAMP_DONE
+    }
+
+    /// The release: `ramp_down`, then `stop_and_disable` once the loop has
+    /// ended. A loop that had already stopped on an error is disabled at
+    /// once. A fault during the ramp gives the arm back, holding, as the
+    /// error: nothing was disabled.
+    pub fn release(self) -> Result<(Session, Result<(), SessionError>), RunningArm> {
+        self.ramp_down();
+        while !self.loop_finished() {
+            if self.ramp_held() {
+                return Err(self);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Ok(self.stop_and_disable())
+    }
+
     /// Join the control thread, then disable all motors, also after the
     /// loop had stopped on an error. A loop error comes back as
-    /// `SessionError::LoopStopped` with the release's own result.
+    /// `SessionError::LoopStopped` with the release's own result. No ramp:
+    /// the torque goes off at once. `release` ramps it down first.
     pub fn stop_and_disable(mut self) -> (Session, Result<(), SessionError>) {
         self.shared.stop.store(true, Ordering::Relaxed);
         let (mut session, looped) = self
