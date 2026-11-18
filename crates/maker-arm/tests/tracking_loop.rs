@@ -3,11 +3,6 @@ use maker_arm::kinematics::Link;
 use maker_arm::tracking::{Push, TrackingController, TrackingParams, RING_TICKS, ROW};
 use maker_arm::{ArmConfig, FaultReason, Session, SessionState, SimArm};
 
-fn fast(mut c: ArmConfig) -> ArmConfig {
-    c.inter_frame_us = 0;
-    c
-}
-
 fn enabled_session(c: &ArmConfig) -> Session {
     let mut s = Session::connect(Box::new(SimArm::new(c)), c.clone()).expect("connect");
     s.enable().expect("enable");
@@ -37,7 +32,7 @@ fn model() -> Dynamics {
 
 #[test]
 fn a_session_runs_1000_tracking_ticks_without_a_fault() {
-    let c = fast(ArmConfig::maker_arm_v1());
+    let c = ArmConfig::maker_arm_v1();
     let mut s = enabled_session(&c);
     let mut ctrl = TrackingController::new(model(), TrackingParams::default(), &c, None).unwrap();
     let start = s.positions();
@@ -61,7 +56,7 @@ fn a_session_runs_1000_tracking_ticks_without_a_fault() {
 
 #[test]
 fn a_non_finite_model_output_ends_in_the_fault_hold() {
-    let c = fast(ArmConfig::maker_arm_v1());
+    let c = ArmConfig::maker_arm_v1();
     let mut s = enabled_session(&c);
     let mut ctrl = TrackingController::new(model(), TrackingParams::default(), &c, None).unwrap();
     s.tick(&mut ctrl).expect("first tick");
@@ -86,7 +81,7 @@ fn a_non_finite_model_output_ends_in_the_fault_hold() {
 
 #[test]
 fn a_tracking_loop_drains_one_telemetry_per_tick_matching_the_loop_records() {
-    let c = fast(ArmConfig::maker_arm_v1());
+    let c = ArmConfig::maker_arm_v1();
     let s = enabled_session(&c);
     let ctrl = TrackingController::new(model(), TrackingParams::default(), &c, None).unwrap();
     let shared = ctrl.shared();
@@ -107,7 +102,7 @@ fn a_tracking_loop_drains_one_telemetry_per_tick_matching_the_loop_records() {
 
 #[test]
 fn a_full_tracking_ring_counts_what_it_dropped() {
-    let c = fast(ArmConfig::maker_arm_v1());
+    let c = ArmConfig::maker_arm_v1();
     let mut s = enabled_session(&c);
     let mut ctrl = TrackingController::new(model(), TrackingParams::default(), &c, None).unwrap();
     let shared = ctrl.shared();
