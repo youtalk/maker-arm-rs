@@ -21,7 +21,7 @@ pub use clamp::{clamp_command, ClampError};
 pub use config::{ArmConfig, GripperRules, JointConfig, MotorModel};
 pub use control_loop::{
     HoldHandle, LoopRt, RingWriter, RtError, RunningArm, Snapshot, StartError, TickOutcome,
-    TickRecord, TickRing, RING_TICKS,
+    TickRecord, TickRing, RELEASE_RAMP_S, RING_TICKS,
 };
 pub use controller::{Controller, HoldController};
 pub use health::{FaultReason, HealthMonitor};

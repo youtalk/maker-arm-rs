@@ -137,6 +137,20 @@ fn doctor_fails_on_a_reported_fault() {
 }
 
 #[test]
+fn hold_ramps_the_torque_down_after_the_typed_word() {
+    // Ruling R36: RELEASE_RAMP_S of ramp before the disable.
+    let t = std::time::Instant::now();
+    let (code, out) = sim_cli(&["hold"], "RELEASE\n");
+    assert_eq!(code, Some(0), "{out}");
+    assert!(out.contains("torque released."), "{out}");
+    assert!(
+        t.elapsed() >= Duration::from_millis(1900),
+        "{:?}",
+        t.elapsed()
+    );
+}
+
+#[test]
 fn zero_prompt_names_the_vendor_pose() {
     let (code, out) = sim_cli(&["zero", "--motor", "5"], "\nno\n");
     assert_eq!(code, Some(1), "{out}");

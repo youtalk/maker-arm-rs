@@ -26,10 +26,11 @@
 
 use crate::clamp::ClampError;
 use crate::config::ArmConfig;
+use crate::control_loop::Ramp;
 use crate::controller::HoldController;
 use crate::health::{FaultReason, HealthMonitor};
 use crate::sim::SimArm;
-use crate::state::{ArmState, MotorState};
+use crate::state::{ArmCommand, ArmState, MotorState};
 use maker_arm_protocol::{self as p, mit};
 use maker_arm_transport::{CanBackend, TransportError};
 use std::f64::consts::TAU;
@@ -255,6 +256,10 @@ pub struct Session {
     /// The controller's gravity torque in the last command sent (N m), which the fault hold
     /// keeps sending. Empty before the first.
     pub(crate) gravity: Vec<f64>,
+    /// The last command sent, after the clamp: the release ramp starts from it.
+    pub(crate) sent: ArmCommand,
+    /// The release ramp, from the tick it starts after to the end of the loop.
+    pub(crate) ramp: Option<Ramp>,
     /// The gripper's CAN_TIMEOUT from before enable, kept for the restore.
     watchdog_restore: Option<u32>,
 }
@@ -312,6 +317,8 @@ impl Session {
             failing_since: None,
             grip_sent: None,
             gravity: Vec::new(),
+            sent: Vec::new(),
+            ramp: None,
             watchdog_restore: None,
         };
         let motor_ids: Vec<u8> = s.config.joints.iter().map(|j| j.motor_id).collect();
@@ -623,6 +630,8 @@ impl Session {
         self.failing_since = None;
         self.grip_sent = None;
         self.gravity.clear();
+        self.sent.clear();
+        self.ramp = None;
         self.health = HealthMonitor::new(&self.config);
         for slot in &mut self.slots {
             slot.state.restarted = false;
