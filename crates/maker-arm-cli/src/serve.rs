@@ -22,8 +22,10 @@ const LEAD_S: f64 = 0.02; // INITIAL: V2 checks the tracking lag
 const STREAM_TIMEOUT_S: f64 = 0.1; // INITIAL: spec section 6.1
 /// An arm joint further than this from the last accepted target is refused.
 const JUMP_MAX_RAD: f64 = 0.05; // INITIAL: 5 rad/s at 100 Hz, the clamp's max_velocity
-/// The gripper target leads the measured angle by at most this spring torque.
-const GRIP_TAU_MAX_NM: f64 = 0.5; // INITIAL: session 4 checks it with the gripper map
+/// The gripper target leads the measured angle by at most this spring torque, closing only.
+/// The vendor SDK (`maker_arm/gripper.py`) caps the closing side at `max(1, 2 x hold)` Nm,
+/// with a default hold of 0.5 Nm. Opening is not capped: a window there held the jaw shut.
+const GRIP_TAU_MAX_NM: f64 = 1.0;
 /// As the lab's rig runs the loop.
 const RT: LoopRt = LoopRt {
     priority: 80,
@@ -83,7 +85,7 @@ struct Daemon {
     state: Mutex<State>,
     shared: Arc<TrackingShared>,
     grip: GripMap,
-    /// `GRIP_TAU_MAX_NM / kp` of the gripper (rad).
+    /// `GRIP_TAU_MAX_NM / kp` of the gripper (rad), the closing lead limit.
     grip_window: f64,
     digest: u64,
     /// A virtual interface without `--persist`.
@@ -191,12 +193,7 @@ impl Daemon {
         let measured = snap.arm.motors[ARM_DOF].position;
         let mut row = [0.0; ROW];
         row[..ARM_DOF].copy_from_slice(&q[..ARM_DOF]);
-        // max/min, not clamp: they cannot panic on a NaN.
-        row[ARM_DOF] = self
-            .grip
-            .to_angle(q[ARM_DOF])
-            .max(measured - self.grip_window)
-            .min(measured + self.grip_window);
+        row[ARM_DOF] = grip_target(self.grip.to_angle(q[ARM_DOF]), measured, self.grip_window);
         if self.push(row) {
             st.target.copy_from_slice(&q[..ARM_DOF]);
             st.last_command = Instant::now();
@@ -511,6 +508,30 @@ fn released(mode: Mode) -> Result<(), String> {
          torque. Support the arm.",
         mode_name(mode)
     ))
+}
+
+/// Caps only the closing side of the gripper target at `measured + window`; opening passes.
+/// Closing is the positive motor-angle direction on this arm, so the bound is an upper one.
+/// `min`, not `clamp`: it cannot panic on a NaN.
+fn grip_target(angle: f64, measured: f64, window: f64) -> f64 {
+    angle.min(measured + window)
+}
+
+#[cfg(test)]
+mod grip_tests {
+    use super::grip_target;
+
+    #[test]
+    fn opening_passes_and_closing_is_capped() {
+        let (kp, measured) = (20.0, 0.3);
+        let window = 1.0 / kp;
+        assert_eq!(grip_target(-2.0, measured, window), -2.0);
+        assert_eq!(grip_target(5.0, measured, window), measured + window);
+        assert_eq!(
+            grip_target(measured + 0.01, measured, window),
+            measured + 0.01
+        );
+    }
 }
 
 pub fn run(o: &ServeOptions, check: bool) -> Result<(), String> {

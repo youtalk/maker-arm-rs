@@ -276,7 +276,7 @@ impl Session {
         }
         if self.config().hold_on_fault {
             // Joints 1-6 hold the measured pose. The gripper keeps its last
-            // sent target, within `0.5 Nm / kp` of the jaw under serve, so
+            // sent target, within `1.0 Nm / kp` of the jaw under serve, so
             // a held object keeps its squeeze, as the vendor keeps its
             // gripper regulation in a fault hold.
             let mut targets: Vec<f64> = at.motors.iter().map(|m| m.position).collect();
