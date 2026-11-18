@@ -372,6 +372,28 @@ fn release_needs_the_typed_word_and_then_disables_and_exits() {
 }
 
 #[test]
+fn a_command_client_that_leaves_during_a_release_does_not_cut_it_short() {
+    // On sim, the daemon ends with its command client, but only after a release in flight.
+    let mut d = Daemon::start(&[]);
+    let (c, _) = activated(&d);
+    let socket = d.socket.clone();
+    let release = std::thread::spawn(move || client_cli(&["release", "--yes"], &socket, ""));
+    // Inside the 2 s ramp.
+    sleep_ms(500);
+    drop(c);
+    let (code, out, err) = release.join().unwrap();
+    assert_eq!(code, Some(0), "{out}{err}");
+    assert!(out.contains("torque released."), "{out}");
+    assert_eq!(
+        d.exit_within(Duration::from_secs(2)).unwrap().code(),
+        Some(0)
+    );
+    assert!(d
+        .line("SERVE_EXIT released", Duration::from_secs(1))
+        .is_some());
+}
+
+#[test]
 fn release_yes_skips_the_typed_word() {
     let mut d = Daemon::start(&["--persist"]);
     let (code, out, err) = client_cli(&["release", "--yes"], &d.socket, "");

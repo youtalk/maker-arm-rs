@@ -16,6 +16,7 @@ use maker_arm_cli::wire::{self, ClientFrame, Mode, Op, Role, StateFrame, WireErr
 use maker_arm_transport::CanBackend;
 use std::io::Write;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
@@ -64,7 +65,8 @@ struct State {
     arm: Option<RunningArm>,
     /// The tracking half of the loop that runs: pushes in, the clock out.
     shared: Arc<TrackingShared>,
-    /// Released: the last read of the motors, with torque off.
+    /// Released: the last read of the motors, with torque off. During a release's disable, with
+    /// no arm: the loop's last snapshot.
     parked: Option<ArmState>,
     mode: Mode,
     /// Activate was sent and no Deactivate, disconnect or signal since.
@@ -89,12 +91,14 @@ fn stopped(a: &RunningArm) -> bool {
 }
 
 impl State {
+    /// Not released, and the loop stopped or faulted. With no loop, only if `parked` holds no
+    /// pose: a release takes the loop out for its disable and leaves the last pose there.
     fn faulted(&self) -> bool {
         self.mode != Mode::Released
-            && self
-                .arm
-                .as_ref()
-                .is_none_or(|a| stopped(a) || a.snapshot().is_some_and(|s| s.fault.is_some()))
+            && match &self.arm {
+                Some(a) => stopped(a) || a.snapshot().is_some_and(|s| s.fault.is_some()),
+                None => self.parked.is_none(),
+            }
     }
 
     /// Commands are ignored until the next Activate. The plan holds its last row.
@@ -354,12 +358,14 @@ impl Daemon {
     }
 
     /// The one way to drop torque on a real interface. First the torque ramps down over
-    /// `RELEASE_RAMP_S` (ruling R36), off the state lock, so the other clients keep their
-    /// replies; meanwhile the mode is Holding and commands are ignored. A fault during the ramp
-    /// ends it: the arm holds, and the reply says Fault. Else the reply goes out only after the
-    /// motors are disabled. On a real interface the daemon stays up, released, and returns the
-    /// reply. Else, and after a failed disable, it exits holding the lock, so no other client
-    /// sees the arm gone.
+    /// `RELEASE_RAMP_S` (ruling R36), then the checked disable runs. Both run off the state
+    /// lock, so the other clients keep their replies: meanwhile the mode stays as it was
+    /// (Holding, or Fault for a fault hold), a Poll gets the last measured pose, and commands are
+    /// ignored. A fault during the ramp ends it: the arm holds, and the reply says Fault. Else
+    /// the reply goes out only after the motors are disabled. On a real interface the daemon
+    /// stays up, released, and returns the reply. Else, and after a failed disable, it exits
+    /// holding the state lock. With no arm, the reply says Released only in mode Released:
+    /// after a disable that panicked, it says Fault.
     fn release(&self, stream: &mut UnixStream, seq: u32) -> StateFrame {
         // An enable in flight finishes first, and a signal, an enable or a second release waits
         // for this one.
@@ -388,11 +394,30 @@ impl Daemon {
         }
         let mut frame = self.state_frame(&st, seq);
         frame.mode = Mode::Released;
-        // No arm: released already.
         let Some(arm) = st.arm.take() else {
+            // No arm: released already, or a disable that panicked left none and confirmed
+            // nothing. Never claim a release that did not happen.
+            if st.mode != Mode::Released {
+                log(
+                    "release refused: no control loop, and no disable confirmed the motors off. \
+                     They may keep their last command. Support the arm.",
+                );
+                frame.mode = Mode::Fault;
+            }
             return frame;
         };
-        let (session, result) = arm.stop_and_disable();
+        // The disable waits for each motor's answer over CAN: about 30 ms on the real arm, too
+        // long for a client's Poll. The session lock still keeps a signal, an enable and a
+        // second release out until the result is set.
+        st.parked = arm.snapshot().map(|s| s.arm);
+        drop(st);
+        let disabled = std::panic::catch_unwind(AssertUnwindSafe(|| arm.stop_and_disable()));
+        st = self.lock();
+        let (session, result) = disabled.unwrap_or_else(|panic| {
+            // No arm and no pose: `faulted`, as before the arm left. The motors may hold torque.
+            st.parked = None;
+            std::panic::resume_unwind(panic)
+        });
         let failed = match result {
             Ok(()) => None,
             // Every motor is confirmed off. Say why the loop had stopped.
@@ -426,7 +451,7 @@ impl Daemon {
     }
 
     /// Sends `frame`, removes the socket and exits with `code`. The caller holds the state
-    /// lock, so no other client sees the arm gone.
+    /// lock, so no other client gets another reply.
     fn exit(&self, stream: &mut UnixStream, frame: &StateFrame, code: i32, why: &str) -> ! {
         let _ = stream.write_all(&wire::encode_state(frame));
         let _ = std::fs::remove_file(&self.socket);
@@ -1075,6 +1100,9 @@ pub fn run(o: &ServeOptions, check: bool) -> Result<(), String> {
         }
         if let Some(why) = st.exit {
             drop(st);
+            // A release in flight ends first, also in its disable, with no arm here to take.
+            // If it releases, it ends the daemon itself.
+            let _parked = d.lock_session();
             finish(&d, &socket, why);
         }
     }
@@ -1131,6 +1159,37 @@ mod tests {
             timeout: Duration,
         ) -> Result<Option<(u32, [u8; 8])>, maker_arm_transport::TransportError> {
             self.0.lock().unwrap().recv(timeout)
+        }
+    }
+
+    /// Each disable frame takes this long, as a motor's answer over CAN does.
+    const SLOW_DISABLE: Duration = Duration::from_millis(10);
+
+    /// A sim that runs its hook before each disable frame: the checked disable sends 14.
+    struct OnDisable(SimArm, fn());
+
+    impl CanBackend for OnDisable {
+        fn send(
+            &mut self,
+            id: u32,
+            data: &[u8; 8],
+        ) -> Result<(), maker_arm_transport::TransportError> {
+            let disable = maker_arm_protocol::mit::encode_disable((id & 0x7F) as u8);
+            if (id, *data) == (disable.id, disable.data) {
+                self.1();
+            }
+            self.0.send(id, data)
+        }
+
+        fn recv(
+            &mut self,
+            timeout: Duration,
+        ) -> Result<Option<(u32, [u8; 8])>, maker_arm_transport::TransportError> {
+            self.0.recv(timeout)
+        }
+
+        fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+            self.0.as_any_mut()
         }
     }
 
@@ -1322,6 +1381,65 @@ mod tests {
             assert!(!release.is_finished(), "the ramp lasts RELEASE_RAMP_S");
             release.join().unwrap();
         });
+    }
+
+    #[test]
+    fn the_other_clients_get_their_replies_during_the_disable() {
+        // The real arm, 2026-11-18: at each release every client's Poll waited 27-31 ms for the
+        // checked disable, and the ros2_control loop overran.
+        let sim = SimArm::new(&ArmConfig::maker_arm_v1());
+        let slow = || std::thread::sleep(SLOW_DISABLE);
+        let (d, _) = daemon_on(true, Box::new(OnDisable(sim, slow)));
+        let before = d.state_frame(&d.lock(), 1);
+        std::thread::scope(|s| {
+            let release = s.spawn(|| release_now(&d));
+            // After the ramp, the release takes the arm out for the disable.
+            while d.lock().arm.is_some() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let t = Instant::now();
+            let poll = ClientFrame::Control {
+                seq: 2,
+                op: Op::Poll,
+            };
+            let f = d.handle(Role::Monitor, poll).unwrap();
+            let took = t.elapsed();
+            assert!(
+                !release.is_finished(),
+                "the disable takes 14 x SLOW_DISABLE"
+            );
+            assert!(took < Duration::from_millis(10), "{took:?}");
+            assert_eq!(f.mode, Mode::Holding);
+            for (j, (a, b)) in f.q.iter().zip(&before.q).enumerate() {
+                assert!((a - b).abs() < 1e-3, "joint {j}: {:?}", f.q);
+            }
+            // The sim's motors are at 35 C. Never 0.0.
+            assert!(
+                f.temp.iter().all(|t| *t == 35.0 || t.is_nan()),
+                "{:?}",
+                f.temp
+            );
+            release.join().unwrap();
+        });
+        on_sim(&d, |sim| assert!((1..=7).all(|m| !sim.enabled(m))));
+    }
+
+    #[test]
+    fn a_panic_in_the_disable_answers_fault() {
+        // No arm and no pose is a fault, as it was with the disable under the state lock.
+        let sim = SimArm::new(&ArmConfig::maker_arm_v1());
+        let (d, _) = daemon_on(true, Box::new(OnDisable(sim, || panic!("injected"))));
+        let (mut a, _b) = UnixStream::pair().unwrap();
+        let released = std::thread::scope(|s| s.spawn(|| d.release(&mut a, 1)).join());
+        assert!(released.is_err(), "the panic reaches the client's thread");
+        let poll = ClientFrame::Control {
+            seq: 2,
+            op: Op::Poll,
+        };
+        let f = d.handle(Role::Monitor, poll).unwrap();
+        assert_eq!(f.mode, Mode::Fault);
+        // A second release finds no arm, and must not answer Released.
+        assert_eq!(d.release(&mut a, 3).mode, Mode::Fault);
     }
 
     #[test]
