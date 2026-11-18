@@ -87,17 +87,18 @@ The daemon sets the error clamp to `0.03 / kp_scale` rad per arm joint, where `k
 
 The daemon is not yet verified on a real arm. Support the arm before you start `serve` on a real interface.
 
-Three commands. For `PROFILE` and `MODEL`, use the profile and model files that ship with your arm's ROS package. Do not write them by hand.
+Four commands. For `PROFILE` and `MODEL`, use the profile and model files that ship with your arm's ROS package. Do not write them by hand.
 
 ```sh
 maker-arm-cli serve --interface can0 --profile PROFILE --dynamics MODEL   # start the daemon
 maker-arm-cli status --interface can0                                    # print one STATUS line
 maker-arm-cli release --interface can0                                   # disable the motors
+maker-arm-cli enable --interface can0                                    # enable them again
 ```
 
-The socket is `--socket PATH`. If you omit it, the path is `$XDG_RUNTIME_DIR/maker-arm-<interface>.sock`. If that variable is not set, pass `--socket`. `status` and `release` use the same rule. They never open the bus.
+The socket is `--socket PATH`. If you omit it, the path is `$XDG_RUNTIME_DIR/maker-arm-<interface>.sock`. If that variable is not set, pass `--socket`. `status`, `release` and `enable` use the same rule. They never open the bus.
 
-`status` prints `STATUS {"mode": ..., "t": ..., "q": [7 values], "clamped": ..., "refused": ..., "fault": ..., "digest": ...}` and exits 0. It exits 1 if no daemon runs on the socket.
+`status` prints `STATUS {"mode": ..., "t": ..., "q": [7 values], "clamped": ..., "refused": ..., "fault": ..., "temp_max_c": ..., "temp_max_motor": ..., "digest": ...}` and exits 0. `temp_max_c` is the temperature of the hottest motor, and `temp_max_motor` is its motor id. It exits 1 if no daemon runs on the socket.
 
 ### Export the daemon's files
 
@@ -120,12 +121,15 @@ For an arm with another zero, the procedure to measure `direction` and `offset` 
 
 Hold rules:
 
-- On a real interface, after `SERVE_READY`, the daemon does not disable the motors by itself. It holds the arm when the client leaves, on SIGINT and SIGTERM, and on a fault.
+- On a real interface, after `SERVE_READY`, the daemon does not disable the motors by itself. It holds the arm when the client leaves, on SIGINT and SIGTERM, and on a fault. The fault hold keeps the gravity torque of the last command, so the arm does not sag.
 - Before `SERVE_READY`, a start-up failure can disable the motors that the daemon just enabled. The arm can then drop.
 - A short CAN error does not stop the control loop. The arm holds as on a fault. The loop stops only when the errors last longer than 0.25 s or the CAN interface is gone. `release` then still tries to disable the motors.
 - If the control loop stops, or the daemon process is killed, nothing commands the motors. Each motor keeps its last command. Only a gripper whose firmware has parameter access has a watchdog. Legacy firmware has no parameter access, so the arm then has no motor-side watchdog. To stop the motors, support the arm and press the emergency stop.
 - After a daemon death, support the arm before you start `serve` or `hold` again. The start can release each joint for a moment.
-- After `SERVE_READY`, only `release` disables the motors. It asks you to type `RELEASE`. Until you do, the arm holds. Release the torque only when the arm is supported.
+- After `SERVE_READY`, only `release` disables the motors. It asks you to type `RELEASE`. Until you do, the arm holds. Release the torque only when the arm is supported. `release --yes` does not ask. It is for a script that knows the arm is supported, such as a park at `home`.
+- On a real interface, a release does not end the daemon. The daemon goes to mode `released`. It keeps the bus and reads the motors 5 times a second with no torque, so `status` and the ROS 2 client still see the joints move.
+- `enable` enables a released arm again at the measured pose. It asks you to type `ENABLE`; `enable --yes` does not ask. The daemon runs the same checks as at start: the motor fault query, the gripper temperature, the 0.35 rad limit window, and the first tick's health check. If one fails, every motor gets a disable, the daemon stays `released` and its log says why. After an enable the daemon holds the measured pose, and the client must send Activate again. Support the arm first, as before every enable.
+- On `sim` or `vcan`, a release ends the daemon.
 - While the daemon runs, `scan`, `doctor`, `zero`, `hold` and the Python binding refuse to open the same interface. Each one names the bus lock `maker-arm-bus-<interface>`.
 - On `sim` or `vcan`, the daemon ends with its command client. Pass `--persist` to keep it running.
 - A command more than 0.05 rad from the last target is refused. The daemon holds until the client sends Deactivate and then Activate.
