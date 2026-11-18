@@ -4,6 +4,7 @@
 mod common;
 
 use common::{run_to_exit, scratch_dir, serve_command, Client, Daemon};
+use maker_arm_cli::files::GripMap;
 use maker_arm_cli::wire::{Mode, Op, Role};
 use std::time::Duration;
 
@@ -193,15 +194,12 @@ fn a_monitor_can_poll_while_a_client_commands() {
     assert_eq!(c.command(q).mode, Mode::Following);
 }
 
-/// The vendor's direction: the jaw gap grows as the gripper angle falls, and closing is the
-/// positive angle direction. The provisional map has the opposite sign, so the tests pass this.
-const VENDOR_GRIP_MAP: &str = "--gripper_map=-0.051059,-0.001991";
-
 #[test]
 fn the_gripper_closing_target_stays_within_the_squeeze_window_and_opening_is_free() {
-    let d = Daemon::start(&[VENDOR_GRIP_MAP]);
+    let grip = GripMap::provisional();
     // GRIP_TAU_MAX_NM / kp of the gripper (closing only), in gripper_left_joint metres.
-    let window = 1.0 / 20.0 * 0.051059 / 2.0;
+    let window = 1.0 / 20.0 * grip.joint_m_per_rad().abs();
+    let d = Daemon::start(&[]);
     let (mut c, mut q) = activated(&d);
     q[6] = 0.0;
     for _ in 0..3 {

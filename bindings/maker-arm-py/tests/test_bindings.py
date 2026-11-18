@@ -151,24 +151,26 @@ import math
 
 
 def test_profile_pins_every_upstream_joint():
-    # Same table as crates/maker-arm/src/config.rs::v1_profile_matches_upstream_yaml,
-    # asserted through the Python surface so the binding cannot drift from the crate.
+    # Same table as crates/maker-arm/src/config.rs::v1_profile_matches_the_vendor_yaml
+    # (maker_arm_v1.yaml at 0245316), asserted through the Python surface so the binding
+    # cannot drift from the crate. Limits are in degrees.
     p = m.profile()
     expected = [
-        (1, "j1", "RS00", -0.668, 4.818, 60.0, 4.0, 4.0),
-        (2, "j2", "RS02", -2.024, 0.979, 150.0, 4.5, 12.0),
-        (3, "j3", "RS02", 3.882, 7.955, 90.0, 3.0, 10.0),
-        (4, "j4", "RS00", -0.832, 2.122, 30.0, 2.0, 4.0),
-        (5, "j5", "RS00", 0.577, 3.641, 30.0, 2.0, 4.0),
-        (6, "j6", "RS00", 0.966, 6.292, 30.0, 2.0, 4.0),
-        (7, "gripper", "RS00", -2.092, -0.039, 20.0, 0.5, 2.0),
+        (1, "j1", "RS00", -158.2, 156.1, 60.0, 4.0, 4.0),
+        (2, "j2", "RS02", -175.3, -3.2, 150.0, 4.5, 15.0),
+        (3, "j3", "RS02", 2.8, 236.1, 90.0, 3.0, 10.0),
+        (4, "j4", "RS00", -65.2, 104.0, 30.0, 2.0, 4.0),
+        (5, "j5", "RS00", -97.6, 78.0, 30.0, 2.0, 4.0),
+        (6, "j6", "RS00", -153.2, 152.0, 30.0, 2.0, 4.0),
+        (7, "gripper", "RS00", -96.0, -2.5, 20.0, 0.5, 2.0),
     ]
     assert len(p["joints"]) == 7
     for j, (mid, name, model, q_lo, q_hi, kp, kd, tau_max) in zip(p["joints"], expected):
         assert j["motor_id"] == mid
         assert j["name"] == name
         assert j["model"] == model
-        assert j["q_lo"] == q_lo and j["q_hi"] == q_hi
+        assert j["q_lo"] == pytest.approx(math.radians(q_lo), abs=1e-12)
+        assert j["q_hi"] == pytest.approx(math.radians(q_hi), abs=1e-12)
         assert j["kp"] == kp and j["kd"] == kd and j["tau_max"] == tau_max
         assert j["direction"] == 1.0 and j["offset"] == 0.0
     assert p["control_rate_hz"] == 200.0
@@ -185,7 +187,7 @@ def test_profile_pins_every_upstream_joint():
 def test_profile_returns_a_fresh_dict_each_call():
     a = m.profile()
     a["joints"][0]["q_lo"] = -99.0
-    assert m.profile()["joints"][0]["q_lo"] == -0.668
+    assert m.profile()["joints"][0]["q_lo"] == pytest.approx(math.radians(-158.2))
 
 
 import pytest
@@ -852,6 +854,21 @@ def test_socketcan_refuses_a_held_bus_lock_before_the_socket_opens():
         held.close()
 
 
+def test_reduced_config_accepts_the_vendor_calibration_profile():
+    # What `export --calibration` writes for direction [1, 1, 1, 1, -1, 1, 1]: J5 swaps its
+    # limits in the URDF frame, and the motor-frame check still passes.
+    p = m.profile()
+    j5 = p["joints"][4]
+    j5["direction"] = -1.0
+    j5["q_lo"], j5["q_hi"] = math.radians(-78.0) + 1e-9, math.radians(97.6) - 1e-9
+    a = m.Arm.sim(profile=p)
+    a.stop()
+    # The URDF-frame limits of the identity profile are out of range once J5 is flipped.
+    j5["q_lo"], j5["q_hi"] = math.radians(-97.6), math.radians(78.0)
+    with pytest.raises(ValueError, match="joints\\[4\\]"):
+        m.Arm.sim(profile=p)
+
+
 def test_a_lowered_range_and_gains_are_accepted():
     p = m.profile()
     p["joints"][0]["q_lo"] += 0.1
@@ -864,11 +881,14 @@ def test_a_lowered_range_and_gains_are_accepted():
 
 
 def test_a_flipped_direction_maps_motor_to_joint():
-    v1 = m.profile()
     p = m.profile()
-    for i, (d, o) in {0: (-1.0, 0.4), 2: (-1.0, -0.7), 4: (1.0, 0.3)}.items():
-        p["joints"][i]["direction"] = d
-        p["joints"][i]["offset"] = o
+    # Each range maps inside the v1 motor range through its direction and offset.
+    for i, (d, o, lo, hi) in {
+        0: (-1.0, 0.4, -1.0, 1.0),
+        2: (-1.0, -0.7, -4.0, -1.0),
+        4: (1.0, 0.3, -1.0, 1.0),
+    }.items():
+        p["joints"][i].update(direction=d, offset=o, q_lo=lo, q_hi=hi)
     a = m.Arm.sim(profile=p)
     a.enable()
     a.start_hold()
@@ -878,7 +898,7 @@ def test_a_flipped_direction_maps_motor_to_joint():
     a.stop()
     # The sim parks every motor at the joint-range midpoint through the same map the session
     # reads back with, so joint coordinates come out as the midpoints for any direction/offset.
-    for i, j in enumerate(v1["joints"][:6]):
+    for i, j in enumerate(p["joints"][:6]):
         mid = (j["q_lo"] + j["q_hi"]) / 2.0
         assert abs(snap["positions"][i] - mid) < 1e-3, i
         assert abs(d["cmd_pos"][-1][i] - mid) < 1e-3, i

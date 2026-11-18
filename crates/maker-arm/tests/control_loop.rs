@@ -182,7 +182,7 @@ fn clamp_guards_the_output_stage() {
     // the sim read back the CLAMPED torque, not 99
     let st = s.arm_state();
     assert!((st.motors[0].torque - 4.0).abs() < 1e-2); // J1 tau_max = 4.0
-    assert!((st.motors[1].torque - 12.0).abs() < 1e-2); // J2 (RS02) tau_max = 12.0
+    assert!((st.motors[1].torque - 15.0).abs() < 1e-2); // J2 (RS02) tau_max = 15.0
 }
 
 #[test]
@@ -582,7 +582,7 @@ fn a_saturating_motor_position_faults_instead_of_being_truncated() {
     // J4 parked one turn high gives wrap = -2π, so a commanded 6.3 rad
     // maps to 6.3 + 6.283 = 12.583 rad, just past +12.57.
     let mut c = fast(ArmConfig::maker_arm_v1());
-    c.limit_margin = -4.2;
+    c.limit_margin = -4.6;
     let mut sim = SimArm::new(&c);
     let true_j4 = mid(&c, 3);
     sim.set_position(4, true_j4 + TAU);

@@ -173,7 +173,7 @@ pub(crate) fn config_from_dict(profile: &Bound<'_, PyDict>) -> PyResult<ArmConfi
 /// The config an arm session runs with: the v1 profile with the numeric overrides in
 /// `profile`, after checking that no override loosens a v1 limit. A session may only be
 /// stricter than `maker_arm_v1`: per joint `kp`, `kd` and `tau_max` at most the v1 value and
-/// `[q_lo, q_hi]` inside the v1 range, `max_velocity` at most v1, `direction` exactly -1 or
+/// `[q_lo, q_hi]` inside the v1 range once mapped to the motor frame, `max_velocity` at most v1, `direction` exactly -1 or
 /// +1 and `|offset| <= pi`. Every number must be finite. The error is a ValueError that names
 /// the field (for example `joints[1].tau_max`); callers run this before any connection opens.
 pub(crate) fn reduced_config(profile: &Bound<'_, PyDict>) -> PyResult<ArmConfig> {
@@ -221,18 +221,6 @@ pub(crate) fn reduced_config(profile: &Bound<'_, PyDict>) -> PyResult<ArmConfig>
                 ));
             }
         }
-        if j.q_lo < b.q_lo {
-            return Err(bad(
-                format!("joints[{i}].q_lo"),
-                format!("{} is below the maker_arm_v1 value {}", j.q_lo, b.q_lo),
-            ));
-        }
-        if j.q_hi > b.q_hi {
-            return Err(bad(
-                format!("joints[{i}].q_hi"),
-                format!("{} is above the maker_arm_v1 value {}", j.q_hi, b.q_hi),
-            ));
-        }
         if j.q_lo >= j.q_hi {
             return Err(bad(
                 format!("joints[{i}].q_lo"),
@@ -250,6 +238,20 @@ pub(crate) fn reduced_config(profile: &Bound<'_, PyDict>) -> PyResult<ArmConfig>
                 format!("joints[{i}].offset"),
                 format!("|{}| exceeds pi", j.offset),
             ));
+        }
+        // Both ends go to the motor frame, as `files::check_config` does: a joint with a
+        // direction of -1 has its limits swapped there.
+        for (name, x) in [("q_lo", j.q_lo), ("q_hi", j.q_hi)] {
+            let m = j.to_motor(x);
+            if m < b.q_lo || m > b.q_hi {
+                return Err(bad(
+                    format!("joints[{i}].{name}"),
+                    format!(
+                        "{x} is {m} in the motor frame, outside the maker_arm_v1 range [{}, {}]",
+                        b.q_lo, b.q_hi
+                    ),
+                ));
+            }
         }
     }
     finite("max_velocity".into(), c.max_velocity)?;

@@ -116,14 +116,16 @@ maker-arm-cli export --ident IDENT.json --urdf ARM.urdf --out MODEL
 
 `CAL.json` holds exactly two keys: `direction` (7 values, each -1.0 or 1.0) and `offset` (7 values, each at most pi in absolute value, in radians). Any other key, or a missing key, is refused.
 
-The procedure to measure `direction` and `offset` is not published yet. A guessed calibration can drive a joint into its stop. Do not enable a real arm on a profile whose calibration you did not measure. A profile with `--caps` below 1 cuts `kp`, so the daemon applies the R33 error clamp to it (`e_max = 0.03 / kp_scale`).
+The vendor zero is the pose folded against the base, with the gripper fully closed. The profile limits are in the vendor zero. The default calibration for an arm set to the vendor zero is `direction` `[1, 1, 1, 1, -1, 1, 1]` and `offset` all 0. It comes from the vendor's gravity convention. The gripper keeps direction 1, because the gripper map converts its angle. Write it as `CAL.json` and run `export` with it. The profile itself keeps direction 1 on every joint, so a session without `export` runs in the motor frame.
+
+For an arm with another zero, the procedure to measure `direction` and `offset` is not published yet. A guessed calibration can drive a joint into its stop. Do not enable a real arm on a profile whose calibration you did not measure. A profile with `--caps` below 1 cuts `kp`, so the daemon applies the R33 error clamp to it (`e_max = 0.03 / kp_scale`).
 
 Hold rules:
 
 - On a real interface, after `SERVE_READY`, the daemon does not disable the motors by itself. It holds the arm when the client leaves, on SIGINT and SIGTERM, and on a fault. A signal never releases the arm. The fault hold keeps the gravity torque of the last command, so the arm does not sag.
 - Before `SERVE_READY`, a start-up failure can disable the motors that the daemon just enabled. The arm can then drop.
 - A short CAN error does not stop the control loop. The arm holds as on a fault. The loop stops only when the errors last longer than 0.25 s or the CAN interface is gone. `release` then still tries to disable the motors.
-- If the control loop stops, or the daemon process is killed, nothing commands the motors. Each motor keeps its last command. Only a gripper whose firmware has parameter access has a watchdog. To stop the motors, support the arm and press the emergency stop.
+- If the control loop stops, or the daemon process is killed, nothing commands the motors. Each motor keeps its last command. Only a gripper whose firmware has parameter access has a watchdog. Legacy firmware has no parameter access, so the arm then has no motor-side watchdog. To stop the motors, support the arm and press the emergency stop.
 - After a daemon death, support the arm before you start `serve` or `hold` again. The start can release each joint for a moment.
 - After `SERVE_READY`, only `release` disables the motors. It asks you to type `RELEASE`. Until you do, the arm holds. Release the torque only when the arm is supported. `release --yes` does not ask. It is for a script that knows the arm is supported, such as a park at `home`.
 - A release ramps the torque down before it disables the motors (ruling R36). For 2 s, each motor keeps its last position target, its `kp` and its feed-forward torque fall linearly to 0, and its `kd` stays. Thus a joint that rests above its stop, such as J3 at `home`, sinks slowly onto the stop. The health checks keep running during the ramp. If a fault occurs during the ramp, the ramp stops, the arm holds as on any fault, and `release` reports that it did not release. Run `release` again: the fault hold then ramps down. A gripper that its own fault released gets no ramp frames. The reply to `release` comes after the disable, about 2 s later than before. During the ramp, the daemon answers the other clients with mode `holding` and ignores commands. `hold` ramps the same way after the typed `RELEASE`.
@@ -181,6 +183,9 @@ arm.stop()  # disable at once, with no ramp, and join; also aliased as arm.estop
 `maker_arm_rs.profile()` returns the pinned `maker_arm_v1` profile as a dict (7 joints: limits, gains, torque caps, direction/offset). `maker_arm_rs.clamp_command(cmds, profile)` applies the crate's single-point clamp to a list of 7 `(pos, vel, kp, kd, tau)` tuples and returns `(clamped_cmds, changed)`. The dict's numeric fields may be edited before the call (a simulator passes URDF joint limits this way). Names, models, and motor ids are never read from Python. The control loop's own command path always runs commands through this clamp before they reach a motor. `encode_control` is a separate low-level protocol encoder for tests and tooling, and it is not clamped.
 
 Joint-coordinate contract: joint coordinates are the vendor URDF's
-(`maker-arm-sdk/urdf/maker_arm/robot.urdf` @ b30d05a), `link_002_joint`..`link_007_joint`
-= motor ids 1..6. `direction`/`offset` map motor to URDF coordinates and are calibrated
-on the arm (MA1); the profile's `q_lo`/`q_hi` are motor-frame until then.
+(`maker-arm-sdk/urdf/maker_arm/robot.urdf`), `link_002_joint`..`link_007_joint`
+= motor ids 1..6. `direction`/`offset` map motor to URDF coordinates. The profile's
+`q_lo`/`q_hi` are motor-frame values from the vendor YAML at 0245316. The default
+calibration above turns them into URDF coordinates.
+
+The gripper map follows the vendor. Angle 0 is closed, and the jaw opens toward negative angles. The default map is the vendor's two-point preview: closed at 0.006713 rad and fully open at -2.078984 rad.

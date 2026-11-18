@@ -1600,8 +1600,11 @@ mod tests {
         let mut p = contact(0.5);
         p.dob = dob;
         let mut c = TrackingController::new(plant.clone(), p, &config, residual).unwrap();
-        let q0: Joints =
+        // The limit midpoint, with J1 at pi/2: at J1's midpoint the plant's gravity torque
+        // is above its tau_max, so the clamp would saturate it on every tick.
+        let mut q0: Joints =
             std::array::from_fn(|j| (config.joints[j].q_lo + config.joints[j].q_hi) / 2.0);
+        q0[0] = std::f64::consts::FRAC_PI_2;
         let (mut q, mut dq) = (q0, [0.0; ARM_DOF]);
         let mit = |cmd: &ArmCommand, q: &Joints, dq: &Joints| -> Joints {
             std::array::from_fn(|j| {
@@ -1613,7 +1616,8 @@ mod tests {
         let mut half = 0.0;
         for k in 0..=200 {
             let out = c.update(&st(k as f64 * H, q, dq, tau), H);
-            let (cmd, _) = clamp_command(&out, &config).unwrap();
+            let (cmd, clamped) = clamp_command(&out, &config).unwrap();
+            assert!(!clamped, "tick {k}: a joint saturates at the hold pose");
             if k == 100 {
                 half = c.offset[1];
             }

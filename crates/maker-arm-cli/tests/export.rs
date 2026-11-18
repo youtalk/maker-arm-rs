@@ -399,3 +399,19 @@ fn a_urdf_with_the_wrong_chain_is_refused_by_joint_name() {
         assert!(!outdir.exists());
     }
 }
+
+#[test]
+fn the_vendor_calibration_flips_j5_limits() {
+    let dir = scratch_dir();
+    let cal = write_cal(
+        &dir,
+        &json!({"direction": [1.0, 1.0, 1.0, 1.0, -1.0, 1.0, 1.0], "offset": rep(0.0, 7)}),
+    );
+    let out = dir.join("vendor.json");
+    export::run(&rig_options(&cal, 0.5, &out)).unwrap();
+    assert!(serve_check_ok(&out));
+    let l = load(&serve_options("can0", &out, &fixture("dynamics_urdf.json"))).unwrap();
+    let j5 = &l.config.joints[4];
+    assert_eq!(j5.q_lo, (-78.0f64).to_radians());
+    assert_eq!(j5.q_hi, 97.6f64.to_radians());
+}

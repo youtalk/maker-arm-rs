@@ -50,11 +50,18 @@ impl GripMap {
         Ok(GripMap { a, b })
     }
 
-    /// A gap of 0 at the gripper's `q_lo` and a full stroke at its `q_hi`.
-    pub fn provisional(config: &ArmConfig) -> GripMap {
-        let g = &config.joints[ARM_DOF];
-        let a = 2.0 * JAW_HALF_STROKE / (g.q_hi - g.q_lo);
-        GripMap { a, b: -a * g.q_lo }
+    /// A gap of 0 at `closed_angle` and a full stroke at `open_angle`.
+    pub fn from_points(closed_angle: f64, open_angle: f64) -> GripMap {
+        let a = 2.0 * JAW_HALF_STROKE / (open_angle - closed_angle);
+        GripMap {
+            a,
+            b: -a * closed_angle,
+        }
+    }
+
+    /// The vendor's two-point preview: angle 0 is closed and the jaw opens toward negative angles.
+    pub fn provisional() -> GripMap {
+        GripMap::from_points(0.006713, -2.078984)
     }
 
     fn parse(text: &str) -> Result<GripMap, String> {
@@ -140,7 +147,7 @@ pub fn load(o: &ServeOptions) -> Result<Loaded, String> {
     };
     let grip = match &o.gripper_map {
         Some(t) => GripMap::parse(t)?,
-        None => GripMap::provisional(&config),
+        None => GripMap::provisional(),
     };
     let empty: &[u8] = &[];
     let opt = |b: &Option<Vec<u8>>| b.as_deref().unwrap_or(empty).to_vec();
@@ -802,10 +809,10 @@ mod tests {
         let mut v = v1_json();
         v["joints"][0]["direction"] = json!(-1.0);
         v["joints"][0]["offset"] = json!(0.5);
-        v["joints"][0]["q_lo"] = json!(-4.318);
-        v["joints"][0]["q_hi"] = json!(1.168);
+        v["joints"][0]["q_lo"] = json!(-2.2);
+        v["joints"][0]["q_hi"] = json!(3.2);
         assert!(profile_from_json(&v, "can0").is_ok());
-        v["joints"][0]["q_hi"] = json!(1.3);
+        v["joints"][0]["q_hi"] = json!(3.3);
         let e = profile_from_json(&v, "can0").unwrap_err();
         assert!(e.contains("joints[0].q_hi"), "{e}");
     }
@@ -836,10 +843,11 @@ mod tests {
     }
 
     #[test]
-    fn the_provisional_grip_map_spans_the_gripper_range() {
-        let g = GripMap::provisional(&ArmConfig::maker_arm_v1());
-        assert!((g.to_joint_m(-2.092)).abs() < 1e-12);
-        assert!((g.to_joint_m(-0.039) - 0.0524125).abs() < 1e-12);
+    fn the_provisional_grip_map_is_the_vendor_preview() {
+        let g = GripMap::provisional();
+        assert!(g.to_joint_m(0.006713).abs() < 1e-12);
+        assert!((g.to_joint_m(-2.078984) - JAW_HALF_STROKE).abs() < 1e-12);
+        assert!((g.to_joint_m((-96.0f64).to_radians()) - 0.042274).abs() < 1e-5);
         assert!((g.to_angle(g.to_joint_m(-1.0)) + 1.0).abs() < 1e-12);
         assert!(GripMap::new(0.0, 1.0).is_err());
     }
