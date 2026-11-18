@@ -3,7 +3,8 @@
 //! Connect sends each motor a non-clearing fault query and reads its state
 //! only after a clean answer, infers parameter access from a RUN_MODE read,
 //! and applies the 2π wrap correction once. Enable refuses a reported fault,
-//! a pose outside the grace window and a hot gripper, arms the gripper
+//! a pose outside the grace window, a hot gripper and a joint at its health
+//! limit, arms the gripper
 //! watchdog where parameters work, then preloads each motor with a
 //! zero-gain frame before it enables it. Disable is checked per motor, then
 //! the gripper watchdog is restored.
@@ -59,7 +60,8 @@ pub enum SessionError {
         motor_id: u8,
         value: u8,
     },
-    /// The gripper is at or above its enable temperature.
+    /// The gripper is at or above its enable temperature, or a joint at or
+    /// above `temp_hold_c`.
     TooHot {
         motor_id: u8,
         celsius: f64,
@@ -571,8 +573,9 @@ impl Session {
             });
         }
         // Gates: fresh fault status and position from every motor (cached
-        // values never authorize torque), then limits and the gripper's
-        // temperature.
+        // values never authorize torque), then limits and temperatures: the
+        // gripper below its enable limit, every joint below the health limit
+        // that would fault the first tick (ruling R31), before any torque.
         let motor_ids: Vec<u8> = self.config.joints.iter().map(|j| j.motor_id).collect();
         for &m in &motor_ids {
             self.probe(m)?;
@@ -589,13 +592,16 @@ impl Session {
                     joint_pos: st.position,
                 });
             }
-            if let Some(g) = self.config.gripper {
-                if g.motor_id == j.motor_id && st.temperature >= g.enable_temperature_c {
-                    return Err(SessionError::TooHot {
-                        motor_id: j.motor_id,
-                        celsius: st.temperature,
-                    });
-                }
+            let limit = self
+                .config
+                .gripper
+                .filter(|g| g.motor_id == j.motor_id)
+                .map_or(self.config.temp_hold_c, |g| g.enable_temperature_c);
+            if st.temperature >= limit {
+                return Err(SessionError::TooHot {
+                    motor_id: j.motor_id,
+                    celsius: st.temperature,
+                });
             }
         }
         if let Err(e) = self.arm_watchdog().and_then(|()| self.preload_and_enable()) {
