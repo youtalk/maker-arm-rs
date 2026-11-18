@@ -16,6 +16,7 @@ use maker_arm_cli::wire::{self, ClientFrame, Mode, Op, Role, StateFrame, WireErr
 use maker_arm_transport::CanBackend;
 use std::io::Write;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
@@ -401,8 +402,13 @@ impl Daemon {
         // second release out until the result is set.
         st.parked = arm.snapshot().map(|s| s.arm);
         drop(st);
-        let (session, result) = arm.stop_and_disable();
+        let disabled = std::panic::catch_unwind(AssertUnwindSafe(|| arm.stop_and_disable()));
         st = self.lock();
+        let (session, result) = disabled.unwrap_or_else(|panic| {
+            // No arm and no pose: `faulted`, as before the arm left. The motors may hold torque.
+            st.parked = None;
+            std::panic::resume_unwind(panic)
+        });
         let failed = match result {
             Ok(()) => None,
             // Every motor is confirmed off. Say why the loop had stopped.
@@ -1150,10 +1156,10 @@ mod tests {
     /// Each disable frame takes this long, as a motor's answer over CAN does.
     const SLOW_DISABLE: Duration = Duration::from_millis(10);
 
-    /// A sim whose disable frames each take `SLOW_DISABLE`: the checked disable sends 14.
-    struct SlowDisable(SimArm);
+    /// A sim that runs its hook before each disable frame: the checked disable sends 14.
+    struct OnDisable(SimArm, fn());
 
-    impl CanBackend for SlowDisable {
+    impl CanBackend for OnDisable {
         fn send(
             &mut self,
             id: u32,
@@ -1161,7 +1167,7 @@ mod tests {
         ) -> Result<(), maker_arm_transport::TransportError> {
             let disable = maker_arm_protocol::mit::encode_disable((id & 0x7F) as u8);
             if (id, *data) == (disable.id, disable.data) {
-                std::thread::sleep(SLOW_DISABLE);
+                self.1();
             }
             self.0.send(id, data)
         }
@@ -1373,7 +1379,8 @@ mod tests {
         // The real arm, 2026-11-18: at each release every client's Poll waited 27-31 ms for the
         // checked disable, and the ros2_control loop overran.
         let sim = SimArm::new(&ArmConfig::maker_arm_v1());
-        let (d, _) = daemon_on(true, Box::new(SlowDisable(sim)));
+        let slow = || std::thread::sleep(SLOW_DISABLE);
+        let (d, _) = daemon_on(true, Box::new(OnDisable(sim, slow)));
         let before = d.state_frame(&d.lock(), 1);
         std::thread::scope(|s| {
             let release = s.spawn(|| release_now(&d));
@@ -1406,6 +1413,22 @@ mod tests {
             release.join().unwrap();
         });
         on_sim(&d, |sim| assert!((1..=7).all(|m| !sim.enabled(m))));
+    }
+
+    #[test]
+    fn a_panic_in_the_disable_answers_fault() {
+        // As before the disable ran off the state lock: no arm and no pose is a fault.
+        let sim = SimArm::new(&ArmConfig::maker_arm_v1());
+        let (d, _) = daemon_on(true, Box::new(OnDisable(sim, || panic!("injected"))));
+        let (mut a, _b) = UnixStream::pair().unwrap();
+        let released = std::thread::scope(|s| s.spawn(|| d.release(&mut a, 1)).join());
+        assert!(released.is_err(), "the panic reaches the client's thread");
+        let poll = ClientFrame::Control {
+            seq: 2,
+            op: Op::Poll,
+        };
+        let f = d.handle(Role::Monitor, poll).unwrap();
+        assert_eq!(f.mode, Mode::Fault);
     }
 
     #[test]
