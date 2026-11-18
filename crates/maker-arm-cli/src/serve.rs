@@ -1417,7 +1417,7 @@ mod tests {
 
     #[test]
     fn a_panic_in_the_disable_answers_fault() {
-        // As before the disable ran off the state lock: no arm and no pose is a fault.
+        // No arm and no pose is a fault, as it was with the disable under the state lock.
         let sim = SimArm::new(&ArmConfig::maker_arm_v1());
         let (d, _) = daemon_on(true, Box::new(OnDisable(sim, || panic!("injected"))));
         let (mut a, _b) = UnixStream::pair().unwrap();
