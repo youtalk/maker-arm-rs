@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 const LEAD_S: f64 = 0.02; // INITIAL: V2 checks the tracking lag
 /// A Following client silent this long is reported as Holding.
 const STREAM_TIMEOUT_S: f64 = 0.1; // INITIAL: spec section 6.1
-/// An arm joint further than this from the last accepted target is refused.
+/// An arm joint further than this from the last accepted target, after the clamp, is refused.
 const JUMP_MAX_RAD: f64 = 0.05; // INITIAL: 5 rad/s at 100 Hz, the clamp's max_velocity
 /// The gripper target leads the measured angle by at most this spring torque, closing only.
 /// The vendor SDK (`maker_arm/gripper.py`) caps the closing side at `max(1, 2 x hold)` Nm,
@@ -72,6 +72,8 @@ struct State {
     /// The last accepted arm target (rad).
     target: [f64; ARM_DOF],
     last_command: Instant,
+    /// The loop's ticks whose command it clamped, plus one per client command whose arm joints
+    /// `command` clamped into the limits. The loop then gets that command inside the limits.
     clamped: u32,
     refused: u32,
     /// The command client's connection, kept to shut it down on a signal.
@@ -122,7 +124,7 @@ impl State {
 type Tracking = Box<dyn Fn() -> Result<TrackingController, String> + Send + Sync>;
 
 struct Daemon {
-    /// The limits the loop clamps commands into; Activate clamps the measured pose the same way.
+    /// The limits the loop clamps commands into. Activate and `command` clamp the same way.
     config: ArmConfig,
     state: Mutex<State>,
     /// The session while released. Locked before `state`, and held across a release and an
@@ -199,25 +201,9 @@ impl Daemon {
         };
         // The loop pulls a joint that rests outside its limits to the clamped pose. Take that
         // pose as the jump reference, or the client's first command after the pull-in is refused.
-        let pose: Vec<JointCommand> = snap
-            .arm
-            .motors
-            .iter()
-            .map(|m| JointCommand {
-                pos: m.position,
-                vel: 0.0,
-                kp: 0.0,
-                kd: 0.0,
-                tau: 0.0,
-            })
-            .collect();
-        let Ok((clamped, _)) = clamp_command(&pose, &self.config) else {
+        let Some(row) = self.clamp_pose(snap.arm.motors.iter().map(|m| m.position)) else {
             return;
         };
-        let mut row = [0.0; ROW];
-        for (r, c) in row.iter_mut().zip(&clamped) {
-            *r = c.pos;
-        }
         if st.push(row) {
             st.target.copy_from_slice(&row[..ARM_DOF]);
             st.active = true;
@@ -225,33 +211,62 @@ impl Daemon {
         }
     }
 
+    /// `pos` (rad, one per motor) clamped into the limits as the loop's `clamp_command` clamps
+    /// it: a joint outside its limits goes to the limit. None for a non-finite value.
+    fn clamp_pose(&self, pos: impl Iterator<Item = f64>) -> Option<[f64; ROW]> {
+        let pose: Vec<JointCommand> = pos
+            .map(|pos| JointCommand {
+                pos,
+                vel: 0.0,
+                kp: 0.0,
+                kd: 0.0,
+                tau: 0.0,
+            })
+            .collect();
+        let (clamped, _) = clamp_command(&pose, &self.config).ok()?;
+        let mut row = [0.0; ROW];
+        for (r, c) in row.iter_mut().zip(&clamped) {
+            *r = c.pos;
+        }
+        Some(row)
+    }
+
     fn command(&self, st: &mut State, q: &[f64; ROW]) {
         if st.mode == Mode::Fault || st.mode == Mode::Refused || !st.active {
             return;
         }
-        let jump = q[..ARM_DOF]
-            .iter()
-            .zip(&st.target)
-            .any(|(a, b)| (a - b).abs() > JUMP_MAX_RAD);
-        if jump || q.iter().any(|v| !v.is_finite()) {
+        // The arm joints are clamped as Activate clamps the pose, before the jump check: the
+        // client's first command is the measured pose, also of a joint that rests outside its
+        // limits. A non-finite value fails the clamp. The gripper entry is the jaw in metres, so
+        // its clamped value is not used.
+        let row = self.clamp_pose(q.iter().copied()).filter(|c| {
+            !c[..ARM_DOF]
+                .iter()
+                .zip(&st.target)
+                .any(|(a, b)| (a - b).abs() > JUMP_MAX_RAD)
+        });
+        let Some(mut row) = row else {
             st.refused = st.refused.saturating_add(1);
             st.mode = Mode::Refused;
             log(&format!(
-                "refused {q:?}: a non-finite value or a joint more than {JUMP_MAX_RAD} rad \
-                 from the last target {:?}; holding until Deactivate, then Activate",
+                "refused {q:?}: a non-finite value or a joint more than {JUMP_MAX_RAD} rad, \
+                 after the clamp, from the last target {:?}; holding until Deactivate, then \
+                 Activate",
                 st.target
             ));
             return;
-        }
+        };
         let Some(snap) = st.arm.as_ref().and_then(RunningArm::snapshot) else {
             return;
         };
         let measured = snap.arm.motors[ARM_DOF].position;
-        let mut row = [0.0; ROW];
-        row[..ARM_DOF].copy_from_slice(&q[..ARM_DOF]);
         row[ARM_DOF] = grip_target(self.grip.to_angle(q[ARM_DOF]), measured, self.grip_window);
         if st.push(row) {
-            st.target.copy_from_slice(&q[..ARM_DOF]);
+            // Counted here, as the loop no longer sees it outside the limits.
+            if row[..ARM_DOF] != q[..ARM_DOF] {
+                st.clamped = st.clamped.saturating_add(1);
+            }
+            st.target.copy_from_slice(&row[..ARM_DOF]);
             st.last_command = Instant::now();
             st.mode = Mode::Following;
         }
@@ -1200,6 +1215,46 @@ mod tests {
     fn activate_takes_the_jump_reference_from_inside_the_limits() {
         let (d, hi) = daemon(false);
         activate_clamps(&d, hi);
+    }
+
+    #[test]
+    fn the_first_command_at_the_measured_pose_is_not_a_jump() {
+        // The real arm, 2026-11-18: J2 rested 0.054 rad outside its limit, and the client's
+        // first command, the measured pose, was refused as a jump from the clamped target.
+        let (d, hi) = daemon(false);
+        let mut st = d.lock();
+        d.activate(&mut st);
+        let snap = st.arm.as_ref().and_then(RunningArm::snapshot).unwrap();
+        let mut q = [0.0; ROW];
+        for (q, m) in q.iter_mut().zip(&snap.arm.motors) {
+            *q = m.position;
+        }
+        assert!(q[1] - hi > JUMP_MAX_RAD, "J2 rests outside its limit");
+        d.command(&mut st, &q);
+        assert_eq!((st.mode, st.refused), (Mode::Following, 0));
+        assert!((st.target[1] - hi).abs() < 1e-9, "{}", st.target[1]);
+        // More than JUMP_MAX_RAD from the target after the clamp.
+        q[1] = hi - 0.06;
+        d.command(&mut st, &q);
+        assert_eq!((st.mode, st.refused), (Mode::Refused, 1));
+    }
+
+    #[test]
+    fn a_clamped_command_counts_once() {
+        // maker_arm_ros2's V1 launch test asserts `clamped == 0` after its MoveIt goals.
+        let (d, hi) = daemon(false);
+        let mut st = d.lock();
+        d.activate(&mut st);
+        let mut q = [0.0; ROW];
+        q[..ARM_DOF].copy_from_slice(&st.target);
+        // Inside the limits. The gripper entry (the jaw in metres) never counts.
+        d.command(&mut st, &q);
+        assert_eq!((st.mode, st.clamped), (Mode::Following, 0));
+        // Outside J2's limit, but within JUMP_MAX_RAD of the target after the clamp.
+        q[1] = hi + 0.02;
+        d.command(&mut st, &q);
+        assert_eq!((st.mode, st.refused, st.clamped), (Mode::Following, 0, 1));
+        assert!((st.target[1] - hi).abs() < 1e-9, "{}", st.target[1]);
     }
 
     #[test]
