@@ -1,14 +1,14 @@
 //! THE single command-clamp enforcement point (design §2). Every command
 //! that reaches a motor passes through [`clamp_command`] in the control
 //! loop's output stage; nothing else in this workspace may feed controller
-//! or user values into `encode_mit`.
+//! or user values into `mit::encode_control`.
 
 use crate::config::ArmConfig;
 use crate::state::{ArmCommand, JointCommand};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClampError {
-    /// Non-finite values are rejected outright: `float_to_u16` would map
+    /// Non-finite values are rejected outright: `float_to_uint` would map
     /// NaN to the range minimum — a full-negative-rail command.
     NonFinite {
         joint: usize,
@@ -153,7 +153,7 @@ mod tests {
 
     #[test]
     fn non_finite_is_an_error_not_a_command() {
-        // float_to_u16 maps NaN to the range MINIMUM (full negative rail) —
+        // float_to_uint maps NaN to the range MINIMUM (full negative rail) —
         // a NaN escaping a controller must become an error here, never a
         // motor command (MA0 carry-forward).
         let c = ArmConfig::maker_arm_v1();

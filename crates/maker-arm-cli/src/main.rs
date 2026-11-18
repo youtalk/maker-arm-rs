@@ -39,7 +39,8 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Connect, enable, and hold the current pose until a typed RELEASE
+    /// Connect, enable, and hold the current pose until a typed RELEASE, then ramp the torque
+    /// down over 2 s and disable
     Hold,
     /// Write the profile and dynamics files that serve loads: --sim, --calibration or --ident
     Export {
@@ -62,13 +63,29 @@ enum Command {
         #[arg(long = "out_dir")]
         out_dir: Option<PathBuf>,
     },
-    /// Ask a running serve daemon to disable the motors, after a typed RELEASE
+    /// Ask a running serve daemon to ramp the torque down over 2 s and disable the motors,
+    /// after a typed RELEASE
     Release {
         #[arg(long)]
         interface: String,
         /// Default: $XDG_RUNTIME_DIR/maker-arm-<interface>.sock
         #[arg(long)]
         socket: Option<PathBuf>,
+        /// Skip the typed RELEASE, for a script that has checked the arm is supported
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Ask a released serve daemon to enable the motors at the measured pose, after a typed
+    /// ENABLE
+    Enable {
+        #[arg(long)]
+        interface: String,
+        /// Default: $XDG_RUNTIME_DIR/maker-arm-<interface>.sock
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        /// Skip the typed ENABLE
+        #[arg(long)]
+        yes: bool,
     },
     /// Print one STATUS line from a running serve daemon
     Status {
@@ -115,8 +132,8 @@ enum Command {
 }
 
 /// A real bus comes with its lock, which the caller holds for the whole command: the probes of
-/// scan, doctor and zero and the connect of hold send disable frames, which would drop an arm
-/// that a serve daemon holds.
+/// scan, doctor and zero clear faults, zero disables every motor and the enable of hold sends
+/// zero-gain frames, which would drop an arm that a serve daemon holds.
 fn open_backend(
     cli: &Cli,
     config: &ArmConfig,
@@ -138,6 +155,18 @@ fn open_backend(
         }
         (None, true) => Ok((None, Box::new(SimArm::new(config)))),
         _ => Err("pass exactly one of --can <iface> or --sim".into()),
+    }
+}
+
+/// Fault recovery is the operator's: this CLI never clears a fault.
+const FAULT_KEPT: &str = "A reported fault is kept. Fix the cause, then press and release the \
+                          emergency stop, or run the vendor `maker-arm scan --clear-faults`.";
+
+/// The decoded fault word, with the raw word when there is a fault.
+fn fault(word: u32) -> String {
+    match word {
+        0 => maker_arm_protocol::mit::fault_text(0),
+        w => format!("{w:#010x} {}", maker_arm_protocol::mit::fault_text(w)),
     }
 }
 
@@ -204,8 +233,19 @@ fn main() -> Result<(), String> {
         return Ok(());
     }
     match &cli.command {
-        Command::Release { interface, socket } => {
-            return serve::release(interface, socket.as_deref());
+        Command::Release {
+            interface,
+            socket,
+            yes,
+        } => {
+            return serve::release(interface, socket.as_deref(), *yes);
+        }
+        Command::Enable {
+            interface,
+            socket,
+            yes,
+        } => {
+            return serve::enable(interface, socket.as_deref(), *yes);
         }
         Command::Status { interface, socket } => {
             return serve::status(interface, socket.as_deref());
@@ -219,17 +259,12 @@ fn main() -> Result<(), String> {
         Command::Scan => {
             let rows = maker_arm_cli::scan(backend.as_mut(), &config).map_err(|e| e.to_string())?;
             println!(
-                "{:>3} {:>8} {:>5} {:>7} {:>9} {:>4} {:>6} {:>5}",
-                "id", "name", "model", "present", "pos(rad)", "mode", "temp", "fault"
+                "{:>3} {:>8} {:>5} {:>7} {:>9} {:>4} {:>6} {:>6} fault",
+                "id", "name", "model", "present", "pos(rad)", "mode", "temp", "params"
             );
-            for r in rows {
-                // `{:>5:#04x}` is not valid Rust format syntax (a spec takes
-                // at most one `:`-separated section); format the hex value
-                // as a string first and align that, per the brief's escape
-                // hatch.
-                let fault = format!("{:#04x}", r.fault_bits);
+            for r in &rows {
                 println!(
-                    "{:>3} {:>8} {:>5} {:>7} {:>9.3} {:>4} {:>6.1} {:>5}",
+                    "{:>3} {:>8} {:>5} {:>7} {:>9.3} {:>4} {:>6.1} {:>6} {}",
                     r.motor_id,
                     r.name,
                     r.model,
@@ -237,8 +272,12 @@ fn main() -> Result<(), String> {
                     r.joint_pos,
                     r.mode,
                     r.temperature,
-                    fault
+                    r.params,
+                    fault(r.fault_word)
                 );
+            }
+            if rows.iter().any(|r| r.fault_word != 0) {
+                println!("{FAULT_KEPT}");
             }
         }
         Command::Doctor => {
@@ -246,53 +285,71 @@ fn main() -> Result<(), String> {
                 maker_arm_cli::doctor(backend.as_mut(), &config).map_err(|e| e.to_string())?;
             for r in &report.rows {
                 println!(
-                    "motor {} present={} pos={:.3} in_limits={} run_mode={:?} \
-                     can_timeout={:?} vbus={:?} temp={:.1} fault={:#04x}",
+                    "motor {} present={} pos={:.3} in_limits={} params={} run_mode={:?} \
+                     can_timeout={:?} vbus={:?} temp={:.1} fault={}",
                     r.motor_id,
                     r.present,
                     r.joint_pos,
                     r.in_limits,
+                    r.params,
                     r.run_mode,
                     r.can_timeout,
                     r.vbus,
                     r.temperature,
-                    r.fault_bits
+                    fault(r.fault_word)
                 );
             }
             for w in &report.warnings {
                 println!("WARNING: {w}");
             }
-            if report.rows.iter().any(|r| !r.present || !r.in_limits) {
+            if report.rows.iter().any(|r| r.fault_word != 0) {
+                println!("{FAULT_KEPT}");
+            }
+            if !report.passed() {
                 return Err("doctor found problems (see rows above)".into());
             }
         }
         Command::Zero { motor, yes } => {
+            // A dead daemon may have left the arm raised on enabled motors:
+            // ask before the disables drop it. Input that ends aborts.
             if !yes {
-                println!(
-                    "zeroing motor {motor} overwrites its zero position. Type YES to continue."
-                );
+                println!("every motor will be disabled: support the arm, then press ENTER");
                 let mut line = String::new();
-                std::io::stdin()
-                    .read_line(&mut line)
-                    .map_err(|e| e.to_string())?;
-                if line.trim() != "YES" {
+                if !matches!(std::io::stdin().read_line(&mut line), Ok(n) if n > 0) {
                     return Err("aborted".into());
                 }
             }
-            let pos = maker_arm_cli::zero_motor(backend.as_mut(), &config, motor)?;
+            // Runs after every motor is disabled.
+            let confirm = || {
+                if yes {
+                    return true;
+                }
+                println!(
+                    "every motor is disabled: support the arm. Zeroing motor {motor} \
+                     overwrites its zero position. Move the arm by hand to the vendor zero \
+                     pose: folded against the base, gripper fully closed. Then type YES to \
+                     continue."
+                );
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line).is_ok() && line.trim() == "YES"
+            };
+            let pos = maker_arm_cli::zero_motor(backend.as_mut(), &config, motor, confirm)?;
             println!("motor {motor} zeroed; joint position now {pos:.4} rad");
             // Presentation only: `zero_motor` reports a true register
-            // value, not a claim that it is a safe pose. Some joints'
-            // configured ranges do not include zero (e.g. J5, J6), so
-            // warn here -- `Session::enable()` remains the real gate and
-            // will refuse to energize a joint left outside its range.
+            // value, not a claim that it is a safe pose. Enable accepts a
+            // joint up to `enable_limit_grace` past its range, so warn only
+            // outside that window -- `Session::enable()` remains the real
+            // gate.
             if let Some(j) = config.joint_by_motor_id(motor) {
-                if pos < j.q_lo || pos > j.q_hi {
+                let (lo, hi) = (
+                    j.q_lo - config.enable_limit_grace,
+                    j.q_hi + config.enable_limit_grace,
+                );
+                if !(lo..=hi).contains(&pos) {
                     println!(
-                        "WARNING: {pos:.4} rad is outside motor {motor}'s configured range \
-                         [{:.3}, {:.3}]; enable will refuse this pose until it is moved back \
-                         inside range",
-                        j.q_lo, j.q_hi
+                        "WARNING: {pos:.4} rad is outside motor {motor}'s enable window \
+                         [{lo:.3}, {hi:.3}]; enable will refuse this pose until it is moved \
+                         back inside"
                     );
                 }
             }
@@ -301,7 +358,7 @@ fn main() -> Result<(), String> {
             let mut session =
                 Session::connect(backend, config.clone()).map_err(|e| e.to_string())?;
             session.enable().map_err(|e| e.to_string())?;
-            let running = session
+            let mut running = session
                 .start(Box::new(HoldController::from_config(&config)), None)
                 .expect("a start without rt cannot fail");
             // EVERYTHING from here to `confirm_release` runs with a live,
@@ -330,30 +387,45 @@ fn main() -> Result<(), String> {
                     // Losing the Ctrl-C convenience is strictly better than
                     // dropping a live arm because a handler could not be
                     // installed. Without it, Ctrl-C terminates this process
-                    // outright and the motors' own CAN_TIMEOUT watchdog is
-                    // the only backstop -- so say so, and continue into the
-                    // gate, which is still the only way to release cleanly.
+                    // outright and the motors keep their last command -- so
+                    // say so, and continue into the gate, which is still the
+                    // only way to release cleanly.
                     let _ = writeln!(
                         std::io::stderr(),
                         "WARNING: could not install the Ctrl-C handler ({e}); Ctrl-C will \
-                         kill this process instead of holding, leaving the motors to their \
-                         own CAN_TIMEOUT watchdog. Type RELEASE to release cleanly."
+                         kill this process instead of holding, leaving the motors on their \
+                         last command. Type RELEASE to release cleanly."
                     );
                 }
             }
             let stdin = std::io::stdin();
             let mut input = stdin.lock();
             let mut output = std::io::stdout();
-            maker_arm_cli::confirm_release(&mut input, &mut output);
-            // Past the gate: torque is commanded off before anything below
-            // can fail, so `?` is safe again from here on.
-            let (_session, res) = running.stop_and_disable();
+            // Past the gate, the torque ramps down and then goes off.
+            // A fault during the ramp holds the arm, as any fault does:
+            // back to the gate.
+            let (_session, res) = loop {
+                maker_arm_cli::confirm_release(&mut input, &mut output);
+                match running.release() {
+                    Ok(released) => break released,
+                    Err(held) => {
+                        running = held;
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "a fault ended the torque ramp: torque remains enabled, holding \
+                             the measured pose"
+                        );
+                    }
+                }
+            };
+            // Torque is commanded off, so `?` is safe again from here on.
             res.map_err(|e| e.to_string())?;
             let _ = writeln!(std::io::stdout(), "torque released.");
         }
         Command::Serve { .. }
         | Command::Export { .. }
         | Command::Release { .. }
+        | Command::Enable { .. }
         | Command::Status { .. } => {
             unreachable!("handled above")
         }

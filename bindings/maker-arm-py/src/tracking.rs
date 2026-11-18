@@ -156,6 +156,10 @@ impl Controller for LoopTracking {
             .unwrap_or_else(|e| e.into_inner())
             .update(state, dt)
     }
+
+    fn gravity(&self) -> Vec<f64> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).gravity()
+    }
 }
 
 /// The compliant tracking controller (tracking design sections 6, 7, 9 and 10).
@@ -167,8 +171,8 @@ pub struct Tracking {
     pub(crate) ctrl: Arc<Mutex<TrackingController>>,
     shared: Arc<maker_arm::tracking::TrackingShared>,
     pub(crate) in_loop: AtomicBool,
-    /// The motors' CAN_TIMEOUT (s): in a loop, a last tick older than this means the loop no
-    /// longer runs this controller (stopped, fault hold or `hold_now`).
+    /// The profile's feedback timeout (s): in a loop, a last tick older than this means the
+    /// loop no longer runs this controller (stopped, fault hold or `hold_now`).
     stale_s: f64,
 }
 
@@ -242,7 +246,7 @@ impl Tracking {
             ctrl: Arc::new(Mutex::new(ctrl)),
             shared,
             in_loop: AtomicBool::new(false),
-            stale_s: f64::from(config.motor_can_timeout_ms) / 1000.0,
+            stale_s: config.feedback_timeout,
         })
     }
 
@@ -314,8 +318,8 @@ impl Tracking {
     /// last `t` plus wall time, so it mixes the caller's sim time with wall time.
     ///
     /// None before the first tick, and None in a loop whose last tick is older than the
-    /// motors' CAN_TIMEOUT (0.2 s): the loop is stopped, fault-holding or in `hold_now`, and
-    /// no longer runs this controller.
+    /// profile's feedback timeout (0.25 s): the loop is stopped, fault-holding or in
+    /// `hold_now`, and no longer runs this controller.
     fn now(&self) -> Option<f64> {
         self.live_now().ok().flatten()
     }

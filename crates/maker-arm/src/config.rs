@@ -72,6 +72,19 @@ impl JointConfig {
     }
 }
 
+/// The vendor's gripper rules. The gripper is also released on a fault,
+/// and its warning flag counts as a fault.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GripperRules {
+    pub motor_id: u8,
+    /// Motor-side watchdog written to CAN_TIMEOUT at enable where the
+    /// firmware has parameter access (ms).
+    pub can_timeout_ms: u32,
+    pub max_temperature_c: f64,
+    /// Enable needs the gripper below this temperature.
+    pub enable_temperature_c: f64,
+}
+
 #[derive(Debug, Clone)]
 pub struct ArmConfig {
     /// Index 0..=6 = J1..J6, gripper. Motor ids 1..=7.
@@ -81,16 +94,17 @@ pub struct ArmConfig {
     pub max_velocity: f64,
     /// Seconds; feedback older than this is a health fault.
     pub feedback_timeout: f64,
-    /// Motor-side watchdog written to CAN_TIMEOUT at enable (ms).
-    pub motor_can_timeout_ms: u32,
+    /// Seconds between non-clearing fault queries to one motor.
+    pub fault_poll_interval: f64,
     /// Subtracted from q_hi / added to q_lo by the clamp (rad).
     pub limit_margin: f64,
     /// Connect/enable position tolerance beyond soft limits (rad).
     pub enable_limit_grace: f64,
     /// Consecutive ticks of mode != 2 before faulting.
     pub mode_fault_ticks: u32,
-    /// Our addition: any motor at or above this temperature (°C) trips an
-    /// automatic hold (design §4 item 3). Not an upstream behavior.
+    /// Our addition: a joint at or above this temperature (°C) trips an
+    /// automatic hold (design §4 item 3). The gripper uses its own
+    /// `GripperRules::max_temperature_c`.
     pub temp_hold_c: f64,
     /// Our addition: experiment gain ceiling for kp (design §2) — well below
     /// the protocol's KP_MAX = 500.0, tuned by hardware sessions under
@@ -98,12 +112,16 @@ pub struct ArmConfig {
     pub kp_max: f64,
     /// Clamp ceiling for kd: tracks the protocol's KD_MAX constant.
     pub kd_max: f64,
-    /// Wire spacing between per-motor MIT frames within one tick (µs).
-    pub inter_frame_us: u64,
+    /// How long the session waits for one motor's reply before it sends the
+    /// next frame (µs). Every motor replies on the same CAN id, so two
+    /// replies on the bus at once collide. A missing reply is not a fault by
+    /// itself: the health checks decide.
+    pub reply_wait_us: u64,
     /// On health fault: freeze targets and keep holding (true, default)
     /// versus disable outright (false).
     pub hold_on_fault: bool,
     pub host_id: u8,
+    pub gripper: Option<GripperRules>,
 }
 
 impl ArmConfig {
@@ -148,17 +166,23 @@ impl ArmConfig {
             ],
             control_rate_hz: 200.0,
             max_velocity: 5.0,
-            feedback_timeout: 0.2,
-            motor_can_timeout_ms: 200,
+            feedback_timeout: 0.25,
+            fault_poll_interval: 0.25,
             limit_margin: 0.0,
             enable_limit_grace: 0.35,
             mode_fault_ticks: 5,
             temp_hold_c: 70.0,
             kp_max: 200.0,
             kd_max: maker_arm_protocol::KD_MAX,
-            inter_frame_us: 150,
+            reply_wait_us: 3000,
             hold_on_fault: true,
             host_id: maker_arm_protocol::HOST_CAN_ID,
+            gripper: Some(GripperRules {
+                motor_id: 7,
+                can_timeout_ms: 500,
+                max_temperature_c: 55.0,
+                enable_temperature_c: 45.0,
+            }),
         }
     }
 
@@ -210,13 +234,23 @@ mod tests {
         }
         assert_eq!(c.control_rate_hz, 200.0);
         assert_eq!(c.max_velocity, 5.0);
-        assert_eq!(c.feedback_timeout, 0.2);
-        assert_eq!(c.motor_can_timeout_ms, 200);
+        // The vendor's health and gripper rules (spec 6.2).
+        assert_eq!(c.feedback_timeout, 0.25);
+        assert_eq!(c.fault_poll_interval, 0.25);
+        assert_eq!(
+            c.gripper,
+            Some(GripperRules {
+                motor_id: 7,
+                can_timeout_ms: 500,
+                max_temperature_c: 55.0,
+                enable_temperature_c: 45.0,
+            })
+        );
         assert_eq!(c.limit_margin, 0.0);
         assert_eq!(c.enable_limit_grace, 0.35);
         assert_eq!(c.mode_fault_ticks, 5);
         assert_eq!(c.host_id, 0xFD);
-        assert_eq!(c.inter_frame_us, 150);
+        assert_eq!(c.reply_wait_us, 3000);
         assert!(c.hold_on_fault);
     }
 

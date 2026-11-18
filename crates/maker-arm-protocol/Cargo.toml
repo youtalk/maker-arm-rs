@@ -1,6 +1,6 @@
 [package]
 name = "maker-arm-protocol"
-description = "RobStride private CAN protocol codec for the MakerMods Maker Arm: pure functions, zero I/O"
+description = "RobStride MIT CAN protocol codec for the MakerMods Maker Arm: pure functions, zero I/O"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
