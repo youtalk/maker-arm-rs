@@ -750,11 +750,9 @@ mod tests {
 
     #[test]
     fn activate_takes_the_jump_reference_from_inside_the_limits() {
-        let c = ArmConfig::maker_arm_v1();
-        let (arm, shared) = started(|sim| {
-            let j = &c.joints[1];
-            sim.set_position(j.motor_id, j.q_lo - 0.3);
-        });
+        // The loop runs with the stock limits and never moves the sim. The daemon gets a J2
+        // upper limit 0.3 rad below the measured pose, so Activate must pull that pose in.
+        let (arm, shared) = started(|_| {});
         first_tick(
             &arm,
             &shared,
@@ -762,6 +760,11 @@ mod tests {
             Duration::from_secs(1),
         )
         .unwrap();
+        let measured = arm.snapshot().unwrap().arm.motors[1].position;
+        let mut c = ArmConfig::maker_arm_v1();
+        c.joints[1].q_hi = measured - 0.3 + c.limit_margin;
+        let hi = measured - 0.3;
+        assert!(hi > c.joints[1].q_lo + c.limit_margin);
         let d = Daemon {
             config: c.clone(),
             state: Mutex::new(State {
@@ -782,17 +785,15 @@ mod tests {
             exit_with_client: false,
             socket: PathBuf::new(),
         };
-        let lo = c.joints[1].q_lo + c.limit_margin;
         let mut st = d.lock();
         d.activate(&mut st);
         assert!(st.active);
-        // The loop may already have moved the sim a little toward the limit.
-        assert!((st.target[1] - lo).abs() < 1e-3, "{}", st.target[1]);
+        assert!((st.target[1] - hi).abs() < 1e-9, "{}", st.target[1]);
         let mut q = [0.0; ROW];
         q[..ARM_DOF].copy_from_slice(&st.target);
         d.command(&mut st, &q);
         assert_eq!(st.mode, Mode::Following);
-        q[1] = lo - 0.06;
+        q[1] = hi - 0.06;
         d.command(&mut st, &q);
         assert_eq!(st.mode, Mode::Refused);
     }
