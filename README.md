@@ -28,9 +28,10 @@ agree byte for byte. See [NOTICE](NOTICE) for the attribution details.
   Jacobian, Levenberg-Marquardt refine, multi-seed branch selection, and
   continuity-constrained paths), exposed to Python as `maker_arm_rs.Kinematics`.
 - `crates/maker-arm-cli`: `scan`, `doctor`, `zero`, and `hold` (typed-RELEASE
-  safety gate), against `--can <iface>` or `--sim`. No command clears a motor
-  fault. To clear one, fix the cause, then press and release the emergency
-  stop, or run the vendor `maker-arm scan --clear-faults`.
+  safety gate, then a 2 s torque ramp before the disable), against
+  `--can <iface>` or `--sim`. No command clears a motor fault. To clear one,
+  fix the cause, then press and release the emergency stop, or run the vendor
+  `maker-arm scan --clear-faults`.
 
 Status: MA1 prep (hardware-independent session layer) complete. **No physical
 arm has ever been driven by this code** — everything here is exercised against
@@ -92,7 +93,7 @@ Four commands. For `PROFILE` and `MODEL`, use the profile and model files that s
 ```sh
 maker-arm-cli serve --interface can0 --profile PROFILE --dynamics MODEL   # start the daemon
 maker-arm-cli status --interface can0                                    # print one STATUS line
-maker-arm-cli release --interface can0                                   # disable the motors
+maker-arm-cli release --interface can0                                   # ramp the torque down, then disable the motors
 maker-arm-cli enable --interface can0                                    # enable them again
 ```
 
@@ -125,6 +126,7 @@ Hold rules:
 - If the control loop stops, or the daemon process is killed, nothing commands the motors. Each motor keeps its last command. Only a gripper whose firmware has parameter access has a watchdog. To stop the motors, support the arm and press the emergency stop.
 - After a daemon death, support the arm before you start `serve` or `hold` again. The start can release each joint for a moment.
 - After `SERVE_READY`, only `release` disables the motors. It asks you to type `RELEASE`. Until you do, the arm holds. Release the torque only when the arm is supported. `release --yes` does not ask. It is for a script that knows the arm is supported, such as a park at `home`.
+- A release ramps the torque down before it disables the motors (ruling R36). For 2 s, each motor keeps its last position target, its `kp` and its feed-forward torque fall linearly to 0, and its `kd` stays. Thus a joint that rests above its stop, such as J3 at `home`, sinks slowly onto the stop. The health checks keep running during the ramp. If a fault occurs during the ramp, the ramp stops, the arm holds as on any fault, and `release` reports that it did not release. Run `release` again: the fault hold then ramps down. A gripper that its own fault released gets no ramp frames. The reply to `release` comes after the disable, about 2 s later than before. During the ramp, the daemon answers the other clients with mode `holding` and ignores commands. `hold` ramps the same way after the typed `RELEASE`.
 - On a real interface, a release does not end the daemon. The daemon goes to mode `released`. It keeps the bus and reads the motors 5 times a second with no torque, so `status` and the ROS 2 client still see the joints move.
 - In mode `released`, SIGINT or SIGTERM ends the daemon. It prints `SERVE_EXIT signal while released`, removes the socket and frees the bus lock. To start a daemon with other files, run `release`, then stop the old daemon, for example with `pkill -TERM -f 'maker-arm-cli serve --interface can0'`, then start the new one.
 - `enable` enables a released arm again at the measured pose. It asks you to type `ENABLE`; `enable --yes` does not ask. The daemon runs the same checks as at start: the motor fault query, the 0.35 rad limit window, the temperatures, and the first tick's health check. The gripper must be below 45 C, and every other joint below its 70 C health limit. A hotter joint gets no torque. If a check fails, the daemon stays `released` and its log says why. A check that fails before any enable frame sends nothing more. If a motor got an enable frame and then does not confirm its disable, the daemon ends, as after a failed release. After an enable the daemon holds the measured pose, and the client must send Activate again. Support the arm first, as before every enable.
@@ -171,7 +173,7 @@ arm.start_hold()  # spawns the 200 Hz loop, holding the current pose
 time.sleep(0.1)
 snap = arm.snapshot()
 print(snap["state"], snap["positions"])
-arm.stop()  # disable and join; also aliased as arm.estop()
+arm.stop()  # disable at once, with no ramp, and join; also aliased as arm.estop()
 ```
 
 ## Profile and clamp from Python

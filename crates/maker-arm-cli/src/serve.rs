@@ -1,9 +1,9 @@
 //! `maker-arm-cli serve`: a resident daemon that owns the bus and the `Tracking` loop and
 //! serves one command client over a Unix socket. When its client stops, on a signal and on a
 //! fault, it holds the arm. Once it is ready, on a real interface only an explicit release
-//! disables the motors, and the daemon stays up, released, until an explicit enable or a
-//! signal, which ends it; on a virtual one a release ends the daemon, and so does its client
-//! unless `--persist`.
+//! disables the motors, after it ramps the torque down over `RELEASE_RAMP_S`, and the daemon
+//! stays up, released, until an explicit enable or a signal, which ends it; on a virtual one
+//! a release ends the daemon, and so does its client unless `--persist`.
 
 use maker_arm::kinematics::ARM_DOF;
 use maker_arm::tracking::{Push, Row, TrackingController, TrackingShared, ROW};
@@ -76,12 +76,19 @@ struct State {
     exit: Option<&'static str>,
 }
 
+/// The loop ended on its own: on an error or a panic. A loop that ended after a release ramp
+/// is not: it waits for the release's disable.
+fn stopped(a: &RunningArm) -> bool {
+    a.loop_finished() && !a.ramp_done()
+}
+
 impl State {
     fn faulted(&self) -> bool {
         self.mode != Mode::Released
-            && self.arm.as_ref().is_none_or(|a| {
-                a.loop_finished() || a.snapshot().is_some_and(|s| s.fault.is_some())
-            })
+            && self
+                .arm
+                .as_ref()
+                .is_none_or(|a| stopped(a) || a.snapshot().is_some_and(|s| s.fault.is_some()))
     }
 
     /// Commands are ignored until the next Activate. The plan holds its last row.
@@ -323,14 +330,39 @@ impl Daemon {
         s
     }
 
-    /// The one way to drop torque on a real interface. The reply goes out only after the
+    /// The one way to drop torque on a real interface. First the torque ramps down over
+    /// `RELEASE_RAMP_S` (ruling R36), off the state lock, so the other clients keep their
+    /// replies; meanwhile the mode is Holding and commands are ignored. A fault during the ramp
+    /// ends it: the arm holds, and the reply says Fault. Else the reply goes out only after the
     /// motors are disabled. On a real interface the daemon stays up, released, and returns the
     /// reply. Else, and after a failed disable, it exits holding the lock, so no other client
     /// sees the arm gone.
     fn release(&self, stream: &mut UnixStream, seq: u32) -> StateFrame {
-        // An enable in flight finishes first.
+        // An enable in flight finishes first, and a signal, an enable or a second release waits
+        // for this one.
         let mut parked = self.lock_session();
         let mut st = self.lock();
+        if let Some(arm) = st.arm.as_ref() {
+            arm.ramp_down();
+            st.hold();
+            drop(st);
+            st = loop {
+                std::thread::sleep(TICK);
+                let st = self.lock();
+                if st
+                    .arm
+                    .as_ref()
+                    .is_none_or(|a| a.loop_finished() || a.ramp_held())
+                {
+                    break st;
+                }
+            };
+            if st.arm.as_ref().is_some_and(RunningArm::ramp_held) {
+                log("release refused: a fault during the torque ramp; holding the measured pose");
+                st.mode = Mode::Fault;
+                return self.state_frame(&st, seq);
+            }
+        }
         let mut frame = self.state_frame(&st, seq);
         frame.mode = Mode::Released;
         // No arm: released already.
@@ -996,7 +1028,7 @@ pub fn run(o: &ServeOptions, check: bool) -> Result<(), String> {
             }
             later_logged = later_logged.max(later.len());
             // Also after a transport hold: errors that last end the loop.
-            if !stop_logged && st.arm.as_ref().is_none_or(RunningArm::loop_finished) {
+            if !stop_logged && st.arm.as_ref().is_none_or(stopped) {
                 stop_logged = true;
                 log("FAULT: the control loop stopped; the motors keep their last command");
             }
@@ -1024,22 +1056,57 @@ mod tests {
             .map_err(|e| e.to_string())
     }
 
-    /// A tracking loop on a sim arm, with `hook` applied to the sim after enable.
-    fn started(hook: impl FnOnce(&mut SimArm)) -> (RunningArm, Arc<TrackingShared>) {
+    /// A tracking loop on `backend`, with `hook` applied to the session after enable.
+    fn started_on(
+        backend: Box<dyn CanBackend>,
+        hook: impl FnOnce(&mut Session),
+    ) -> (RunningArm, Arc<TrackingShared>) {
         let c = ArmConfig::maker_arm_v1();
-        let mut s = Session::connect(Box::new(SimArm::new(&c)), c.clone()).unwrap();
+        let mut s = Session::connect(backend, c).unwrap();
         s.enable().unwrap();
-        hook(s.backend_as_sim().unwrap());
+        hook(&mut s);
         let ctrl = tracking().unwrap();
         let shared = ctrl.shared();
         (s.start(Box::new(ctrl), None).unwrap(), shared)
+    }
+
+    /// A tracking loop on a sim arm, with `hook` applied to the sim after enable.
+    fn started(hook: impl FnOnce(&mut SimArm)) -> (RunningArm, Arc<TrackingShared>) {
+        let sim = SimArm::new(&ArmConfig::maker_arm_v1());
+        started_on(Box::new(sim), |s| hook(s.backend_as_sim().unwrap()))
+    }
+
+    /// A sim the test reaches while the loop thread owns the session.
+    #[derive(Clone)]
+    struct Shared(Arc<Mutex<SimArm>>);
+
+    impl CanBackend for Shared {
+        fn send(
+            &mut self,
+            id: u32,
+            data: &[u8; 8],
+        ) -> Result<(), maker_arm_transport::TransportError> {
+            self.0.lock().unwrap().send(id, data)
+        }
+
+        fn recv(
+            &mut self,
+            timeout: Duration,
+        ) -> Result<Option<(u32, [u8; 8])>, maker_arm_transport::TransportError> {
+            self.0.lock().unwrap().recv(timeout)
+        }
     }
 
     /// A daemon on a sim arm past its first tick; `real` as on a real interface. The loop runs
     /// with the stock limits and never moves the sim. The daemon gets a J2 upper limit 0.3 rad
     /// below the measured pose, so Activate must pull that pose in. Also returns that limit.
     fn daemon(real: bool) -> (Daemon, f64) {
-        let (arm, shared) = started(|_| {});
+        daemon_on(real, Box::new(SimArm::new(&ArmConfig::maker_arm_v1())))
+    }
+
+    /// `daemon` on `backend`.
+    fn daemon_on(real: bool, backend: Box<dyn CanBackend>) -> (Daemon, f64) {
+        let (arm, shared) = started_on(backend, |_| {});
         first_tick(
             &arm,
             &shared,
@@ -1154,6 +1221,61 @@ mod tests {
         assert!(d.lock_session().is_none());
         assert!(!d.lock().active, "the client must Activate");
         activate_clamps(&d, hi);
+    }
+
+    #[test]
+    fn the_other_clients_get_their_replies_during_the_ramp() {
+        // Ruling R36: the ramp runs off the state lock. The ROS 2 client waits 50 ms.
+        let (d, _) = daemon(true);
+        std::thread::scope(|s| {
+            let release = s.spawn(|| release_now(&d));
+            std::thread::sleep(Duration::from_millis(300));
+            let t = Instant::now();
+            let poll = ClientFrame::Control {
+                seq: 2,
+                op: Op::Poll,
+            };
+            let f = d.handle(Role::Monitor, poll).unwrap();
+            assert!(
+                t.elapsed() < Duration::from_millis(500),
+                "{:?}",
+                t.elapsed()
+            );
+            assert_eq!(f.mode, Mode::Holding);
+            assert!(!release.is_finished(), "the ramp lasts RELEASE_RAMP_S");
+            release.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn a_fault_during_the_ramp_answers_fault_and_holds() {
+        let sim = Shared(Arc::new(Mutex::new(
+            SimArm::new(&ArmConfig::maker_arm_v1()),
+        )));
+        let (d, _) = daemon_on(true, Box::new(sim.clone()));
+        let hot = {
+            let sim = sim.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                sim.0.lock().unwrap().set_temperature(3, 80.0);
+            })
+        };
+        let (mut a, _b) = UnixStream::pair().unwrap();
+        // An exit here would end the test binary.
+        let f = d.release(&mut a, 1);
+        hot.join().unwrap();
+        assert_eq!((f.mode, f.fault), (Mode::Fault, 4));
+        {
+            let st = d.lock();
+            assert_eq!(st.mode, Mode::Fault);
+            let arm = st.arm.as_ref().expect("the loop holds");
+            assert!(arm.ramp_held() && !arm.loop_finished());
+        }
+        assert!(d.lock_session().is_none());
+        assert!((1..=7).all(|m| sim.0.lock().unwrap().enabled(m)));
+        // A second release ramps the fault hold down and releases.
+        release_now(&d);
+        assert!((1..=7).all(|m| !sim.0.lock().unwrap().enabled(m)));
     }
 
     #[test]
