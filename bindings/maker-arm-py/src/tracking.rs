@@ -156,6 +156,10 @@ impl Controller for LoopTracking {
             .unwrap_or_else(|e| e.into_inner())
             .update(state, dt)
     }
+
+    fn gravity(&self) -> Vec<f64> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).gravity()
+    }
 }
 
 /// The compliant tracking controller (tracking design sections 6, 7, 9 and 10).

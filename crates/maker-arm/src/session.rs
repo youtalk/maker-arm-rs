@@ -250,6 +250,9 @@ pub struct Session {
     pub(crate) failing_since: Option<Instant>,
     /// The gripper's slot and the last target sent to it (joint rad).
     pub(crate) grip_sent: Option<(usize, f64)>,
+    /// The controller's gravity torque in the last command sent (N m), which the fault hold
+    /// keeps sending. Empty before the first.
+    pub(crate) gravity: Vec<f64>,
     /// The gripper's CAN_TIMEOUT from before enable, kept for the restore.
     watchdog_restore: Option<u32>,
 }
@@ -306,6 +309,7 @@ impl Session {
             release_sent: None,
             failing_since: None,
             grip_sent: None,
+            gravity: Vec::new(),
             watchdog_restore: None,
         };
         let motor_ids: Vec<u8> = s.config.joints.iter().map(|j| j.motor_id).collect();
@@ -612,6 +616,7 @@ impl Session {
         self.release_sent = None;
         self.failing_since = None;
         self.grip_sent = None;
+        self.gravity.clear();
         self.health = HealthMonitor::new(&self.config);
         for slot in &mut self.slots {
             slot.state.restarted = false;
@@ -848,6 +853,29 @@ impl Session {
             Duration::from_micros(self.config.reply_wait_us)
         };
         self.send_to(i, f, true, wait).map(drop)
+    }
+
+    /// Reads every motor with torque off, in `scan`'s order: a non-clearing fault query, then
+    /// the clearing state read only after a clean answer, so a reported fault is never erased.
+    /// Each frame waits up to `reply_wait_us` for its motor's reply. Never enables or
+    /// commands a motor; only in `Connected`. The result is in `arm_state`.
+    pub fn read_motors(&mut self) -> Result<(), SessionError> {
+        if self.state != SessionState::Connected {
+            return Err(SessionError::WrongState {
+                expected: "Connected",
+            });
+        }
+        let wait = Duration::from_micros(self.config.reply_wait_us);
+        self.drain()?;
+        for i in 0..self.config.joints.len() {
+            let m = self.config.joints[i].motor_id;
+            if self.send_to(i, mit::encode_fault_query(m), true, wait)?
+                && self.slots[i].state.fault_word == 0
+            {
+                self.send_to(i, mit::encode_clear_fault(m), false, wait)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn state(&self) -> SessionState {
