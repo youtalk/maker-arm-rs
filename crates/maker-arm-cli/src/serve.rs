@@ -72,6 +72,8 @@ struct State {
     /// The last accepted arm target (rad).
     target: [f64; ARM_DOF],
     last_command: Instant,
+    /// The loop's ticks whose command it clamped, plus one per client command whose arm joints
+    /// `command` clamped into the limits. The loop then gets that command inside the limits.
     clamped: u32,
     refused: u32,
     /// The command client's connection, kept to shut it down on a signal.
@@ -260,6 +262,10 @@ impl Daemon {
         let measured = snap.arm.motors[ARM_DOF].position;
         row[ARM_DOF] = grip_target(self.grip.to_angle(q[ARM_DOF]), measured, self.grip_window);
         if st.push(row) {
+            // Counted here, as the loop no longer sees it outside the limits.
+            if row[..ARM_DOF] != q[..ARM_DOF] {
+                st.clamped = st.clamped.saturating_add(1);
+            }
             st.target.copy_from_slice(&row[..ARM_DOF]);
             st.last_command = Instant::now();
             st.mode = Mode::Following;
@@ -1231,6 +1237,24 @@ mod tests {
         q[1] = hi - 0.06;
         d.command(&mut st, &q);
         assert_eq!((st.mode, st.refused), (Mode::Refused, 1));
+    }
+
+    #[test]
+    fn a_clamped_command_counts_once() {
+        // maker_arm_ros2's V1 launch test asserts `clamped == 0` after its MoveIt goals.
+        let (d, hi) = daemon(false);
+        let mut st = d.lock();
+        d.activate(&mut st);
+        let mut q = [0.0; ROW];
+        q[..ARM_DOF].copy_from_slice(&st.target);
+        // Inside the limits. The gripper entry (the jaw in metres) never counts.
+        d.command(&mut st, &q);
+        assert_eq!((st.mode, st.clamped), (Mode::Following, 0));
+        // Outside J2's limit, but within JUMP_MAX_RAD of the target after the clamp.
+        q[1] = hi + 0.02;
+        d.command(&mut st, &q);
+        assert_eq!((st.mode, st.refused, st.clamped), (Mode::Following, 0, 1));
+        assert!((st.target[1] - hi).abs() < 1e-9, "{}", st.target[1]);
     }
 
     #[test]
