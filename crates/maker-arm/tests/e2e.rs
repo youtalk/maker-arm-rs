@@ -8,8 +8,7 @@ use maker_arm::{ArmConfig, FaultReason, HoldController, Session, SessionState, S
 
 #[test]
 fn full_ladder_connect_fault_recover_release() {
-    let mut c = ArmConfig::maker_arm_v1();
-    c.inter_frame_us = 0;
+    let c = ArmConfig::maker_arm_v1();
     let sim = SimArm::new(&c);
     let mut s = Session::connect(Box::new(sim), c.clone()).expect("connect");
     let home = s.positions();

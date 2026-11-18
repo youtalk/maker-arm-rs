@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 fn fast(mut c: ArmConfig) -> ArmConfig {
-    c.inter_frame_us = 0; // no wire pacing against an in-memory sim
+    // The sim replies at once: only a muted motor waits, so keep its wait short.
+    c.reply_wait_us = 500;
     c
 }
 
@@ -1083,5 +1084,112 @@ fn a_joint_fault_keeps_the_gripper_squeeze() {
     assert!(
         (last - squeeze).abs() < 1e-3,
         "the hold sent {last}, the squeeze was {squeeze}"
+    );
+}
+
+/// A frame the host sent, and whether a reply was still on its way then.
+type Sent = Arc<Mutex<Vec<(u32, [u8; 8], bool)>>>;
+
+/// A `SimArm` whose replies reach the host `delay` after the frame that
+/// caused them, as on a real bus. It logs every frame sent. A frame sent
+/// while a reply is on its way is the collision P2 found: on the real bus
+/// two motors then answer at once on one CAN id.
+struct Delayed {
+    sim: SimArm,
+    delay: Duration,
+    replies: std::collections::VecDeque<(Instant, u32, [u8; 8])>,
+    sent: Sent,
+}
+
+impl Delayed {
+    fn session(c: &ArmConfig, delay: Duration) -> (Session, Sent) {
+        let sent = Sent::default();
+        let b = Delayed {
+            sim: SimArm::new(c),
+            delay,
+            replies: Default::default(),
+            sent: sent.clone(),
+        };
+        let mut s = Session::connect(Box::new(b), c.clone()).expect("connect");
+        s.enable().expect("enable");
+        (s, sent)
+    }
+}
+
+impl CanBackend for Delayed {
+    fn send(&mut self, id: u32, data: &[u8; 8]) -> Result<(), TransportError> {
+        let now = Instant::now();
+        let busy = self.replies.iter().any(|r| r.0 > now);
+        self.sent.lock().unwrap().push((id, *data, busy));
+        self.sim.send(id, data)?;
+        while let Some((id, data)) = self.sim.recv(Duration::ZERO)? {
+            self.replies.push_back((now + self.delay, id, data));
+        }
+        Ok(())
+    }
+
+    fn recv(&mut self, _timeout: Duration) -> Result<Option<(u32, [u8; 8])>, TransportError> {
+        match self.replies.front() {
+            Some(r) if r.0 <= Instant::now() => Ok(self.replies.pop_front().map(|r| (r.1, r.2))),
+            _ => Ok(None),
+        }
+    }
+
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(&mut self.sim)
+    }
+}
+
+#[test]
+fn no_frame_goes_out_while_a_reply_is_on_its_way() {
+    let c = ArmConfig::maker_arm_v1();
+    let (mut s, sent) = Delayed::session(&c, Duration::from_millis(1));
+    let mut hold = HoldController::from_config(&c);
+    // Long enough for every motor's first fault query.
+    for _ in 0..20 {
+        let out = s.tick(&mut hold).expect("tick");
+        assert!(out.fault.is_none(), "{:?}", out.fault);
+    }
+    s.disable().expect("disable");
+    let sent = sent.lock().unwrap();
+    let early: Vec<_> = sent.iter().filter(|f| f.2).collect();
+    assert!(early.is_empty(), "{} of {} frames", early.len(), sent.len());
+}
+
+#[test]
+fn a_silent_motor_costs_one_reply_wait_per_tick() {
+    let mut c = ArmConfig::maker_arm_v1();
+    // Long against the in-memory replies, so scheduling noise cannot pass
+    // for a second wait.
+    c.reply_wait_us = 20_000;
+    let wait = Duration::from_micros(c.reply_wait_us);
+    let (mut s, sent) = Delayed::session(&c, Duration::ZERO);
+    s.backend_as_sim().unwrap().set_muted(4, true);
+    let mut hold = HoldController::from_config(&c);
+    let start = Instant::now();
+    // The fault query reaches motor 4 on the fourth tick, before the fault.
+    while s.fault().is_none() {
+        assert!(start.elapsed() < Duration::from_secs(2), "no fault");
+        sent.lock().unwrap().clear();
+        let t = Instant::now();
+        s.tick(&mut hold).expect("tick");
+        let took = t.elapsed();
+        assert!(took >= wait && took < 2 * wait, "a tick took {took:?}");
+        let control: Vec<u32> = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|f| f.1[..6] != [0xFF; 6])
+            .map(|f| f.0)
+            .collect();
+        assert_eq!(control, (1..=7).collect::<Vec<u32>>());
+    }
+    assert!(
+        matches!(
+            s.fault(),
+            Some(FaultReason::FeedbackTimeout { motor_id: 4, .. })
+        ),
+        "{:?}",
+        s.fault()
     );
 }

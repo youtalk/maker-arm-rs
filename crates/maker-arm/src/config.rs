@@ -107,8 +107,11 @@ pub struct ArmConfig {
     pub kp_max: f64,
     /// Clamp ceiling for kd: tracks the protocol's KD_MAX constant.
     pub kd_max: f64,
-    /// Wire spacing between per-motor MIT frames within one tick (µs).
-    pub inter_frame_us: u64,
+    /// How long the session waits for one motor's reply before it sends the
+    /// next frame (µs). Every motor replies on the same CAN id, so two
+    /// replies on the bus at once collide. A missing reply is not a fault by
+    /// itself: the health checks decide.
+    pub reply_wait_us: u64,
     /// On health fault: freeze targets and keep holding (true, default)
     /// versus disable outright (false).
     pub hold_on_fault: bool,
@@ -220,7 +223,7 @@ impl ArmConfig {
             temp_hold_c: 70.0,
             kp_max: 200.0,
             kd_max: maker_arm_protocol::KD_MAX,
-            inter_frame_us: 150,
+            reply_wait_us: 3000,
             hold_on_fault: true,
             host_id: maker_arm_protocol::HOST_CAN_ID,
             gripper: Some(GripperRules {
@@ -286,7 +289,7 @@ mod tests {
         assert_eq!(c.enable_limit_grace, 0.35);
         assert_eq!(c.mode_fault_ticks, 5);
         assert_eq!(c.host_id, 0xFD);
-        assert_eq!(c.inter_frame_us, 150);
+        assert_eq!(c.reply_wait_us, 3000);
         assert!(c.hold_on_fault);
     }
 
