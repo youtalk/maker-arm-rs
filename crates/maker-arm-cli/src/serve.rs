@@ -1,8 +1,9 @@
 //! `maker-arm-cli serve`: a resident daemon that owns the bus and the `Tracking` loop and
 //! serves one command client over a Unix socket. When its client stops, on a signal and on a
 //! fault, it holds the arm. Once it is ready, on a real interface only an explicit release
-//! disables the motors, and the daemon stays up, released, until an explicit enable; on a
-//! virtual one a release ends the daemon, and so does its client unless `--persist`.
+//! disables the motors, and the daemon stays up, released, until an explicit enable or a
+//! signal, which ends it; on a virtual one a release ends the daemon, and so does its client
+//! unless `--persist`.
 
 use maker_arm::kinematics::ARM_DOF;
 use maker_arm::tracking::{Push, Row, TrackingController, TrackingShared, ROW};
@@ -645,7 +646,31 @@ fn start(
     }))
 }
 
-/// Ends a virtual daemon: stop the loop, disable, exit 0. Only `exit_with_client` reaches it.
+/// A SIGINT or SIGTERM. Released, the motors have no torque to keep, so the daemon ends:
+/// the socket goes, and the exit frees the bus lock (ruling R33). In any other mode it holds,
+/// never releases, closes the command client, and keeps running unless `exit_with_client`.
+fn on_signal(d: &Daemon, socket: &Path) {
+    // An enable in flight completes first, so the mode below is the final one. While this
+    // lock is held, no release or enable can change it.
+    let _parked = d.lock_session();
+    let mut st = d.lock();
+    if st.mode == Mode::Released {
+        drop(st);
+        finish(d, socket, "signal while released");
+    }
+    st.hold();
+    if let Some(c) = &st.command {
+        let _ = c.shutdown(std::net::Shutdown::Both);
+    }
+    drop(st);
+    say("holding. Run `maker-arm-cli release` to release torque.");
+    if d.exit_with_client {
+        finish(d, socket, "signal");
+    }
+}
+
+/// Ends the daemon: stop the loop, disable, remove the socket, exit 0. Only a virtual daemon
+/// with `exit_with_client` and a released one on a signal reach it.
 fn finish(d: &Daemon, socket: &Path, why: &str) -> ! {
     let arm = d.lock().arm.take();
     let _ = std::fs::remove_file(socket);
@@ -856,8 +881,8 @@ pub fn run(o: &ServeOptions, check: bool) -> Result<(), String> {
         }
         _ => {}
     }
-    // Ctrl-C must hold, never release. Without the handler, a signal kills the process and
-    // the motors keep their last command.
+    // Ctrl-C must hold, never release; released, it ends the daemon (`on_signal`). Without
+    // the handler, a signal kills the process and the motors keep their last command.
     if let Err(e) = ctrlc::set_handler(|| SIGNALED.store(true, Ordering::Relaxed)) {
         log(&format!(
             "WARNING: no SIGINT/SIGTERM handler ({e}); a signal kills the daemon and leaves \
@@ -917,21 +942,7 @@ pub fn run(o: &ServeOptions, check: bool) -> Result<(), String> {
     let (mut read_at, mut read_failed) = (Instant::now(), false);
     loop {
         if SIGNALED.swap(false, Ordering::Relaxed) {
-            let mut st = d.lock();
-            st.hold();
-            if let Some(c) = &st.command {
-                let _ = c.shutdown(std::net::Shutdown::Both);
-            }
-            let released = st.mode == Mode::Released;
-            drop(st);
-            say(if released {
-                "released. Run `maker-arm-cli enable` to enable torque."
-            } else {
-                "holding. Run `maker-arm-cli release` to release torque."
-            });
-            if d.exit_with_client {
-                finish(&d, &socket, "signal");
-            }
+            on_signal(&d, &socket);
         }
         if read_at.elapsed() >= PARKED_READ {
             read_at = Instant::now();
@@ -1246,6 +1257,64 @@ mod tests {
         let mut s = e.session;
         let sim = s.backend_as_sim().unwrap();
         assert!((1..=7).all(|m| sim.enables(m) == 0));
+    }
+
+    #[test]
+    fn a_signal_holds_unless_released() {
+        let (d, _) = daemon(true);
+        on_signal(&d, Path::new("/nonexistent"));
+        let st = d.lock();
+        assert_eq!(st.mode, Mode::Holding);
+        // A signal never releases: the loop still runs, enabled.
+        let arm = st.arm.as_ref().unwrap();
+        assert!(!arm.loop_finished());
+        assert_eq!(
+            arm.snapshot().unwrap().state,
+            maker_arm::SessionState::Enabled
+        );
+    }
+
+    /// Ruling R33. `on_signal` exits the process, so the released case runs in a child: this
+    /// test binary again, with the socket and the bus name in its environment.
+    #[test]
+    fn a_signal_while_released_ends_the_daemon_and_frees_the_socket_and_the_bus() {
+        const NAME: &str =
+            "serve::tests::a_signal_while_released_ends_the_daemon_and_frees_the_socket_and_the_bus";
+        if let (Some(socket), Ok(iface)) =
+            (std::env::var_os("R33_SOCKET"), std::env::var("R33_IFACE"))
+        {
+            let _bus = maker_arm_transport::bus_lock(&iface).unwrap();
+            let socket = PathBuf::from(socket);
+            let _listener = UnixListener::bind(&socket).unwrap();
+            let (d, _) = daemon(true);
+            release_now(&d);
+            on_signal(&d, &socket);
+            panic!("a released daemon outlived a signal");
+        }
+        let dir = std::env::temp_dir().join(format!("mas-r33-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("s.sock");
+        // Only a lock name: no such device is opened.
+        let iface = format!("vcanr{}", std::process::id());
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture"])
+            .env("R33_SOCKET", &socket)
+            .env("R33_IFACE", &iface)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.status.code(), Some(0), "{stdout}");
+        assert!(
+            stdout.contains("SERVE_EXIT signal while released"),
+            "{stdout}"
+        );
+        assert!(!socket.exists());
+        assert!(
+            maker_arm_transport::bus_lock(&iface).is_ok(),
+            "the bus lock is free"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
