@@ -43,6 +43,10 @@ const FIRST_TICK: Duration = Duration::from_secs(1);
 /// Released, the motors are read this often: 5 Hz, as `scan --watch`.
 const PARKED_READ: Duration = Duration::from_millis(200);
 
+/// A motor silent this long has no temperature: the frame carries NaN. Released, the motors
+/// are read at 5 Hz, so this is five missed reads.
+const NO_REPLY_S: f64 = 1.0; // INITIAL: a reading older than this is not shown as current
+
 /// Set by the SIGINT/SIGTERM handler, read by the accept loop.
 static SIGNALED: AtomicBool = AtomicBool::new(false);
 
@@ -304,7 +308,7 @@ impl Daemon {
             q: [0.0; ROW],
             dq: [0.0; ROW],
             effort: [0.0; ROW],
-            temp: [0.0; ROW],
+            temp: [f64::NAN; ROW],
             fault: 0,
             clamped: st.clamped,
             refused: st.refused,
@@ -322,7 +326,11 @@ impl Daemon {
             s.q[j] = m.position;
             s.dq[j] = m.velocity;
             s.effort[j] = m.torque;
-            s.temp[j] = m.temperature;
+            s.temp[j] = if m.feedback_age > NO_REPLY_S {
+                f64::NAN
+            } else {
+                m.temperature
+            };
         }
         s.q[ARM_DOF] = self.grip.to_joint_m(s.q[ARM_DOF]);
         s.dq[ARM_DOF] *= self.grip.joint_m_per_rad();
@@ -750,22 +758,36 @@ pub fn status(interface: &str, socket: Option<&Path>) -> Result<(), String> {
     Ok(())
 }
 
-/// The STATUS token line, with the hottest motor and its temperature.
+/// The STATUS token line. `temp_c` holds the 7 temperatures in motor order, `null` for a motor
+/// with no reply, and `no_reply` lists those motor ids. `temp_max_c` and `temp_max_motor` cover
+/// only the motors that answer, and are `null` if none does.
 fn status_line(f: &StateFrame) -> String {
+    let ids = ArmConfig::maker_arm_v1()
+        .joints
+        .iter()
+        .map(|j| j.motor_id)
+        .collect::<Vec<_>>();
+    let no_reply: Vec<_> = (0..ROW)
+        .filter(|&j| f.temp[j].is_nan())
+        .map(|j| ids[j])
+        .collect();
     let hot = (0..ROW)
-        .max_by(|&a, &b| f.temp[a].total_cmp(&f.temp[b]))
-        .unwrap_or(0);
+        .filter(|&j| f.temp[j].is_finite())
+        .max_by(|&a, &b| f.temp[a].total_cmp(&f.temp[b]));
     format!(
         "STATUS {{\"mode\": \"{}\", \"t\": {}, \"q\": {}, \"clamped\": {}, \"refused\": {}, \
-         \"fault\": {}, \"temp_max_c\": {}, \"temp_max_motor\": {}, \"digest\": \"{:016x}\"}}",
+         \"fault\": {}, \"temp_c\": {}, \"no_reply\": {}, \"temp_max_c\": {}, \
+         \"temp_max_motor\": {}, \"digest\": \"{:016x}\"}}",
         mode_name(f.mode),
         f.t,
         serde_json::json!(f.q),
         f.clamped,
         f.refused,
         f.fault,
-        serde_json::json!(f.temp[hot]),
-        ArmConfig::maker_arm_v1().joints[hot].motor_id,
+        serde_json::json!(f.temp),
+        serde_json::json!(no_reply),
+        serde_json::json!(hot.map(|j| f.temp[j])),
+        serde_json::json!(hot.map(|j| ids[j])),
         f.digest
     )
 }
@@ -1478,6 +1500,103 @@ mod tests {
         assert_eq!(v["mode"], "released");
         assert_eq!(v["temp_max_c"], 61.5);
         assert_eq!(v["temp_max_motor"], 3);
+    }
+
+    fn frame_with_temp(temp: [f64; ROW]) -> StateFrame {
+        StateFrame {
+            seq: 0,
+            mode: Mode::Released,
+            digest: 0,
+            t: 0.0,
+            q: [0.0; ROW],
+            dq: [0.0; ROW],
+            effort: [0.0; ROW],
+            temp,
+            fault: 0,
+            clamped: 0,
+            refused: 0,
+        }
+    }
+
+    fn status_json(f: &StateFrame) -> serde_json::Value {
+        serde_json::from_str(status_line(f).strip_prefix("STATUS ").unwrap()).unwrap()
+    }
+
+    #[test]
+    fn status_gives_null_for_a_motor_with_no_reply() {
+        let mut t = [35.0; ROW];
+        t[4] = f64::NAN;
+        t[2] = 61.5;
+        let v = status_json(&frame_with_temp(t));
+        assert_eq!(v["temp_c"][4], serde_json::Value::Null);
+        assert_eq!(v["temp_c"][2], 61.5);
+        assert_eq!(v["no_reply"], serde_json::json!([5]));
+        assert_eq!(
+            (v["temp_max_c"].clone(), v["temp_max_motor"].clone()),
+            (61.5.into(), 3.into())
+        );
+        let v = status_json(&frame_with_temp([35.0; ROW]));
+        assert_eq!(v["no_reply"], serde_json::json!([]));
+        // A silent motor never wins the maximum, even if the others are cold.
+        let mut t = [20.0; ROW];
+        t[0] = f64::NAN;
+        assert_eq!(status_json(&frame_with_temp(t))["temp_max_c"], 20.0);
+    }
+
+    #[test]
+    fn status_gives_null_maxima_when_no_motor_answers() {
+        let v = status_json(&frame_with_temp([f64::NAN; ROW]));
+        assert_eq!(v["temp_max_c"], serde_json::Value::Null);
+        assert_eq!(v["temp_max_motor"], serde_json::Value::Null);
+        assert_eq!(v["no_reply"], serde_json::json!([1, 2, 3, 4, 5, 6, 7]));
+    }
+
+    #[test]
+    fn a_frame_before_any_read_has_no_temperature() {
+        let (d, _) = daemon(true);
+        d.lock().arm = None;
+        let f = d.state_frame(&d.lock(), 1);
+        assert!(f.temp.iter().all(|t| t.is_nan()));
+        assert_eq!(
+            status_json(&f)["temp_c"],
+            serde_json::json!([null, null, null, null, null, null, null])
+        );
+    }
+
+    #[test]
+    fn a_motor_silent_for_over_a_second_has_no_temperature_released() {
+        let (d, _) = daemon(true);
+        release_now(&d);
+        d.read_parked().unwrap();
+        assert!(d
+            .state_frame(&d.lock(), 1)
+            .temp
+            .iter()
+            .all(|t| t.is_finite()));
+        on_sim(&d, |sim| sim.set_muted(3, true));
+        std::thread::sleep(Duration::from_millis(1100));
+        d.read_parked().unwrap();
+        let f = d.state_frame(&d.lock(), 2);
+        assert!(f.temp[2].is_nan(), "{:?}", f.temp);
+        assert_eq!(f.temp.iter().filter(|t| t.is_nan()).count(), 1);
+    }
+
+    #[test]
+    fn a_motor_silent_for_over_a_second_has_no_temperature_enabled() {
+        let sim = Shared(Arc::new(Mutex::new(
+            SimArm::new(&ArmConfig::maker_arm_v1()),
+        )));
+        let (d, _) = daemon_on(true, Box::new(sim.clone()));
+        assert!(d
+            .state_frame(&d.lock(), 1)
+            .temp
+            .iter()
+            .all(|t| t.is_finite()));
+        sim.0.lock().unwrap().set_muted(3, true);
+        std::thread::sleep(Duration::from_millis(1300));
+        let f = d.state_frame(&d.lock(), 2);
+        assert!(f.temp[2].is_nan(), "{:?}", f.temp);
+        assert!(f.temp[0].is_finite());
     }
 
     #[test]

@@ -99,7 +99,7 @@ maker-arm-cli enable --interface can0                                    # enabl
 
 The socket is `--socket PATH`. If you omit it, the path is `$XDG_RUNTIME_DIR/maker-arm-<interface>.sock`. If that variable is not set, pass `--socket`. `status`, `release` and `enable` use the same rule. They never open the bus.
 
-`status` prints `STATUS {"mode": ..., "t": ..., "q": [7 values], "clamped": ..., "refused": ..., "fault": ..., "temp_max_c": ..., "temp_max_motor": ..., "digest": ...}` and exits 0. `temp_max_c` is the temperature of the hottest motor, and `temp_max_motor` is its motor id. It exits 1 if no daemon runs on the socket.
+`status` prints `STATUS {"mode": ..., "t": ..., "q": [7 values], "clamped": ..., "refused": ..., "fault": ..., "temp_c": [7 values], "no_reply": [...], "temp_max_c": ..., "temp_max_motor": ..., "digest": ...}` and exits 0. `temp_c` holds the 7 temperatures in motor order. A motor that gave no reply for more than 1 s has `null` there, and its motor id is in `no_reply` (an empty list if all motors answer). `temp_max_c` is the temperature of the hottest motor that answers, and `temp_max_motor` is its motor id. Both are `null` if no motor answers. The wire version is 2: a client of version 1 is refused, so end an old daemon after an upgrade. `status` exits 1 if no daemon runs on the socket.
 
 ### Export the daemon's files
 
