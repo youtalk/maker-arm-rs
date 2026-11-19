@@ -947,16 +947,23 @@ impl RunningArm {
     /// loop had stopped on an error. A loop error comes back as
     /// `SessionError::LoopStopped` with the release's own result. No ramp:
     /// the torque goes off at once. `release` ramps it down first.
-    pub fn stop_and_disable(mut self) -> (Session, Result<(), SessionError>) {
+    pub fn stop_and_disable(self) -> (Session, Result<(), SessionError>) {
+        let (mut session, looped) = self.join().expect("control thread panicked");
+        let result = session.release(looped);
+        (session, result)
+    }
+
+    /// Stop and join the control thread, and send nothing: the session and
+    /// the loop's own result come back, the motors keep their last frame.
+    /// For a loop that stopped on its own, when the caller cannot know that
+    /// a disable is safe (a supply drop or a loose cable look the same).
+    /// `Err` when the thread panicked: then no session comes back.
+    pub fn join(mut self) -> std::thread::Result<(Session, Result<(), SessionError>)> {
         self.shared.stop.store(true, Ordering::Relaxed);
-        let (mut session, looped) = self
-            .handle
+        self.handle
             .take()
             .expect("handle only ever taken here or in Drop, and self is consumed after")
             .join()
-            .expect("control thread panicked");
-        let result = session.release(looped);
-        (session, result)
     }
 }
 

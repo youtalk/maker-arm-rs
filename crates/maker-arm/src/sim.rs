@@ -145,7 +145,14 @@ impl SimArm {
     pub fn power_cycle(&mut self) {
         let mut ids: Vec<u8> = self.motors.keys().copied().collect();
         ids.sort();
-        for id in ids {
+        self.power_cycle_motors(&ids);
+    }
+
+    /// `power_cycle` for these motors only, in this order: as in the
+    /// supply's restart loop, where only some motors live long enough to
+    /// announce themselves.
+    pub fn power_cycle_motors(&mut self, ids: &[u8]) {
+        for &id in ids {
             let m = self.motors.get_mut(&id).unwrap();
             m.enabled = false;
             m.torque = 0.0;

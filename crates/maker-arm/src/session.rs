@@ -906,6 +906,23 @@ impl Session {
         Ok(())
     }
 
+    /// One non-clearing fault query to each motor, in any state: it
+    /// enables, disables and clears nothing. Each waits up to
+    /// `reply_wait_us`. True if every motor answered. A power-up frame
+    /// that comes meanwhile sets `restarted` as in the loop (`dispatch`).
+    /// The first error comes back at once: a failed send means that the bus
+    /// is down for every motor.
+    pub fn query_faults(&mut self) -> Result<bool, SessionError> {
+        let wait = Duration::from_micros(self.config.reply_wait_us);
+        self.drain()?;
+        let mut all = true;
+        for i in 0..self.config.joints.len() {
+            let m = self.config.joints[i].motor_id;
+            all &= self.send_to(i, mit::encode_fault_query(m), true, wait)?;
+        }
+        Ok(all)
+    }
+
     pub fn state(&self) -> SessionState {
         self.state
     }

@@ -311,6 +311,27 @@ fn disable_estop_and_clear_faults_transitions() {
 }
 
 #[test]
+fn query_faults_asks_every_motor_and_records_power_up_frames() {
+    let c = ArmConfig::maker_arm_v1();
+    let mut s = Session::connect(Box::new(SimArm::new(&c)), c).expect("connect");
+    s.enable().expect("enable");
+    assert!(s.query_faults().unwrap());
+    s.backend_as_sim().unwrap().set_muted(3, true);
+    assert!(!s.query_faults().unwrap());
+    let sim = s.backend_as_sim().unwrap();
+    sim.set_muted(3, false);
+    sim.power_cycle_motors(&[2, 3]);
+    assert!(s.query_faults().unwrap());
+    let restarted: Vec<bool> = s.arm_state().motors.iter().map(|m| m.restarted).collect();
+    assert_eq!(restarted, [false, true, true, false, false, false, false]);
+    let sim = s.backend_as_sim().unwrap();
+    assert!(
+        !sim.enabled(2) && sim.enabled(1),
+        "a fault query enables or disables nothing"
+    );
+}
+
+#[test]
 fn poll_fault_asks_each_motor_once_per_interval_by_send_time() {
     let c = ArmConfig::maker_arm_v1();
     let (backend, cfg) = FlakyBackend::new(SimArm::new(&c));
