@@ -135,8 +135,9 @@ pub fn bus_lock(ifname: &str) -> Result<BusLock, TransportError> {
             TransportError::Io(match e.kind() {
                 ErrorKind::AddrInUse => format!(
                     "{ifname} is in use: another process holds the bus lock @{name}. A daemon \
-                     may hold the arm. Run `maker-arm-cli status --interface {ifname}`. Find \
-                     the holder with `ss -xlp | grep {name}`"
+                     may hold the arm. Run `maker-arm-cli status --interface {ifname}`. If it \
+                     is released, `maker-arm-cli stop --interface {ifname}` ends it. Find the \
+                     holder with `ss -xlp | grep {name}`"
                 ),
                 _ => format!("bus lock @{name} for {ifname}: {e}"),
             })

@@ -111,6 +111,14 @@ enum Command {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
+    /// Ask a released serve daemon to exit and free the bus. A daemon that holds torque refuses
+    Stop {
+        #[arg(long)]
+        interface: String,
+        /// Default: $XDG_RUNTIME_DIR/maker-arm-<interface>.sock
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
     /// Own the arm as a daemon for ROS 2: track a client's targets over a Unix socket, and
     /// hold when the client stops
     Serve {
@@ -265,6 +273,9 @@ fn main() -> Result<(), String> {
         }
         Command::Status { interface, socket } => {
             return serve::status(interface, socket.as_deref());
+        }
+        Command::Stop { interface, socket } => {
+            return serve::stop(interface, socket.as_deref());
         }
         _ => {}
     }
@@ -505,7 +516,8 @@ fn main() -> Result<(), String> {
         | Command::Export { .. }
         | Command::Release { .. }
         | Command::Enable { .. }
-        | Command::Status { .. } => {
+        | Command::Status { .. }
+        | Command::Stop { .. } => {
             unreachable!("handled above")
         }
     }

@@ -17,7 +17,7 @@ use maker_arm::{
 use maker_arm_cli::files::{self, GripMap, Loaded, ServeOptions};
 use maker_arm_cli::wire::{self, ClientFrame, Mode, Op, Role, StateFrame, WireError};
 use maker_arm_transport::{CanBackend, TransportError};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
@@ -532,6 +532,24 @@ impl Daemon {
         std::process::exit(code);
     }
 
+    /// Ends a released daemon: the reply, then the exit frees the socket and the bus lock. In
+    /// any other mode the motors may hold torque, so nothing changes and the reply names the
+    /// mode. Only a release drops torque.
+    fn stop(&self, stream: &mut UnixStream, seq: u32) -> StateFrame {
+        // As `on_signal`: an enable or a release in flight finishes first.
+        let _parked = self.lock_session();
+        let st = self.lock();
+        let frame = self.state_frame(&st, seq);
+        if st.mode == Mode::Released {
+            self.exit(stream, &frame, 0, "stop");
+        }
+        log(&format!(
+            "stop refused: the daemon is {}",
+            mode_name(st.mode)
+        ));
+        frame
+    }
+
     /// Enables a released arm at the measured pose behind every gate of the first enable, and
     /// starts a new loop: mode Holding, and the client must Activate again. In any other mode
     /// nothing is sent. A failed gate sends nothing more and stays released. A motor that got
@@ -770,6 +788,9 @@ impl Daemon {
                         op: Op::Enable,
                     },
                 ) => self.enable(&mut stream, seq),
+                (Role::Release, ClientFrame::Control { seq, op: Op::Stop }) => {
+                    self.stop(&mut stream, seq)
+                }
                 _ => match self.handle(role, f) {
                     Some(state) => state,
                     None => {
@@ -1061,6 +1082,30 @@ pub fn enable(interface: &str, socket: Option<&Path>, yes: bool) -> Result<(), S
         ));
     }
     say("torque enabled; the daemon holds the measured pose.");
+    Ok(())
+}
+
+/// `maker-arm-cli stop`: ends a released daemon, and returns at its exit, which frees the bus
+/// lock. A daemon in any other mode refuses and keeps running.
+pub fn stop(interface: &str, socket: Option<&Path>) -> Result<(), String> {
+    let mut s = connect(&socket_path(interface, socket), Role::Release)?;
+    let f = ask(&mut s, Op::Stop).map_err(|e| {
+        format!(
+            "{e}. A daemon older than `stop` closes the connection: end a released one with \
+             SIGTERM, for example `pkill -TERM -f 'maker-arm-cli serve --interface={interface}'`"
+        )
+    })?;
+    if f.mode != Mode::Released {
+        return Err(format!(
+            "the daemon is {}, not released: nothing stopped. Run `maker-arm-cli release` first.",
+            mode_name(f.mode)
+        ));
+    }
+    // The end of file comes with the daemon's exit.
+    if !matches!(s.read(&mut [0; 1]), Ok(0)) {
+        return Err("the daemon accepted the stop, but did not exit".into());
+    }
+    say("daemon stopped; the bus is free.");
     Ok(())
 }
 
@@ -2091,6 +2136,89 @@ mod tests {
             maker_arm_transport::bus_lock(&iface).is_ok(),
             "the bus lock is free"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `stop` exits the process, so the released daemon runs in a child: this test binary
+    /// again, with the socket and the bus name in its environment. This process is the
+    /// `maker-arm-cli stop` client.
+    #[test]
+    fn a_stop_while_released_ends_the_daemon_and_frees_the_socket_and_the_bus() {
+        const NAME: &str =
+            "serve::tests::a_stop_while_released_ends_the_daemon_and_frees_the_socket_and_the_bus";
+        if let (Some(socket), Ok(iface)) =
+            (std::env::var_os("STOP_SOCKET"), std::env::var("STOP_IFACE"))
+        {
+            let _bus = maker_arm_transport::bus_lock(&iface).unwrap();
+            let (mut d, _) = daemon(true);
+            d.socket = PathBuf::from(socket);
+            release_now(&d);
+            for s in UnixListener::bind(&d.socket).unwrap().incoming() {
+                d.serve(s.unwrap());
+            }
+            unreachable!("incoming() never ends");
+        }
+        let dir = std::env::temp_dir().join(format!("mas-stop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("s.sock");
+        // Only a lock name: no such device is opened.
+        let iface = format!("vcans{}", std::process::id());
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture"])
+            .env("STOP_SOCKET", &socket)
+            .env("STOP_IFACE", &iface)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let t0 = Instant::now();
+        while !socket.exists() {
+            assert!(t0.elapsed() < Duration::from_secs(10), "no daemon socket");
+            std::thread::sleep(TICK);
+        }
+        let stopped = stop(&iface, Some(&socket));
+        if stopped.is_err() {
+            // A daemon that outlived the stop accepts clients forever.
+            let _ = child.kill();
+        }
+        let out = child.wait_with_output().unwrap();
+        let log = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(stopped, Ok(()), "{log}");
+        assert_eq!(out.status.code(), Some(0), "{log}");
+        assert!(log.contains("SERVE_EXIT stop"), "{log}");
+        assert!(!socket.exists());
+        assert!(
+            maker_arm_transport::bus_lock(&iface).is_ok(),
+            "the bus lock is free"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_stop_while_holding_changes_nothing() {
+        let (d, _) = daemon(true);
+        let dir = std::env::temp_dir().join(format!("mas-stop-hold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("s.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        std::thread::scope(|s| {
+            s.spawn(|| d.serve(listener.accept().unwrap().0));
+            let e = stop("vcan0", Some(&socket)).unwrap_err();
+            assert!(
+                e.contains("holding") && e.contains("maker-arm-cli release"),
+                "{e}"
+            );
+        });
+        let st = d.lock();
+        assert_eq!(st.mode, Mode::Holding);
+        assert!(st.arm.as_ref().is_some_and(|a| !a.loop_finished()));
+        assert!(socket.exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 
