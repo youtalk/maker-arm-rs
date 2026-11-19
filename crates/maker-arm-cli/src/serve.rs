@@ -3,7 +3,10 @@
 //! fault, it holds the arm. Once it is ready, on a real interface only an explicit release
 //! disables the motors, after it ramps the torque down over `RELEASE_RAMP_S`, and the daemon
 //! stays up, released, until an explicit enable or a signal, which ends it; on a virtual one
-//! a release ends the daemon, and so does its client unless `--persist`.
+//! a release ends the daemon, and so does its client unless `--persist`. On a real interface,
+//! a loop that stops on its own (a supply drop, a loose cable) leaves the daemon in fault,
+//! waiting for the motors: once every motor sent its power-up frame and answered for
+//! `RECOVER`, the daemon disables and is released by itself. It never enables by itself.
 
 use maker_arm::kinematics::ARM_DOF;
 use maker_arm::tracking::{Push, Row, TrackingController, TrackingShared, ROW};
@@ -13,7 +16,7 @@ use maker_arm::{
 };
 use maker_arm_cli::files::{self, GripMap, Loaded, ServeOptions};
 use maker_arm_cli::wire::{self, ClientFrame, Mode, Op, Role, StateFrame, WireError};
-use maker_arm_transport::CanBackend;
+use maker_arm_transport::{CanBackend, TransportError};
 use std::io::Write;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::panic::AssertUnwindSafe;
@@ -69,7 +72,8 @@ struct State {
     /// The tracking half of the loop that runs: pushes in, the clock out.
     shared: Arc<TrackingShared>,
     /// Released: the last read of the motors, with torque off. During a release's disable, with
-    /// no arm: the loop's last snapshot.
+    /// no arm: the loop's last snapshot. Waiting for the motors (`lost`): the last read, and the
+    /// motors may hold torque.
     parked: Option<ArmState>,
     mode: Mode,
     /// Activate was sent and no Deactivate, disconnect or signal since.
@@ -106,7 +110,8 @@ fn stopped(a: &RunningArm) -> bool {
 
 impl State {
     /// Not released, and the loop stopped or faulted. With no loop, only if `parked` holds no
-    /// pose: a release takes the loop out for its disable and leaves the last pose there.
+    /// pose: a release takes the loop out for its disable and leaves the last pose there, and
+    /// the wait for the motors (`lost`) keeps its pose there, with mode Fault already set.
     fn faulted(&self) -> bool {
         self.mode != Mode::Released
             && match &self.arm {
@@ -175,6 +180,20 @@ impl Drop for CommandSlot<'_> {
             st.exit = Some("client gone");
         }
         log("the command client left; holding");
+    }
+}
+
+/// The CAN interface is gone (`TransportError::Closed`) somewhere in `e`: no motor can answer on
+/// this socket again, so a failed release ends the daemon and frees the bus lock, as before the
+/// wait for the motors.
+fn transport_closed(e: &SessionError) -> bool {
+    match e {
+        SessionError::Transport(TransportError::Closed) => true,
+        SessionError::NotDisabled { cause: Some(c), .. } => transport_closed(c),
+        SessionError::LoopStopped { error, release } => {
+            transport_closed(error) || release.as_deref().is_some_and(transport_closed)
+        }
+        _ => false,
     }
 }
 
@@ -420,6 +439,14 @@ impl Daemon {
                             "released: torque is off. `maker-arm-cli enable` enables the arm \
                              again.",
                         ),
+                        Err(e) if transport_closed(&e) => {
+                            log(&format!(
+                                "release failed: disable: {e}. The motors may keep their last \
+                                 command. Support the arm."
+                            ));
+                            let st = self.lock();
+                            self.exit(stream, &self.state_frame(&st, seq), 1, "release failed");
+                        }
                         Err(e) => log(&format!(
                             "release failed: disable: {e}. The motors may keep their last \
                              command. Support the arm. The daemon stays up in fault: run the \
@@ -481,7 +508,7 @@ impl Daemon {
         ));
         // Never claim a release that did not happen.
         frame.mode = Mode::Fault;
-        if !self.real {
+        if !self.real || transport_closed(&e) {
             self.exit(stream, &frame, 1, "release failed");
         }
         log("The daemon stays up in fault: run the release again once the motors answer.");
@@ -508,8 +535,7 @@ impl Daemon {
     /// Enables a released arm at the measured pose behind every gate of the first enable, and
     /// starts a new loop: mode Holding, and the client must Activate again. In any other mode
     /// nothing is sent. A failed gate sends nothing more and stays released. A motor that got
-    /// an enable frame and does not confirm its disable ends the daemon, as a failed release
-    /// does.
+    /// an enable frame and does not confirm its disable ends the daemon.
     fn enable(&self, stream: &mut UnixStream, seq: u32) -> StateFrame {
         let mut parked = self.lock_session();
         let session = {
@@ -1500,8 +1526,54 @@ mod tests {
         assert!(d.lock().lost.is_some() && d.lock_session().is_some());
         // After the park: the motors are still silent.
         assert_eq!(d.release(&mut a, 2).mode, Mode::Fault);
+        // The failed disables left the session Connected: the power-up frames still count, and
+        // the daemon releases by itself.
         supply.restore(&[1, 2, 3, 4, 5, 6, 7]);
-        release_now(&d);
+        d.read_parked().unwrap();
+        assert_eq!(d.lock().mode, Mode::Released);
+    }
+
+    #[test]
+    fn a_foreign_host_frame_never_releases_by_itself() {
+        // A loose cable, plugged back in, then the vendor's scan from another process: its fault
+        // queries on ids 1 to 7 loop back to the daemon's socket.
+        let supply = Supply::new();
+        let (d, _) = daemon_on(true, Box::new(supply.clone()));
+        drop_supply(&d, &supply);
+        supply.restore(&[]);
+        for _ in 0..3 {
+            {
+                let mut sim = supply.sim.lock().unwrap();
+                for m in 1..=7 {
+                    sim.queue_raw(m, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0xFB]);
+                }
+            }
+            d.read_parked().unwrap();
+        }
+        assert_eq!(d.lock().mode, Mode::Fault);
+        assert!(supply.all_enabled());
+    }
+
+    #[test]
+    fn a_closed_transport_ends_the_daemon_on_a_failed_release() {
+        // The USB-CAN adapter was unplugged: no motor can ever answer on this socket, so the
+        // daemon must end and free the bus lock, as before the wait.
+        let closed = || Box::new(SessionError::Transport(TransportError::Closed));
+        let not_disabled = |cause| SessionError::NotDisabled {
+            motors: vec![1],
+            cause,
+        };
+        assert!(transport_closed(&not_disabled(Some(closed()))));
+        assert!(transport_closed(&SessionError::LoopStopped {
+            error: closed(),
+            release: Some(Box::new(not_disabled(None))),
+        }));
+        let io = || Box::new(SessionError::Transport(TransportError::Io("105".into())));
+        assert!(!transport_closed(&not_disabled(Some(io()))));
+        assert!(!transport_closed(&SessionError::LoopStopped {
+            error: io(),
+            release: Some(Box::new(not_disabled(None))),
+        }));
     }
 
     /// Each disable frame takes this long, as a motor's answer over CAN does.

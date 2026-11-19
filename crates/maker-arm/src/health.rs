@@ -44,8 +44,8 @@ pub enum FaultReason {
     BadCommand {
         detail: String,
     },
-    /// A power-up announcement came from this motor while the session was
-    /// enabled: it restarted with torque off. It is never re-enabled.
+    /// A power-up announcement came from this motor since the enable: it
+    /// restarted with torque off. It is never re-enabled.
     MotorRestarted {
         motor_id: u8,
     },
