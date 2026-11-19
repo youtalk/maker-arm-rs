@@ -32,7 +32,8 @@ use crate::health::{FaultReason, HealthMonitor};
 use crate::sim::SimArm;
 use crate::state::{ArmCommand, ArmState, MotorState};
 use maker_arm_protocol::{self as p, mit};
-use maker_arm_transport::{CanBackend, TransportError};
+use maker_arm_transport::{CanBackend, TransportError, POWER_UP_ID};
+use std::collections::HashSet;
 use std::f64::consts::TAU;
 use std::time::{Duration, Instant};
 
@@ -264,6 +265,8 @@ pub struct Session {
     pub(crate) ramp: Option<Ramp>,
     /// The gripper's CAN_TIMEOUT from before enable, kept for the restore.
     watchdog_restore: Option<u32>,
+    /// The MCU ids announced on extended id 0x7FFE since the last enable.
+    power_ups: HashSet<u64>,
 }
 
 impl std::fmt::Debug for Session {
@@ -322,6 +325,7 @@ impl Session {
             sent: Vec::new(),
             ramp: None,
             watchdog_restore: None,
+            power_ups: HashSet::new(),
         };
         let motor_ids: Vec<u8> = s.config.joints.iter().map(|j| j.motor_id).collect();
         for m in &motor_ids {
@@ -514,11 +518,16 @@ impl Session {
     /// not an MIT reply is ignored, except a frame on a motor's own id:
     /// that is the motor's power-up announcement, so it restarted with
     /// torque off. Legacy firmware gives no other sign. It is kept in any
-    /// state until the next enable clears it, so a failed disable does not
-    /// lose it. A host command on that id (bytes 0 to 5 all 0xFF: enable,
+    /// state until the next enable clears it. It can go missing while the
+    /// host polls, so the serve daemon counts the 0x7FFE announcement
+    /// (`power_ups`) instead. A host command on that id (bytes 0 to 5 all 0xFF: enable,
     /// disable, fault query, clear, zero) is not one: on CAN_RAW, another
     /// process's frames loop back to this socket.
     pub(crate) fn dispatch(&mut self, id: u32, data: &[u8; 8]) {
+        if id == POWER_UP_ID {
+            self.power_ups.insert(u64::from_be_bytes(*data));
+            return;
+        }
         let Some(idx) = mit::reply_motor_id(id, data).and_then(|m| self.index_of(m)) else {
             let host = data[..6] == [0xFF; 6];
             if let Some(i) = u8::try_from(id).ok().and_then(|m| self.index_of(m)) {
@@ -649,6 +658,7 @@ impl Session {
         for slot in &mut self.slots {
             slot.state.restarted = false;
         }
+        self.power_ups.clear();
         Ok(())
     }
 
@@ -925,6 +935,15 @@ impl Session {
             all &= self.send_to(i, mit::encode_fault_query(m), true, wait)?;
         }
         Ok(all)
+    }
+
+    /// How many motors announced a power-up on extended id 0x7FFE since the
+    /// last enable, in any state: each distinct MCU id counts once. A motor
+    /// that powered up has its torque off, and nothing in a session enables
+    /// it again. Unlike the frame on the motor's own id, this one came from
+    /// every motor in every power-up on the real arm.
+    pub fn power_ups(&self) -> usize {
+        self.power_ups.len()
     }
 
     pub fn state(&self) -> SessionState {
