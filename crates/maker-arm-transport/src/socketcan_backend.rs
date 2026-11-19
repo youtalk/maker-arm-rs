@@ -83,7 +83,7 @@ impl SocketCanBackend {
             CanFilter::new(0, CAN_EFF_FLAG | CAN_RTR_FLAG),
             CanFilter::new(POWER_UP_ID, CAN_EFF_FLAG | CAN_RTR_FLAG | CAN_EFF_MASK),
         ])
-            .map_err(|e| TransportError::Io(format!("set CAN filter on {ifname}: {e}")))?;
+        .map_err(|e| TransportError::Io(format!("set CAN filter on {ifname}: {e}")))?;
         Ok(Self {
             sock,
             read_timeout: None,

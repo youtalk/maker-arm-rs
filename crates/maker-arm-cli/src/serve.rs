@@ -5,8 +5,8 @@
 //! stays up, released, until an explicit enable or a signal, which ends it; on a virtual one
 //! a release ends the daemon, and so does its client unless `--persist`. On a real interface,
 //! a loop that stops on its own (a supply drop, a loose cable) leaves the daemon in fault,
-//! waiting for the motors: once every motor sent its power-up frame and answered for
-//! `RECOVER`, the daemon disables and is released by itself. It never enables by itself.
+//! waiting for the motors: once every motor announced its power-up on extended id 0x7FFE
+//! and answered for `RECOVER`, the daemon disables and is released by itself. It never enables by itself.
 
 use maker_arm::kinematics::ARM_DOF;
 use maker_arm::tracking::{Push, Row, TrackingController, TrackingShared, ROW};
@@ -603,10 +603,12 @@ impl Daemon {
 
     /// Released: one read of every motor, with torque off, which also chooses the 2π wrap
     /// again (`Session::read_motors`). Waiting for the motors (`Lost`): one fault query to each,
-    /// which enables or disables nothing. Once every motor sent a power-up frame (`restarted`:
-    /// its torque is off) and every motor answered for `recover_after`, the checked disable
-    /// runs and the daemon is released. A loose cable gives no power-up frame, so the motors
-    /// keep their torque until the operator's release. Skipped while a release or an enable
+    /// which enables or disables nothing. Once every motor announced its power-up on extended
+    /// id 0x7FFE (`Session::power_ups`: its torque is off) and every motor answered for
+    /// `recover_after`, the checked disable runs and the daemon is released. A loose cable
+    /// gives no announcement, so the motors keep their torque until the operator's release.
+    /// The frame on each motor's own id is not used: it went missing on the real arm while
+    /// the host polled. Skipped while a release or an enable
     /// holds the session.
     fn read_parked(&self) -> Result<(), String> {
         let Some(mut parked) = self.try_session() else {
@@ -623,7 +625,7 @@ impl Daemon {
         // A send error is no answer: the bus is down while the supply is off.
         let answered = session.query_faults().unwrap_or(false);
         let state = session.arm_state();
-        let restarted = state.motors.iter().all(|m| m.restarted);
+        let restarted = session.power_ups() >= session.config().joints.len();
         {
             let mut st = self.lock();
             st.parked = Some(state);
@@ -1300,6 +1302,7 @@ pub fn run(o: &ServeOptions, check: bool) -> Result<(), String> {
 mod tests {
     use super::*;
     use maker_arm::tracking::TrackingParams;
+    use std::sync::atomic::AtomicU8;
 
     fn tracking() -> Result<TrackingController, String> {
         let c = ArmConfig::maker_arm_v1();
@@ -1356,6 +1359,9 @@ mod tests {
     struct Supply {
         sim: Arc<Mutex<SimArm>>,
         off: Arc<AtomicBool>,
+        /// This motor's frame on its own id never arrives (0: none), as motor 5's on the real
+        /// arm on 2026-11-19 08:25.
+        lost_own_frame: Arc<AtomicU8>,
     }
 
     impl Supply {
@@ -1363,6 +1369,7 @@ mod tests {
             Supply {
                 sim: Arc::new(Mutex::new(SimArm::new(&ArmConfig::maker_arm_v1()))),
                 off: Arc::new(AtomicBool::new(false)),
+                lost_own_frame: Arc::new(AtomicU8::new(0)),
             }
         }
 
@@ -1404,7 +1411,13 @@ mod tests {
             if self.off.load(Ordering::Relaxed) {
                 return Ok(None);
             }
-            self.sim.lock().unwrap().recv(timeout)
+            let lost = u32::from(self.lost_own_frame.load(Ordering::Relaxed));
+            match self.sim.lock().unwrap().recv(timeout)? {
+                Some((id, data)) if lost != 0 && id == lost && data[..2] == [0xA5, 0x5A] => {
+                    Ok(None)
+                }
+                f => Ok(f),
+            }
         }
     }
 
@@ -1468,6 +1481,19 @@ mod tests {
         );
         assert!(d.lock().lost.is_none());
         assert_eq!(d.enable(&mut a, 4).mode, Mode::Holding);
+    }
+
+    #[test]
+    fn a_lost_own_id_frame_still_releases_by_itself() {
+        // The real arm, 2026-11-19 08:25: a stable power-up, but motor 5's frame on its own id
+        // never came. Its 0x7FFE announcement did.
+        let supply = Supply::new();
+        let (d, _) = daemon_on(true, Box::new(supply.clone()));
+        drop_supply(&d, &supply);
+        supply.lost_own_frame.store(5, Ordering::Relaxed);
+        supply.restore(&[1, 2, 3, 4, 5, 6, 7]);
+        d.read_parked().unwrap();
+        assert_eq!(d.lock().mode, Mode::Released);
     }
 
     #[test]
