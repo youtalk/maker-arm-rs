@@ -1,5 +1,6 @@
 //! CAN transports for the Maker Arm. The trait speaks raw
-//! (11-bit standard id, 8-byte payload) frames; encoding/decoding lives in
+//! (11-bit standard id, 8-byte payload) frames, plus the motors' power-up
+//! announcement as `POWER_UP_ID`; encoding/decoding lives in
 //! maker-arm-protocol.
 
 mod mock;
@@ -16,6 +17,12 @@ use std::io::ErrorKind;
 use std::os::linux::net::SocketAddrExt;
 use std::os::unix::net::{SocketAddr, UnixListener};
 use std::time::{Duration, Instant};
+
+/// The id under which every backend delivers a motor's power-up
+/// announcement. A RobStride motor sends it on extended id 0x7FFE right
+/// after power-up, with its MCU id as the payload. The extended-frame flag
+/// keeps it apart from every 11-bit standard id.
+pub const POWER_UP_ID: u32 = 0x8000_7FFE;
 
 /// One read inside `send_and_wait`. A wait can end up to this much after
 /// its timeout.
@@ -62,6 +69,8 @@ pub trait CanBackend: Send {
     /// never returned as motor data: an RTR frame has an empty payload that
     /// would zero-pad into a full-scale-negative feedback reading, and an
     /// extended id is indistinguishable from the same numeric standard id.
+    /// The one exception is a data frame on extended id 0x7FFE, the power-up
+    /// announcement: it comes back as `(POWER_UP_ID, data)`.
     ///
     /// `Duration::ZERO` means "poll": return what is already buffered,
     /// otherwise `Ok(None)` — without blocking. (`MockBackend` and

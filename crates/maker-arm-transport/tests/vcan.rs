@@ -111,6 +111,23 @@ fn extended_ids_not_delivered() {
     assert_eq!(rx.recv(Duration::from_millis(200)).expect("recv"), None);
 }
 
+#[test]
+#[ignore = "needs vcan0"]
+fn the_power_up_announcement_is_delivered() {
+    let _bus = bus();
+    let mut rx = SocketCanBackend::open("vcan0").expect("open rx");
+    let data = [0x50, 0x50, 0x38, 0x00, 0x90, 0x23, 0xB7, 0x03];
+    raw_send(CanFrame::new(ExtendedId::new(0x7FFE).unwrap(), &data).unwrap());
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let got = loop {
+        if let Some(f) = rx.recv(Duration::from_millis(200)).expect("recv") {
+            break f;
+        }
+        assert!(Instant::now() < deadline, "the announcement never arrived");
+    };
+    assert_eq!(got, (maker_arm_transport::POWER_UP_ID, data));
+}
+
 /// The rejections above must not be "nothing ever arrives": a good frame
 /// sent right after a bad one still comes through.
 #[test]
