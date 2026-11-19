@@ -305,7 +305,11 @@ fn a_second_daemon_on_a_held_bus_exits_1_before_it_opens_the_bus() {
     assert_eq!(status.code(), Some(1));
     assert!(err.contains(&name) && !err.contains("open "), "{err}");
     let hint = format!("maker-arm-cli status --interface {iface}");
-    assert!(err.contains(&hint) && err.contains("ss -xlp"), "{err}");
+    let stop = format!("maker-arm-cli stop --interface {iface}");
+    assert!(
+        err.contains(&hint) && err.contains(&stop) && err.contains("ss -xlp"),
+        "{err}"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
