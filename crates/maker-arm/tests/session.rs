@@ -311,6 +311,47 @@ fn disable_estop_and_clear_faults_transitions() {
 }
 
 #[test]
+fn query_faults_asks_every_motor_and_records_power_up_frames() {
+    let c = ArmConfig::maker_arm_v1();
+    let mut s = Session::connect(Box::new(SimArm::new(&c)), c).expect("connect");
+    s.enable().expect("enable");
+    assert!(s.query_faults().unwrap());
+    s.backend_as_sim().unwrap().set_muted(3, true);
+    assert!(!s.query_faults().unwrap());
+    let sim = s.backend_as_sim().unwrap();
+    sim.set_muted(3, false);
+    sim.power_cycle_motors(&[2, 3]);
+    assert!(s.query_faults().unwrap());
+    let restarted: Vec<bool> = s.arm_state().motors.iter().map(|m| m.restarted).collect();
+    assert_eq!(restarted, [false, true, true, false, false, false, false]);
+    let sim = s.backend_as_sim().unwrap();
+    assert!(
+        !sim.enabled(2) && sim.enabled(1),
+        "a fault query enables or disables nothing"
+    );
+}
+
+#[test]
+fn power_ups_count_distinct_announcements_until_the_next_enable() {
+    let c = ArmConfig::maker_arm_v1();
+    let mut s = Session::connect(Box::new(SimArm::new(&c)), c).expect("connect");
+    s.enable().expect("enable");
+    let sim = s.backend_as_sim().unwrap();
+    sim.power_cycle_motors(&[2, 3]);
+    // A second power-up of the same motor counts once.
+    sim.power_cycle_motors(&[3]);
+    assert!(s.query_faults().unwrap());
+    assert_eq!(s.power_ups(), 2);
+    // Kept in any state: after a disable, the session is Connected.
+    s.disable().expect("disable");
+    s.backend_as_sim().unwrap().power_cycle_motors(&[4]);
+    s.query_faults().unwrap();
+    assert_eq!(s.power_ups(), 3);
+    s.enable().expect("enable");
+    assert_eq!(s.power_ups(), 0);
+}
+
+#[test]
 fn poll_fault_asks_each_motor_once_per_interval_by_send_time() {
     let c = ArmConfig::maker_arm_v1();
     let (backend, cfg) = FlakyBackend::new(SimArm::new(&c));

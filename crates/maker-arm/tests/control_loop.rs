@@ -1050,6 +1050,33 @@ fn a_release_after_the_loop_stopped_still_disables() {
 }
 
 #[test]
+fn join_gives_back_the_session_of_a_stopped_loop_and_sends_no_disable() {
+    let c = fast(ArmConfig::maker_arm_v1());
+    let (s, bus) = Enobufs::session(&c);
+    let running = s
+        .start(Box::new(HoldController::from_config(&c)), None)
+        .expect("start");
+    std::thread::sleep(Duration::from_millis(50));
+    bus.lock().unwrap().fail_next = u32::MAX;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !running.loop_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(running.loop_finished(), "errors that last end the loop");
+    // The bus works again: the join must still send nothing.
+    *bus.lock().unwrap() = Bus::default();
+    let (mut s, looped) = running.join().expect("no panic");
+    assert!(
+        matches!(looped, Err(SessionError::Transport(_))),
+        "{looped:?}"
+    );
+    assert_eq!(s.state(), SessionState::Fault);
+    assert_eq!(bus.lock().unwrap().disables_tried, 0);
+    let sim = s.backend_as_sim().unwrap();
+    assert!((1..=7).all(|m| sim.enabled(m)));
+}
+
+#[test]
 fn a_motor_that_restarts_mid_session_holds_the_arm_and_stays_off() {
     // Legacy firmware leaves mode and the fault bits at 0, and a restarted
     // motor still answers every control frame. Only its power-up

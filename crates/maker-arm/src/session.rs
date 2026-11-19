@@ -32,7 +32,8 @@ use crate::health::{FaultReason, HealthMonitor};
 use crate::sim::SimArm;
 use crate::state::{ArmCommand, ArmState, MotorState};
 use maker_arm_protocol::{self as p, mit};
-use maker_arm_transport::{CanBackend, TransportError};
+use maker_arm_transport::{CanBackend, TransportError, POWER_UP_ID};
+use std::collections::HashSet;
 use std::f64::consts::TAU;
 use std::time::{Duration, Instant};
 
@@ -264,6 +265,8 @@ pub struct Session {
     pub(crate) ramp: Option<Ramp>,
     /// The gripper's CAN_TIMEOUT from before enable, kept for the restore.
     watchdog_restore: Option<u32>,
+    /// The MCU ids announced on extended id 0x7FFE since the last enable.
+    power_ups: HashSet<u64>,
 }
 
 impl std::fmt::Debug for Session {
@@ -322,6 +325,7 @@ impl Session {
             sent: Vec::new(),
             ramp: None,
             watchdog_restore: None,
+            power_ups: HashSet::new(),
         };
         let motor_ids: Vec<u8> = s.config.joints.iter().map(|j| j.motor_id).collect();
         for m in &motor_ids {
@@ -511,14 +515,23 @@ impl Session {
     }
 
     /// Routes one raw frame into the right motor slot. Anything that is
-    /// not an MIT reply is ignored, except a frame on a motor's own id in
-    /// an enabled session: that is the motor's power-up announcement, so
-    /// it restarted with torque off. Legacy firmware gives no other sign.
+    /// not an MIT reply is ignored, except a frame on a motor's own id:
+    /// that is the motor's power-up announcement, so it restarted with
+    /// torque off. Legacy firmware gives no other sign. It is kept in any
+    /// state until the next enable clears it. It can go missing while the
+    /// host polls, so the serve daemon counts the 0x7FFE announcement
+    /// (`power_ups`) instead. A host command on that id (bytes 0 to 5 all 0xFF: enable,
+    /// disable, fault query, clear, zero) is not one: on CAN_RAW, another
+    /// process's frames loop back to this socket.
     pub(crate) fn dispatch(&mut self, id: u32, data: &[u8; 8]) {
+        if id == POWER_UP_ID {
+            self.power_ups.insert(u64::from_be_bytes(*data));
+            return;
+        }
         let Some(idx) = mit::reply_motor_id(id, data).and_then(|m| self.index_of(m)) else {
-            let enabled = matches!(self.state, SessionState::Enabled | SessionState::Fault);
+            let host = data[..6] == [0xFF; 6];
             if let Some(i) = u8::try_from(id).ok().and_then(|m| self.index_of(m)) {
-                self.slots[i].state.restarted |= enabled;
+                self.slots[i].state.restarted |= !host;
             }
             return;
         };
@@ -645,6 +658,7 @@ impl Session {
         for slot in &mut self.slots {
             slot.state.restarted = false;
         }
+        self.power_ups.clear();
         Ok(())
     }
 
@@ -906,6 +920,32 @@ impl Session {
         Ok(())
     }
 
+    /// One non-clearing fault query to each motor, in any state: it
+    /// enables, disables and clears nothing. Each waits up to
+    /// `reply_wait_us`. True if every motor answered. A power-up frame
+    /// that comes meanwhile sets `restarted` as in the loop (`dispatch`).
+    /// The first error comes back at once: a failed send means that the bus
+    /// is down for every motor.
+    pub fn query_faults(&mut self) -> Result<bool, SessionError> {
+        let wait = Duration::from_micros(self.config.reply_wait_us);
+        self.drain()?;
+        let mut all = true;
+        for i in 0..self.config.joints.len() {
+            let m = self.config.joints[i].motor_id;
+            all &= self.send_to(i, mit::encode_fault_query(m), true, wait)?;
+        }
+        Ok(all)
+    }
+
+    /// How many motors announced a power-up on extended id 0x7FFE since the
+    /// last enable, in any state: each distinct MCU id counts once. A motor
+    /// that powered up has its torque off, and nothing in a session enables
+    /// it again. Unlike the frame on the motor's own id, this one came from
+    /// every motor in every power-up on the real arm.
+    pub fn power_ups(&self) -> usize {
+        self.power_ups.len()
+    }
+
     pub fn state(&self) -> SessionState {
         self.state
     }
@@ -965,28 +1005,30 @@ mod tests {
         Session::connect(Box::new(SimArm::new(&c)), c).expect("connect")
     }
 
+    fn restarted(s: &Session) -> Vec<bool> {
+        s.slots.iter().map(|m| m.state.restarted).collect()
+    }
+
     #[test]
-    fn a_power_up_announcement_is_ignored_before_enable_and_holds_after() {
+    fn a_power_up_announcement_is_kept_in_any_state_and_holds_only_after_enable() {
         let mut s = connected();
-        let seen = |s: &Session| -> Vec<_> {
-            s.slots
-                .iter()
-                .map(|m| (m.state, m.last_feedback, m.last_fault_reply))
-                .collect()
-        };
         // A synthetic MCU id, never a real motor's.
         let announce = |s: &mut Session| {
             s.backend_as_sim()
                 .unwrap()
                 .queue_raw(3, [0xA5, 0x5A, 0, 0, 0, 0, 0, 3])
         };
-        // Before enable (connect, probe), it changes nothing.
-        let before = seen(&s);
+        // Before enable (connect, probe), it is kept, as after a failed disable: the serve
+        // daemon waits for one from every motor. The enable clears it.
         announce(&mut s);
         s.drain().unwrap();
-        assert_eq!(seen(&s), before);
+        assert_eq!(
+            restarted(&s),
+            [false, false, true, false, false, false, false]
+        );
         // In an enabled session, motor 3 restarted with torque off: hold.
         s.enable().expect("enable");
+        assert_eq!(restarted(&s), [false; 7]);
         let position = s.positions()[2];
         announce(&mut s);
         let mut hold = HoldController::from_config(&s.config().clone());
@@ -999,6 +1041,22 @@ mod tests {
         assert!((s.positions()[2] - position).abs() < 1e-3);
         // No enable went out.
         assert_eq!(s.backend_as_sim().unwrap().enables(3), 1);
+    }
+
+    #[test]
+    fn a_host_command_on_a_motor_id_is_no_power_up_frame() {
+        // On CAN_RAW, frames that another process on this host sends (the vendor's scan, a
+        // cansend) loop back to the daemon's socket. A motor never sends this format.
+        let mut s = connected();
+        s.enable().expect("enable");
+        let sim = s.backend_as_sim().unwrap();
+        sim.queue_raw(3, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0xFB]);
+        sim.queue_raw(4, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFC]);
+        s.drain().unwrap();
+        assert_eq!(restarted(&s), [false; 7]);
+        let mut hold = HoldController::from_config(&s.config().clone());
+        s.tick(&mut hold).expect("tick");
+        assert_eq!(s.state(), SessionState::Enabled);
     }
 
     #[test]

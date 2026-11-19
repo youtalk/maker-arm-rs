@@ -9,7 +9,7 @@
 
 use crate::config::ArmConfig;
 use maker_arm_protocol::{self as p, mit};
-use maker_arm_transport::{CanBackend, TransportError};
+use maker_arm_transport::{CanBackend, TransportError, POWER_UP_ID};
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
@@ -141,20 +141,32 @@ impl SimArm {
     }
 
     /// Power off and on: every motor is disabled, its fault and CAN_TIMEOUT
-    /// reset, and it announces itself on its motor id.
+    /// reset, and it announces itself on extended id 0x7FFE
+    /// (`POWER_UP_ID`), then on its motor id.
     pub fn power_cycle(&mut self) {
         let mut ids: Vec<u8> = self.motors.keys().copied().collect();
         ids.sort();
-        for id in ids {
+        self.power_cycle_motors(&ids);
+    }
+
+    /// `power_cycle` for these motors only, in this order: as in the
+    /// supply's restart loop, where only some motors live long enough to
+    /// announce themselves.
+    pub fn power_cycle_motors(&mut self, ids: &[u8]) {
+        // A synthetic MCU id, never a real motor's.
+        let mcu = |id: u8| [0xA5, 0x5A, 0, 0, 0, 0, 0, id];
+        for &id in ids {
             let m = self.motors.get_mut(&id).unwrap();
             m.enabled = false;
             m.torque = 0.0;
             m.fault_word = 0;
             m.params
                 .insert(p::param_index::CAN_TIMEOUT, 0u32.to_le_bytes());
-            // A synthetic MCU id, never a real motor's.
-            self.replies
-                .push_back((id as u32, [0xA5, 0x5A, 0, 0, 0, 0, 0, id]));
+            self.replies.push_back((POWER_UP_ID, mcu(id)));
+        }
+        // On the real arm, the frame on the motor's own id comes 0.2 to 1.2 s later.
+        for &id in ids {
+            self.replies.push_back((id as u32, mcu(id)));
         }
     }
 
@@ -523,9 +535,15 @@ mod tests {
         assert!(!sim.enabled(7));
         assert_eq!(sim.param_u32(7, param_index::CAN_TIMEOUT), Some(0));
         assert_eq!(sim.motors[&7].fault_word, 0);
-        let ids: Vec<u32> = std::iter::from_fn(|| sim.recv(Duration::ZERO).unwrap())
-            .map(|(id, _)| id)
-            .collect();
-        assert_eq!(ids, (1..=7).collect::<Vec<u32>>());
+        let frames: Vec<(u32, [u8; 8])> =
+            std::iter::from_fn(|| sim.recv(Duration::ZERO).unwrap()).collect();
+        // As on the real arm: every motor's 0x7FFE announcement first, then
+        // the frame on its own id, both with its MCU id.
+        let ids: Vec<u32> = frames.iter().map(|(id, _)| *id).collect();
+        let mut want = vec![maker_arm_transport::POWER_UP_ID; 7];
+        want.extend(1..=7);
+        assert_eq!(ids, want);
+        assert_eq!(frames[4].1, frames[11].1, "motor 5's MCU id");
+        assert_ne!(frames[4].1, frames[5].1);
     }
 }

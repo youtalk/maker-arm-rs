@@ -20,8 +20,8 @@ pub struct MotorState {
     pub fault_reply_age: f64,
     /// The firmware answers parameter reads (found at connect).
     pub params: bool,
-    /// A power-up announcement came while the session was enabled: the
-    /// motor restarted with torque off.
+    /// A power-up announcement came since the last enable: the motor
+    /// restarted with torque off.
     pub restarted: bool,
 }
 

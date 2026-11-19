@@ -17,7 +17,8 @@ pub struct RecordedFrame {
 
 /// Parses one `candump -l` line: `(ts) iface ID#HEXDATA`. Returns None on
 /// anything that isn't a well-formed standard-id frame line: the id must be
-/// 3 hex digits (an 8-digit extended id is skipped).
+/// 3 hex digits. An 8-digit extended id is skipped, except `00007FFE`, the
+/// power-up announcement, which comes back as `POWER_UP_ID`.
 ///
 /// Note the classic-CAN shape: a CAN FD capable adapter makes `candump -l`
 /// emit `ID##flags+data` (a doubled `#`), which this parser rejects. Use
@@ -34,10 +35,11 @@ pub fn parse_candump_line(line: &str) -> Option<RecordedFrame> {
     let interface = parts.next()?.to_string();
     let frame = parts.next()?;
     let (id_hex, data_hex) = frame.split_once('#')?;
-    if id_hex.len() != 3 {
-        return None;
-    }
-    let id = u32::from_str_radix(id_hex, 16).ok()?;
+    let id = match id_hex.len() {
+        3 => u32::from_str_radix(id_hex, 16).ok()?,
+        8 if id_hex.eq_ignore_ascii_case("00007FFE") => crate::POWER_UP_ID,
+        _ => return None,
+    };
     // Byte length alone doesn't guarantee char boundaries: a multi-byte UTF-8
     // character can make `data_hex.len()` even and <= 16 while still landing
     // mid-character at a fixed 2-byte slice offset below, which panics. Reject
@@ -205,7 +207,12 @@ mod tests {
         let f = parse_candump_line("(1.0) can0 0FD#01BE907FD7FF00F0").unwrap();
         assert_eq!(f.id, 0xFD);
         assert_eq!(f.data, [0x01, 0xBE, 0x90, 0x7F, 0xD7, 0xFF, 0x00, 0xF0]);
-        assert!(parse_candump_line("(1.0) can0 00007FFE#0102030405060708").is_none());
+        assert!(parse_candump_line("(1.0) can0 00007FFD#0102030405060708").is_none());
+        assert!(parse_candump_line("(1.0) can0 00000001#0102030405060708").is_none());
+        // The power-up announcement, as every backend delivers it.
+        let f = parse_candump_line("(1.0) can0 00007FFE#505038009023B703").unwrap();
+        assert_eq!(f.id, crate::POWER_UP_ID);
+        assert_eq!(f.data, [0x50, 0x50, 0x38, 0x00, 0x90, 0x23, 0xB7, 0x03]);
     }
 
     #[test]
