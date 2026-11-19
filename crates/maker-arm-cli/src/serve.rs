@@ -43,6 +43,9 @@ const TICK: Duration = Duration::from_millis(10);
 const FIRST_TICK: Duration = Duration::from_secs(1);
 /// Released, the motors are read this often: 5 Hz, as `scan --watch`.
 const PARKED_READ: Duration = Duration::from_millis(200);
+/// After the loop stopped on its own, every motor must answer this long, after a power-up frame
+/// from each, before the daemon releases by itself.
+const RECOVER: Duration = Duration::from_secs(5); // INITIAL: about two restart periods (2.4 s) of the adapter's loop
 
 /// A motor silent this long has no temperature: the frame carries NaN. Released, the motors
 /// are read at 5 Hz, so this is five missed reads.
@@ -82,6 +85,17 @@ struct State {
     command: Option<UnixStream>,
     /// Set when a virtual daemon without `--persist` must end.
     exit: Option<&'static str>,
+    /// Waiting for the motors after the loop stopped on its own or a release failed: mode
+    /// Fault, no arm, the session parked in `Daemon.session` and its pose in `parked`.
+    lost: Option<Lost>,
+}
+
+/// The wait for the motors after a supply drop (`Daemon::read_parked`).
+struct Lost {
+    /// The STATUS fault code of the loop that stopped.
+    fault: u32,
+    /// Every motor answered every fault query since then.
+    answering_since: Option<Instant>,
 }
 
 /// The loop ended on its own: on an error or a panic. A loop that ended after a release ramp
@@ -145,6 +159,8 @@ struct Daemon {
     /// A real interface: a release keeps the daemon up, released.
     real: bool,
     socket: PathBuf,
+    /// `RECOVER`, shorter in tests.
+    recover_after: Duration,
 }
 
 /// Holds the command slot. Its drop, also on a panic, frees the slot and holds the arm.
@@ -337,7 +353,7 @@ impl Daemon {
         } else if let Some(parked) = &st.parked {
             // The same clock as the loop's: both count from the session's connect.
             s.t = parked.t;
-            (parked.clone(), 0)
+            (parked.clone(), st.lost.as_ref().map_or(0, |l| l.fault))
         } else {
             return s;
         };
@@ -363,9 +379,10 @@ impl Daemon {
     /// (Holding, or Fault for a fault hold), a Poll gets the last measured pose, and commands are
     /// ignored. A fault during the ramp ends it: the arm holds, and the reply says Fault. Else
     /// the reply goes out only after the motors are disabled. On a real interface the daemon
-    /// stays up, released, and returns the reply. Else, and after a failed disable, it exits
-    /// holding the state lock. With no arm, the reply says Released only in mode Released:
-    /// after a disable that panicked, it says Fault.
+    /// stays up and returns the reply: released, or after a failed disable in Fault, waiting for
+    /// the motors (`Lost`). On a virtual one it exits holding the state lock. While it waits
+    /// for the motors, a release runs the checked disable at once. With no arm, the reply says
+    /// Released only in mode Released: after a disable that panicked, it says Fault.
     fn release(&self, stream: &mut UnixStream, seq: u32) -> StateFrame {
         // An enable in flight finishes first, and a signal, an enable or a second release waits
         // for this one.
@@ -395,6 +412,23 @@ impl Daemon {
         let mut frame = self.state_frame(&st, seq);
         frame.mode = Mode::Released;
         let Some(arm) = st.arm.take() else {
+            if st.lost.is_some() {
+                drop(st);
+                if let Some(session) = parked.as_mut() {
+                    match self.disable_parked(session) {
+                        Ok(()) => log(
+                            "released: torque is off. `maker-arm-cli enable` enables the arm \
+                             again.",
+                        ),
+                        Err(e) => log(&format!(
+                            "release failed: disable: {e}. The motors may keep their last \
+                             command. Support the arm. The daemon stays up in fault: run the \
+                             release again once the motors answer."
+                        )),
+                    }
+                }
+                return self.state_frame(&self.lock(), seq);
+            }
             // No arm: released already, or a disable that panicked left none and confirmed
             // nothing. Never claim a release that did not happen.
             if st.mode != Mode::Released {
@@ -447,7 +481,19 @@ impl Daemon {
         ));
         // Never claim a release that did not happen.
         frame.mode = Mode::Fault;
-        self.exit(stream, &frame, 1, "release failed");
+        if !self.real {
+            self.exit(stream, &frame, 1, "release failed");
+        }
+        log("The daemon stays up in fault: run the release again once the motors answer.");
+        st.parked = Some(session.arm_state());
+        st.lost = Some(Lost {
+            fault: frame.fault,
+            answering_since: None,
+        });
+        st.mode = Mode::Fault;
+        st.active = false;
+        *parked = Some(session);
+        frame
     }
 
     /// Sends `frame`, removes the socket and exits with `code`. The caller holds the state
@@ -520,20 +566,131 @@ impl Daemon {
         self.state_frame(&st, seq)
     }
 
+    /// The session lock, or None while a release or an enable holds it.
+    fn try_session(&self) -> Option<MutexGuard<'_, Option<Session>>> {
+        match self.session.try_lock() {
+            Ok(p) => Some(p),
+            Err(TryLockError::Poisoned(e)) => Some(e.into_inner()),
+            Err(TryLockError::WouldBlock) => None,
+        }
+    }
+
     /// Released: one read of every motor, with torque off, which also chooses the 2π wrap
-    /// again (`Session::read_motors`). Skipped while a release or an enable holds the session.
+    /// again (`Session::read_motors`). Waiting for the motors (`Lost`): one fault query to each,
+    /// which enables or disables nothing. Once every motor sent a power-up frame (`restarted`:
+    /// its torque is off) and every motor answered for `recover_after`, the checked disable
+    /// runs and the daemon is released. A loose cable gives no power-up frame, so the motors
+    /// keep their torque until the operator's release. Skipped while a release or an enable
+    /// holds the session.
     fn read_parked(&self) -> Result<(), String> {
-        let mut parked = match self.session.try_lock() {
-            Ok(p) => p,
-            Err(TryLockError::Poisoned(e)) => e.into_inner(),
-            Err(TryLockError::WouldBlock) => return Ok(()),
+        let Some(mut parked) = self.try_session() else {
+            return Ok(());
         };
         let Some(session) = parked.as_mut() else {
             return Ok(());
         };
-        let read = session.read_motors().map_err(|e| e.to_string());
-        self.lock().parked = Some(session.arm_state());
-        read
+        if self.lock().lost.is_none() {
+            let read = session.read_motors().map_err(|e| e.to_string());
+            self.lock().parked = Some(session.arm_state());
+            return read;
+        }
+        // A send error is no answer: the bus is down while the supply is off.
+        let answered = session.query_faults().unwrap_or(false);
+        let state = session.arm_state();
+        let restarted = state.motors.iter().all(|m| m.restarted);
+        {
+            let mut st = self.lock();
+            st.parked = Some(state);
+            let Some(lost) = st.lost.as_mut() else {
+                return Ok(());
+            };
+            if !answered {
+                lost.answering_since = None;
+                return Ok(());
+            }
+            let since = *lost.answering_since.get_or_insert_with(Instant::now);
+            if !restarted || since.elapsed() < self.recover_after {
+                return Ok(());
+            }
+        }
+        match self.disable_parked(session) {
+            Ok(()) => log(
+                "released after a supply drop: every motor restarted with torque off. \
+                 `maker-arm-cli enable` enables the arm again.",
+            ),
+            Err(e) => log(&format!(
+                "supply drop: the disable failed: {e}. Still waiting."
+            )),
+        }
+        Ok(())
+    }
+
+    /// The checked disable of the session parked while waiting for the motors, off the state
+    /// lock. Then the 2π wrap is chosen again, and the daemon is released. If the disable
+    /// fails, the wait goes on.
+    fn disable_parked(&self, session: &mut Session) -> Result<(), SessionError> {
+        let disabled = session.disable();
+        if disabled.is_ok() {
+            if let Err(e) = session.read_motors() {
+                log(&format!("released: read the motors: {e}"));
+            }
+        }
+        let mut st = self.lock();
+        st.parked = Some(session.arm_state());
+        match &disabled {
+            Ok(()) => {
+                st.lost = None;
+                st.mode = Mode::Released;
+                st.active = false;
+            }
+            Err(_) => {
+                if let Some(l) = st.lost.as_mut() {
+                    l.answering_since = None;
+                }
+            }
+        }
+        disabled
+    }
+
+    /// On a real interface, a loop that stopped on its own gives its session back with no
+    /// disable: a supply drop and a loose cable look the same, and after a loose cable the
+    /// motors still hold torque. The daemon then waits for the motors in Fault (`Lost`,
+    /// `read_parked`). Skipped while a release or an enable holds the session.
+    fn park_stopped_loop(&self) {
+        if !self.real {
+            return;
+        }
+        let Some(mut parked) = self.try_session() else {
+            return;
+        };
+        let mut st = self.lock();
+        if !st.arm.as_ref().is_some_and(stopped) {
+            return;
+        }
+        let fault = self.state_frame(&st, 0).fault;
+        let Some(Ok((session, looped))) = st.arm.take().map(RunningArm::join) else {
+            log(
+                "FAULT: the control loop panicked; nothing reads the motors. They may keep \
+                 their last command. Support the arm.",
+            );
+            return;
+        };
+        if let Err(e) = looped {
+            log(&format!("the control loop had stopped: {e}"));
+        }
+        st.parked = Some(session.arm_state());
+        st.lost = Some(Lost {
+            fault,
+            answering_since: None,
+        });
+        st.mode = Mode::Fault;
+        st.active = false;
+        *parked = Some(session);
+        log(&format!(
+            "waiting for the motors: the daemon releases by itself once every motor restarted \
+             (torque off) and answered for {} s. `maker-arm-cli release` disables at once.",
+            self.recover_after.as_secs_f64()
+        ));
     }
 
     fn serve(&self, mut stream: UnixStream) {
@@ -1016,6 +1173,7 @@ pub fn run(o: &ServeOptions, check: bool) -> Result<(), String> {
             refused: 0,
             command: None,
             exit: None,
+            lost: None,
         }),
         session: Mutex::new(None),
         tracking: Box::new(tracking),
@@ -1027,6 +1185,7 @@ pub fn run(o: &ServeOptions, check: bool) -> Result<(), String> {
         exit_with_client: files::is_virtual(&o.interface) && !o.persist,
         real: !files::is_virtual(&o.interface),
         socket: socket.clone(),
+        recover_after: RECOVER,
     });
     say(&format!(
         "SERVE_READY {{\"socket\": {}, \"digest\": \"{digest:016x}\"}}",
@@ -1105,6 +1264,9 @@ pub fn run(o: &ServeOptions, check: bool) -> Result<(), String> {
             let _parked = d.lock_session();
             finish(&d, &socket, why);
         }
+        // Last, so the fault lines above came from the stopped loop's snapshot.
+        drop(st);
+        d.park_stopped_loop();
     }
 }
 
@@ -1160,6 +1322,186 @@ mod tests {
         ) -> Result<Option<(u32, [u8; 8])>, maker_arm_transport::TransportError> {
             self.0.lock().unwrap().recv(timeout)
         }
+    }
+
+    /// A sim behind a 48 V supply the test can cut: while off, every send fails with ENOBUFS
+    /// and nothing arrives, as on the real arm after a supply drop.
+    #[derive(Clone)]
+    struct Supply {
+        sim: Arc<Mutex<SimArm>>,
+        off: Arc<AtomicBool>,
+    }
+
+    impl Supply {
+        fn new() -> Supply {
+            Supply {
+                sim: Arc::new(Mutex::new(SimArm::new(&ArmConfig::maker_arm_v1()))),
+                off: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        /// Power comes back: these motors restart first (none for a loose cable).
+        fn restore(&self, cycle: &[u8]) {
+            self.sim.lock().unwrap().power_cycle_motors(cycle);
+            self.off.store(false, Ordering::Relaxed);
+        }
+
+        fn disables(&self) -> Vec<u32> {
+            let sim = self.sim.lock().unwrap();
+            (1..=7).map(|m| sim.disables(m)).collect()
+        }
+
+        fn all_enabled(&self) -> bool {
+            let sim = self.sim.lock().unwrap();
+            (1..=7).all(|m| sim.enabled(m))
+        }
+    }
+
+    impl CanBackend for Supply {
+        fn send(
+            &mut self,
+            id: u32,
+            data: &[u8; 8],
+        ) -> Result<(), maker_arm_transport::TransportError> {
+            if self.off.load(Ordering::Relaxed) {
+                return Err(maker_arm_transport::TransportError::Io(
+                    "No buffer space available (os error 105)".into(),
+                ));
+            }
+            self.sim.lock().unwrap().send(id, data)
+        }
+
+        fn recv(
+            &mut self,
+            timeout: Duration,
+        ) -> Result<Option<(u32, [u8; 8])>, maker_arm_transport::TransportError> {
+            if self.off.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            self.sim.lock().unwrap().recv(timeout)
+        }
+    }
+
+    /// The supply goes off until the loop stops on its own.
+    fn cut(d: &Daemon, s: &Supply) {
+        s.off.store(true, Ordering::Relaxed);
+        let end = Instant::now() + Duration::from_secs(5);
+        while !d.lock().arm.as_ref().is_some_and(RunningArm::loop_finished) {
+            assert!(Instant::now() < end, "the loop did not stop");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// `cut`, then the accept loop parks the stopped loop: fault 9 (transport), session kept.
+    fn drop_supply(d: &Daemon, s: &Supply) {
+        cut(d, s);
+        d.park_stopped_loop();
+        let f = d.state_frame(&d.lock(), 0);
+        assert_eq!((f.mode, f.fault), (Mode::Fault, 9));
+        assert!(d.lock().arm.is_none() && d.lock().lost.is_some());
+        assert!(d.lock_session().is_some());
+    }
+
+    #[test]
+    fn a_supply_drop_releases_by_itself_after_every_motor_restarted() {
+        // 2026-11-18: 11 drops of the 48 V adapter. After a stable power-up, each motor sends a
+        // frame on its own id.
+        let supply = Supply::new();
+        let (mut d, _) = daemon_on(true, Box::new(supply.clone()));
+        d.recover_after = Duration::from_millis(100);
+        let before = d.state_frame(&d.lock(), 1).q;
+        drop_supply(&d, &supply);
+        // During the wait, a signal holds, and an enable is refused.
+        on_signal(&d, Path::new("/nonexistent"));
+        assert_eq!(d.lock().mode, Mode::Fault);
+        let (mut a, _b) = UnixStream::pair().unwrap();
+        assert_eq!(d.enable(&mut a, 2).mode, Mode::Fault);
+        assert!(d.lock_session().is_some());
+        // Motor 1 comes back one turn away.
+        {
+            let mut sim = supply.sim.lock().unwrap();
+            let p = sim.position(1);
+            sim.set_position(1, p - std::f64::consts::TAU);
+        }
+        supply.restore(&[1, 2, 3, 4, 5, 6, 7]);
+        d.read_parked().unwrap();
+        assert_eq!(
+            d.lock().mode,
+            Mode::Fault,
+            "answering for less than recover_after"
+        );
+        std::thread::sleep(Duration::from_millis(120));
+        d.read_parked().unwrap();
+        let f = d.state_frame(&d.lock(), 3);
+        assert_eq!((f.mode, f.fault), (Mode::Released, 0));
+        assert!(
+            (f.q[0] - before[0]).abs() < 1e-3,
+            "{} vs {}",
+            f.q[0],
+            before[0]
+        );
+        assert!(d.lock().lost.is_none());
+        assert_eq!(d.enable(&mut a, 4).mode, Mode::Holding);
+    }
+
+    #[test]
+    fn a_power_up_from_some_motors_keeps_the_wait() {
+        // The supply's restart loop: only motors 2 and 3 live long enough to send their frame.
+        let supply = Supply::new();
+        let (d, _) = daemon_on(true, Box::new(supply.clone()));
+        drop_supply(&d, &supply);
+        supply.restore(&[2, 3]);
+        for _ in 0..3 {
+            d.read_parked().unwrap();
+        }
+        assert_eq!(d.lock().mode, Mode::Fault);
+        // A miss starts the wait again.
+        supply.off.store(true, Ordering::Relaxed);
+        d.read_parked().unwrap();
+        assert!(d.lock().lost.as_ref().unwrap().answering_since.is_none());
+        supply.restore(&[1, 4, 5, 6, 7]);
+        d.read_parked().unwrap();
+        assert_eq!(d.lock().mode, Mode::Released);
+    }
+
+    #[test]
+    fn a_cable_fault_never_releases_by_itself() {
+        // A loose cable looks like a drop, but the motors keep power and their last command.
+        let supply = Supply::new();
+        let (d, _) = daemon_on(true, Box::new(supply.clone()));
+        drop_supply(&d, &supply);
+        let before = supply.disables();
+        supply.restore(&[]);
+        for _ in 0..5 {
+            d.read_parked().unwrap();
+        }
+        assert_eq!(d.lock().mode, Mode::Fault);
+        assert_eq!(
+            supply.disables(),
+            before,
+            "no disable without a power-up frame"
+        );
+        assert!(supply.all_enabled());
+        // The operator's release disables at once.
+        release_now(&d);
+        let sim = supply.sim.lock().unwrap();
+        assert!((1..=7).all(|m| !sim.enabled(m)));
+    }
+
+    #[test]
+    fn a_release_with_silent_motors_stays_up_in_fault() {
+        let supply = Supply::new();
+        let (d, _) = daemon_on(true, Box::new(supply.clone()));
+        // Before the park: the release takes the stopped loop, and its disable fails.
+        cut(&d, &supply);
+        let (mut a, _b) = UnixStream::pair().unwrap();
+        // An exit here would end the test binary.
+        assert_eq!(d.release(&mut a, 1).mode, Mode::Fault);
+        assert!(d.lock().lost.is_some() && d.lock_session().is_some());
+        // After the park: the motors are still silent.
+        assert_eq!(d.release(&mut a, 2).mode, Mode::Fault);
+        supply.restore(&[1, 2, 3, 4, 5, 6, 7]);
+        release_now(&d);
     }
 
     /// Each disable frame takes this long, as a motor's answer over CAN does.
@@ -1229,6 +1571,7 @@ mod tests {
                 refused: 0,
                 command: None,
                 exit: None,
+                lost: None,
             }),
             session: Mutex::new(None),
             tracking: Box::new(tracking),
@@ -1239,6 +1582,7 @@ mod tests {
             exit_with_client: false,
             real,
             socket: PathBuf::new(),
+            recover_after: Duration::ZERO,
         };
         (d, hi)
     }
